@@ -1,21 +1,19 @@
-THE GOLDEN FORK
+Page 1
+THE GOLDEN FORS
 456 Oak Avenue
-Anytown, CA 94301
-
-Server: Maria  Table: 12
-Date: 2024-03-15  7:45 PM
-
-Caesar Salad         12.95
-Grilled Salmon       28.50
-Mushroom Risotto     22.00
-Glass Pinot Noir     14.00
-Tiramisu              9.50
-
-Subtotal             86.95
-Tax (8.5%)            7.39
-Total                94.34
-
-Tip: ________
-Total: ________
-
+Anyton, CA 94301
+Server: Maria Table: 12
+no: 2022-03-15 7:45 221
+Caesar Salad
+Grilled Salmon
+Mushrora Bisette
+Class Pinot Soir
+12.95
+20.30
+Subtotal
+102(5,55)
+Total
+86.35
+7.39
+03.74
 Thank you for dining with us!

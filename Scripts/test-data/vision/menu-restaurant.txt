@@ -1,26 +1,26 @@
+Page 1
 BELLA CUCINA
 Italian Restaurant & Wine Bar
-
 ANTIPASTI
-Bruschetta al Pomodoro          12
-Carpaccio di Manzo              16
-Burrata con Prosciutto          18
-Calamari Fritti                 14
-
+Bruschetta al Pomodoro
+Carpaccio di Manzo
+Burrata con Prosciutto
+Calamari Fritti
 PRIMI
-Spaghetti Carbonara             22
-Risotto ai Funghi Porcini       24
-Pappardelle al Ragu             23
-Gnocchi alla Sorrentina         20
-
+Spaghetti Carbonara
+Risotto ai Funghi Porcini
+Pappardelle al Ragu
+Gnocchi alla Sorrentina
 SECONDI
-Branzino al Forno               32
-Ossobuco alla Milanese          36
-Pollo alla Parmigiana           26
-Tagliata di Manzo               38
-
+Branzino al Forno
+Ossobuco alla Milanese
+Pollo alla Parmigiana
+Tagliata di Manzo
 DOLCI
-Tiramisu                        12
-Panna Cotta                     10
-Cannoli Siciliani               11
-Affogato                         9
+Tiramisu
+Panna Cotta
+Cannoli Siciliani
+Affogato
+12
+16
+18
