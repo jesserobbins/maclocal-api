@@ -406,6 +406,85 @@ async def benchmark_speech(session: aiohttp.ClientSession, base_url: str,
     }
 
 
+async def benchmark_mlx_vlm(session: aiohttp.ClientSession, vlm_url: str,
+                            vlm_model: str, file_path: Path) -> dict | None:
+    """Run OCR via AFM MLX VLM (chat completions with image)."""
+    if file_path.suffix.lower() == ".pdf":
+        return None  # VLMs can't process PDFs directly
+
+    # Encode image as base64 data URL
+    with open(file_path, "rb") as f:
+        img_data = f.read()
+    b64 = base64.b64encode(img_data).decode()
+    ext = file_path.suffix.lower().lstrip(".")
+    mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png"}.get(ext, "jpeg")
+
+    # Sample GPU before
+    afm_vlm_pid = None
+    try:
+        proc = subprocess.run(["lsof", "-ti", f":{vlm_url.split(':')[-1]}"],
+                              capture_output=True, text=True, timeout=3)
+        pids = proc.stdout.strip().split('\n')
+        if pids and pids[0]:
+            afm_vlm_pid = int(pids[0])
+    except Exception:
+        pass
+
+    gpu_before = get_per_pid_gpu_ns()
+
+    t0 = time.perf_counter()
+    try:
+        payload = {
+            "model": vlm_model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{b64}"}},
+                    {"type": "text", "text": "Extract all text from this image exactly as it appears. Return only the extracted text, no commentary."}
+                ]
+            }],
+            "max_tokens": 2048,
+            "temperature": 0.0
+        }
+        async with session.post(
+            f"{vlm_url}/v1/chat/completions",
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=120)
+        ) as resp:
+            data = await resp.json()
+    except Exception as e:
+        return {"tool": f"mlx-vlm ({vlm_model})", "error": str(e)}
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+
+    extracted = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    usage = data.get("usage", {})
+    prompt_tokens = usage.get("prompt_tokens", 0)
+
+    # If prompt_tokens < 100, image wasn't processed
+    if prompt_tokens < 100:
+        return {"tool": f"mlx-vlm ({vlm_model})", "error": "image not processed (check --vlm flag)"}
+
+    gt_path = file_path.parent / (file_path.stem + ".txt")
+    ground_truth = gt_path.read_text().strip() if gt_path.exists() else ""
+    cer = compute_cer(extracted, ground_truth) if ground_truth else None
+
+    # GPU delta
+    gpu_after = get_per_pid_gpu_ns()
+    gpu_time_ms = None
+    if afm_vlm_pid and afm_vlm_pid in gpu_before and afm_vlm_pid in gpu_after:
+        gpu_time_ms = round((gpu_after[afm_vlm_pid] - gpu_before[afm_vlm_pid]) / 1e6, 1)
+
+    model_short = vlm_model.split("/")[-1][:20]
+    return {
+        "tool": f"mlx-vlm ({model_short})",
+        "latency_ms": round(elapsed_ms, 1),
+        "cer": round(cer, 4) if cer is not None else None,
+        "gpu_time_ms": gpu_time_ms,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": usage.get("completion_tokens", 0),
+    }
+
+
 def benchmark_tesseract(file_path: Path) -> dict | None:
     """Run Tesseract OCR on a file for comparison."""
     if not _has_command("tesseract"):
@@ -499,6 +578,10 @@ async def main():
     parser.add_argument("--output-dir", type=str, default=str(RESULTS_DIR))
     parser.add_argument("--calibrate", action="store_true",
                         help="Capture actual OCR/speech output as new ground truth .txt files")
+    parser.add_argument("--vlm-url", type=str, default=None,
+                        help="URL of AFM MLX VLM server for comparison (e.g. http://127.0.0.1:9998)")
+    parser.add_argument("--vlm-model", type=str, default=None,
+                        help="Model ID for VLM server (e.g. dealignai/Qwen3.5-VL-9B-4bit-MLX-CRACK)")
     args = parser.parse_args()
 
     base_url = f"http://127.0.0.1:{args.port}"
@@ -558,6 +641,15 @@ async def main():
                             result["tesseract_latency_ms"] = tess["latency_ms"]
                             result["tesseract_cer"] = tess["cer"]
 
+                    # Competitor: MLX VLM
+                    if args.vlm_url and args.vlm_model and fp.suffix.lower() != ".pdf":
+                        vlm = await benchmark_mlx_vlm(session, args.vlm_url, args.vlm_model, fp)
+                        if vlm and "error" not in vlm:
+                            result["vlm_latency_ms"] = vlm["latency_ms"]
+                            result["vlm_cer"] = vlm["cer"]
+                            result["vlm_gpu_time_ms"] = vlm.get("gpu_time_ms")
+                            result["vlm_tool"] = vlm["tool"]
+
                     status = "PASS" if result["pass"] else "FAIL"
                     cer_str = f"CER={result['afm_cer']:.3f}" if result.get("afm_cer") is not None else "N/A"
                     # Show actual per-process GPU time
@@ -567,11 +659,16 @@ async def main():
                         gpu_str = f"GPU={gpu_time:.1f}ms CPU={cpu_time:.0f}ms" if cpu_time else f"GPU={gpu_time:.1f}ms"
                     else:
                         gpu_str = "ANE"
-                    tess_str = ""
+                    comp_str = ""
                     if result.get("tesseract_latency_ms") is not None:
                         speedup = result["tesseract_latency_ms"] / result["afm_latency_ms"] if result["afm_latency_ms"] > 0 else 0
-                        tess_str = f" | Tess={result['tesseract_latency_ms']:.0f}ms ({speedup:.1f}x)"
-                    print(f" {result['afm_latency_ms']:.0f}ms | {cer_str} | {gpu_str}{tess_str} | {status}")
+                        comp_str += f" | Tess={result['tesseract_latency_ms']:.0f}ms ({speedup:.1f}x)"
+                    if result.get("vlm_latency_ms") is not None:
+                        speedup = result["vlm_latency_ms"] / result["afm_latency_ms"] if result["afm_latency_ms"] > 0 else 0
+                        vlm_gpu = result.get("vlm_gpu_time_ms")
+                        vlm_gpu_str = f" GPU={vlm_gpu:.0f}ms" if vlm_gpu else ""
+                        comp_str += f" | VLM={result['vlm_latency_ms']:.0f}ms ({speedup:.1f}x){vlm_gpu_str}"
+                    print(f" {result['afm_latency_ms']:.0f}ms | {cer_str} | {gpu_str}{comp_str} | {status}")
 
                     # Calibrate: save actual OCR output as ground truth
                     if args.calibrate and result.get("extracted_preview"):
@@ -699,7 +796,12 @@ async def main():
                    for r in speech_results
                    if r.get("whisper_latency_ms") is not None]
 
-    if tess_pairs or whisp_pairs:
+    vlm_pairs = [(r["afm_latency_ms"], r["vlm_latency_ms"], r.get("vlm_gpu_time_ms"),
+                   r.get("afm_gpu_time_ms"))
+                  for r in vision_results
+                  if r.get("vlm_latency_ms") is not None]
+
+    if tess_pairs or whisp_pairs or vlm_pairs:
         print()
         print("  ┌─────────────────────────────────────────────┐")
         print("  │           SPEED COMPARISON                   │")
@@ -721,6 +823,27 @@ async def main():
         avg_tess = sum(t for _, t in tess_pairs) / len(tess_pairs)
         overall = avg_tess / avg_afm if avg_afm > 0 else 0
         print(f"  {'AVERAGE':30s}  AFM {avg_afm:>7.0f}ms  Tess {avg_tess:>7.0f}ms  {overall:>5.1f}x")
+
+    if vlm_pairs:
+        vlm_tool = next((r.get("vlm_tool", "MLX VLM") for r in vision_results if r.get("vlm_tool")), "MLX VLM")
+        print()
+        print(f"  OCR: AFM Vision (ANE) vs {vlm_tool} (GPU)")
+        print("  ─────────────────────────────────────────────")
+        for r in vision_results:
+            vlm_ms = r.get("vlm_latency_ms")
+            if vlm_ms is None:
+                continue
+            afm_ms = r["afm_latency_ms"]
+            speedup = vlm_ms / afm_ms if afm_ms > 0 else 0
+            arrow = "◀ AFM faster" if speedup > 1 else "▶ VLM faster"
+            afm_gpu = r.get("afm_gpu_time_ms", 0) or 0
+            vlm_gpu = r.get("vlm_gpu_time_ms")
+            gpu_note = f"  (AFM GPU={afm_gpu:.0f}ms VLM GPU={vlm_gpu:.0f}ms)" if vlm_gpu else ""
+            print(f"  {r['file']:30s}  AFM {afm_ms:>7.0f}ms  VLM {vlm_ms:>7.0f}ms  {speedup:>5.1f}x  {arrow}{gpu_note}")
+        avg_afm = sum(a for a, _, _, _ in vlm_pairs) / len(vlm_pairs)
+        avg_vlm = sum(v for _, v, _, _ in vlm_pairs) / len(vlm_pairs)
+        overall = avg_vlm / avg_afm if avg_afm > 0 else 0
+        print(f"  {'AVERAGE':30s}  AFM {avg_afm:>7.0f}ms  VLM {avg_vlm:>7.0f}ms  {overall:>5.1f}x")
 
     if whisp_pairs:
         print()
