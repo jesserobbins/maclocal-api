@@ -493,12 +493,16 @@ async def benchmark_mlx_vlm(session: aiohttp.ClientSession, vlm_url: str,
     if afm_vlm_pid and afm_vlm_pid in gpu_before and afm_vlm_pid in gpu_after:
         gpu_time_ms = round((gpu_after[afm_vlm_pid] - gpu_before[afm_vlm_pid]) / 1e6, 1)
 
+    # VLM memory (RSS of the VLM server process)
+    vlm_mem_mb = get_process_memory_mb(afm_vlm_pid) if afm_vlm_pid else None
+
     model_short = vlm_model.split("/")[-1][:20]
     return {
         "tool": f"mlx-vlm ({model_short})",
         "latency_ms": round(elapsed_ms, 1),
         "cer": round(cer, 4) if cer is not None else None,
         "gpu_time_ms": gpu_time_ms,
+        "memory_mb": vlm_mem_mb,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": usage.get("completion_tokens", 0),
     }
@@ -516,9 +520,26 @@ def benchmark_tesseract(file_path: Path) -> dict | None:
             capture_output=True, text=True, timeout=60
         )
         extracted = result.stdout.strip()
+        # Capture tesseract's peak memory via /usr/bin/time if available
+        pid = result.pid if hasattr(result, 'pid') else None
     except Exception as e:
         return {"tool": "tesseract", "error": str(e)}
     elapsed_ms = (time.perf_counter() - t0) * 1000
+
+    # Get tesseract memory: re-run with /usr/bin/time to capture RSS
+    mem_mb = None
+    try:
+        mem_result = subprocess.run(
+            ["/usr/bin/time", "-l", "tesseract", str(file_path), "stdout", "--oem", "1"],
+            capture_output=True, text=True, timeout=60
+        )
+        for line in mem_result.stderr.splitlines():
+            if "maximum resident set size" in line:
+                rss_bytes = int(line.strip().split()[0])
+                mem_mb = round(rss_bytes / (1024 * 1024), 1)
+                break
+    except Exception:
+        pass
 
     gt_path = file_path.parent / (file_path.stem + ".txt")
     ground_truth = gt_path.read_text().strip() if gt_path.exists() else ""
@@ -528,6 +549,7 @@ def benchmark_tesseract(file_path: Path) -> dict | None:
         "tool": "tesseract",
         "latency_ms": round(elapsed_ms, 1),
         "cer": round(cer, 4) if cer is not None else None,
+        "memory_mb": mem_mb,
     }
 
 
@@ -659,6 +681,7 @@ async def main():
                         if tess and "error" not in tess:
                             result["tesseract_latency_ms"] = tess["latency_ms"]
                             result["tesseract_cer"] = tess["cer"]
+                            result["tesseract_memory_mb"] = tess.get("memory_mb")
 
                     # Competitor: MLX VLM
                     if args.vlm_url and args.vlm_model and fp.suffix.lower() != ".pdf":
@@ -667,6 +690,7 @@ async def main():
                             result["vlm_latency_ms"] = vlm["latency_ms"]
                             result["vlm_cer"] = vlm["cer"]
                             result["vlm_gpu_time_ms"] = vlm.get("gpu_time_ms")
+                            result["vlm_memory_mb"] = vlm.get("memory_mb")
                             result["vlm_tool"] = vlm["tool"]
 
                     status = "PASS" if result["pass"] else "FAIL"
@@ -854,6 +878,12 @@ async def main():
         print("  ┌─────────────────────────────────────────────┐")
         print("  │    AFM Vision vs Tesseract                  │")
         print("  └─────────────────────────────────────────────┘")
+        # Get representative memory values
+        tess_mem = next((r.get("tesseract_memory_mb") for r in vision_results if r.get("tesseract_memory_mb")), None)
+        tess_mem_str = f"  Tesseract: {tess_mem:.0f} MB" if tess_mem else ""
+        afm_mem_str = f"  AFM: {afm_mem:.0f} MB" if afm_mem else ""
+        if afm_mem_str or tess_mem_str:
+            print(f"  Memory:{afm_mem_str}{tess_mem_str}")
         print(f"  {'Document':30s} {'AFM':>8s} {'Tess':>8s} {'Speedup':>8s}")
         print(f"  {'─'*30} {'─'*8} {'─'*8} {'─'*8}")
         for r in vision_results:
@@ -874,6 +904,11 @@ async def main():
         print(f"  ┌─────────────────────────────────────────────────────────┐")
         print(f"  │    AFM Vision vs {vlm_tool:40s} │")
         print(f"  └─────────────────────────────────────────────────────────┘")
+        vlm_mem = next((r.get("vlm_memory_mb") for r in vision_results if r.get("vlm_memory_mb")), None)
+        vlm_mem_str = f"  VLM: {vlm_mem:.0f} MB" if vlm_mem else ""
+        afm_mem_str2 = f"  AFM: {afm_mem:.0f} MB" if afm_mem else ""
+        if afm_mem_str2 or vlm_mem_str:
+            print(f"  Memory:{afm_mem_str2}{vlm_mem_str}")
         print(f"  {'Document':30s} {'AFM':>8s} {'VLM':>9s} {'Speedup':>8s}  {'AFM GPU':>8s} {'VLM GPU':>9s}")
         print(f"  {'─'*30} {'─'*8} {'─'*9} {'─'*8}  {'─'*8} {'─'*9}")
         for r in vision_results:
