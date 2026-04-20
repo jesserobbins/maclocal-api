@@ -1,0 +1,16 @@
+CENTRAL PHARMACY
+1200 Health Blvd, Anytown CA 94301
+Phone: (555) 234-5678  DEA: BC1234567
+
+Rx# 7834521
+Patient: DOE, JOHN M
+DOB: 05/15/1980
+
+LISINOPRIL 10MG TABLETS
+Take one tablet by mouth daily
+Qty: 30  Refills: 5
+Dr. A. Williams  NPI: 1234567890
+Filled: 03/15/2024  Discard after: 03/15/2025
+
+WARNING: May cause dizziness
+Do not take with potassium supplements

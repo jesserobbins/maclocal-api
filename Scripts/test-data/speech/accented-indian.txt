@@ -1,0 +1,1 @@
+The software development lifecycle includes planning, analysis, design, implementation, testing, and maintenance phases. Each phase has specific deliverables and review processes.
