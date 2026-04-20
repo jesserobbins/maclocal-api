@@ -1,0 +1,27 @@
+INVOICE
+
+From: Acme Consulting LLC
+      789 Business Park Dr
+      Suite 200
+      San Jose, CA 95134
+
+To:   Widget Corp
+      321 Industrial Blvd
+      Oakland, CA 94612
+
+Invoice #: INV-2024-0042
+Date: March 15, 2024
+Due: April 14, 2024
+
+Description                    Hours    Rate     Amount
+Software Architecture Review      40   $175   $7,000.00
+Code Audit & Security Review      24   $200   $4,800.00
+Performance Optimization          16   $175   $2,800.00
+Documentation                      8   $125   $1,000.00
+
+                              Subtotal       $15,600.00
+                              Tax (9.25%)     $1,443.00
+                              TOTAL          $17,043.00
+
+Payment Terms: Net 30
+Wire: First National Bank, Acct 98765432

@@ -1,0 +1,21 @@
+FRESH MART GROCERY
+123 Main Street
+Anytown, CA 94301
+
+Date: 2024-03-15  Time: 14:32
+
+Organic Bananas      2.49
+Whole Milk 1gal      4.99
+Sourdough Bread      5.49
+Chicken Breast lb    8.99
+Baby Spinach 5oz     3.99
+Greek Yogurt         1.79
+Olive Oil 16oz       7.49
+Brown Rice 2lb       3.29
+
+Subtotal            38.52
+Tax (8.5%)           3.27
+TOTAL               41.79
+
+VISA ****4821
+Thank you for shopping!

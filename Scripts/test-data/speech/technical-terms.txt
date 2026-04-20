@@ -1,0 +1,1 @@
+Kubernetes orchestrates containerized microservices across distributed clusters. Each pod contains one or more containers sharing network namespaces and storage volumes. The control plane manages scheduling, scaling, and self-healing through reconciliation loops.

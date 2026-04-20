@@ -102,5 +102,19 @@ vendor/llama.cpp/tools/server/public/
 .codex/*auth*.json
 /default.metallib
 
+# Vision/Speech test corpus (large binary files — regenerated via generate-test-corpus.sh)
+Scripts/test-data/vision/*.jpg
+Scripts/test-data/vision/*.png
+Scripts/test-data/vision/*.pdf
+Scripts/test-data/speech/*.wav
+Scripts/test-data/speech/*.mp3
+Scripts/test-data/speech/*.m4a
+Scripts/test-data/speech/*.aiff
+# Keep ground truth text files (tracked)
+!Scripts/test-data/vision/*.txt
+!Scripts/test-data/speech/*.txt
+# Benchmark results (regenerated)
+Scripts/benchmark-results/
+
 # Worktrees
 .worktrees/

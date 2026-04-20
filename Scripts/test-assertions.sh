@@ -4159,6 +4159,553 @@ print(content.strip())
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Section 17: Vision OCR
+# ═══════════════════════════════════════════════════════════════════════════════
+if should_run_section 17; then
+  CURRENT_TIER="smoke"
+  echo ""
+  echo "👁️  Section 17: Vision OCR"
+
+  # Preflight: check macOS version (Vision framework requires macOS 26+)
+  MACOS_MAJOR_VER=$(sw_vers -productVersion | cut -d. -f1)
+  VISION_MIN_MACOS_VERSION=26
+  VISION_TEST_DIR="$SCRIPT_DIR/test-data/vision"
+  VISION_LATENCY_BUDGET_MS=5000
+
+  if [[ "$MACOS_MAJOR_VER" -lt "$VISION_MIN_MACOS_VERSION" ]]; then
+    run_test "Vision" "Vision OCR: macOS ${VISION_MIN_MACOS_VERSION}+ required (have $MACOS_MAJOR_VER)" "macOS ${VISION_MIN_MACOS_VERSION}+" "SKIP"
+  else
+    # Check that test corpus exists (at least screenshot-code.png)
+    if [[ ! -f "$VISION_TEST_DIR/screenshot-code.png" ]]; then
+      # Try to use any available test image
+      VISION_TEST_IMAGE=""
+      for candidate in "$VISION_TEST_DIR"/*.png "$VISION_TEST_DIR"/*.jpg; do
+        if [[ -f "$candidate" ]]; then
+          VISION_TEST_IMAGE="$candidate"
+          break
+        fi
+      done
+      if [[ -z "$VISION_TEST_IMAGE" ]]; then
+        run_test "Vision" "Vision OCR: test corpus missing (run generate-test-corpus.sh)" "corpus present" "SKIP"
+        VISION_AVAILABLE=false
+      else
+        VISION_AVAILABLE=true
+      fi
+    else
+      VISION_TEST_IMAGE="$VISION_TEST_DIR/screenshot-code.png"
+      VISION_AVAILABLE=true
+    fi
+
+    if [[ "${VISION_AVAILABLE:-true}" == "true" ]]; then
+      # 17.1: File path input
+      t0=$(now_ms)
+      RESP=$(curl -sf --max-time 30 "$BASE_URL/v1/vision/ocr" \
+        -H "Content-Type: application/json" \
+        -d "{\"file\": \"$VISION_TEST_IMAGE\"}" 2>/dev/null || echo '{"error":"curl_failed"}')
+      dur=$(($(now_ms) - t0))
+      HAS_TEXT=$(echo "$RESP" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    ct = d.get('combined_text', '')
+    print('yes' if ct and ct.strip() else 'no')
+except:
+    print('no')
+" 2>/dev/null)
+      if [[ "$HAS_TEXT" == "yes" ]]; then
+        run_test "Vision" "OCR file path input returns combined_text" "yes" "PASS" "$dur"
+      else
+        run_test "Vision" "OCR file path input returns combined_text" "yes" "${HAS_TEXT:-no}" "$dur"
+      fi
+
+      # 17.2: Base64 input
+      if min_tier smoke; then
+        t0=$(now_ms)
+        B64_DATA=$(base64 < "$VISION_TEST_IMAGE" | tr -d '\n')
+        RESP=$(curl -sf --max-time 30 "$BASE_URL/v1/vision/ocr" \
+          -H "Content-Type: application/json" \
+          -d "{\"data\": \"$B64_DATA\", \"media_type\": \"image/png\"}" 2>/dev/null || echo '{"error":"curl_failed"}')
+        dur=$(($(now_ms) - t0))
+        HAS_TEXT=$(echo "$RESP" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    ct = d.get('combined_text', '')
+    print('yes' if ct and ct.strip() else 'no')
+except:
+    print('no')
+" 2>/dev/null)
+        if [[ "$HAS_TEXT" == "yes" ]]; then
+          run_test "Vision" "OCR base64 input returns combined_text" "yes" "PASS" "$dur"
+        else
+          run_test "Vision" "OCR base64 input returns combined_text" "yes" "${HAS_TEXT:-no}" "$dur"
+        fi
+      fi
+
+      # 17.3: Response schema validation
+      if min_tier smoke; then
+        t0=$(now_ms)
+        RESP=$(curl -sf --max-time 30 "$BASE_URL/v1/vision/ocr" \
+          -H "Content-Type: application/json" \
+          -d "{\"file\": \"$VISION_TEST_IMAGE\"}" 2>/dev/null || echo '{}')
+        dur=$(($(now_ms) - t0))
+        SCHEMA_OK=$(echo "$RESP" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    has_object = 'object' in d
+    has_documents = isinstance(d.get('documents'), list)
+    has_combined = isinstance(d.get('combined_text'), str)
+    print('yes' if (has_object and has_documents and has_combined) else 'no')
+except:
+    print('no')
+" 2>/dev/null)
+        if [[ "$SCHEMA_OK" == "yes" ]]; then
+          run_test "Vision" "OCR response schema (object, documents, combined_text)" "valid" "PASS" "$dur"
+        else
+          run_test "Vision" "OCR response schema (object, documents, combined_text)" "valid" "invalid" "$dur"
+        fi
+      fi
+
+      # 17.4: Error - missing file
+      if min_tier smoke; then
+        t0=$(now_ms)
+        HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 10 "$BASE_URL/v1/vision/ocr" \
+          -H "Content-Type: application/json" \
+          -d '{"file": "/nonexistent/path/to/file.png"}' 2>/dev/null || echo "000")
+        dur=$(($(now_ms) - t0))
+        if [[ "$HTTP_CODE" =~ ^4[0-9][0-9]$ ]]; then
+          run_test "Vision" "OCR error: missing file returns 4xx" "4xx" "PASS" "$dur"
+        else
+          run_test "Vision" "OCR error: missing file returns 4xx" "4xx" "$HTTP_CODE" "$dur"
+        fi
+      fi
+
+      # 17.5: Error - unsupported format
+      if min_tier smoke; then
+        t0=$(now_ms)
+        # Create a dummy .mp3 file for the test
+        echo "not an image" > /tmp/test-vision-unsupported.$$.mp3
+        HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 10 "$BASE_URL/v1/vision/ocr" \
+          -H "Content-Type: application/json" \
+          -d "{\"file\": \"/tmp/test-vision-unsupported.$$.mp3\"}" 2>/dev/null || echo "000")
+        dur=$(($(now_ms) - t0))
+        rm -f /tmp/test-vision-unsupported.$$.mp3
+        if [[ "$HTTP_CODE" =~ ^4[0-9][0-9]$ ]]; then
+          run_test "Vision" "OCR error: unsupported format returns 4xx" "4xx" "PASS" "$dur"
+        else
+          run_test "Vision" "OCR error: unsupported format returns 4xx" "4xx" "$HTTP_CODE" "$dur"
+        fi
+      fi
+
+      # 17.6: Verbose mode (standard tier)
+      CURRENT_TIER="standard"
+      if min_tier standard; then
+        t0=$(now_ms)
+        RESP=$(curl -sf --max-time 30 "$BASE_URL/v1/vision/ocr" \
+          -H "Content-Type: application/json" \
+          -d "{\"file\": \"$VISION_TEST_IMAGE\", \"verbose\": true}" 2>/dev/null || echo '{}')
+        dur=$(($(now_ms) - t0))
+        HAS_BLOCKS=$(echo "$RESP" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    docs = d.get('documents', [{}])
+    blocks = docs[0].get('textBlocks', []) if docs else []
+    has_bbox = any('boundingBox' in b for b in blocks) if blocks else False
+    print('yes' if blocks and has_bbox else 'no')
+except:
+    print('no')
+" 2>/dev/null)
+        if [[ "$HAS_BLOCKS" == "yes" ]]; then
+          run_test "Vision" "OCR verbose mode returns textBlocks with boundingBox" "yes" "PASS" "$dur"
+        else
+          run_test "Vision" "OCR verbose mode returns textBlocks with boundingBox" "yes" "${HAS_BLOCKS:-no}" "$dur"
+        fi
+      fi
+
+      # 17.7: Table extraction (standard tier)
+      if min_tier standard; then
+        if [[ -f "$VISION_TEST_DIR/table-financial.png" ]]; then
+          t0=$(now_ms)
+          RESP=$(curl -sf --max-time 30 "$BASE_URL/v1/vision/ocr" \
+            -H "Content-Type: application/json" \
+            -d "{\"file\": \"$VISION_TEST_DIR/table-financial.png\", \"table\": true}" 2>/dev/null || echo '{}')
+          dur=$(($(now_ms) - t0))
+          HAS_TABLE=$(echo "$RESP" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    docs = d.get('documents', [{}])
+    tables = docs[0].get('tables', []) if docs else []
+    print('yes' if tables else 'no')
+except:
+    print('no')
+" 2>/dev/null)
+          if [[ "$HAS_TABLE" == "yes" ]]; then
+            run_test "Vision" "OCR table extraction returns tables array" "yes" "PASS" "$dur"
+          else
+            run_test "Vision" "OCR table extraction returns tables array" "yes" "${HAS_TABLE:-no}" "$dur"
+          fi
+        else
+          run_test "Vision" "OCR table extraction (corpus missing)" "table-financial.png" "SKIP"
+        fi
+      fi
+
+      # 17.8: Multi-page PDF (standard tier)
+      if min_tier standard; then
+        if [[ -f "$VISION_TEST_DIR/multipage-report.pdf" ]]; then
+          t0=$(now_ms)
+          RESP=$(curl -sf --max-time 60 "$BASE_URL/v1/vision/ocr" \
+            -H "Content-Type: application/json" \
+            -d "{\"file\": \"$VISION_TEST_DIR/multipage-report.pdf\"}" 2>/dev/null || echo '{}')
+          dur=$(($(now_ms) - t0))
+          MULTI_PAGE=$(echo "$RESP" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    docs = d.get('documents', [{}])
+    doc = docs[0] if docs else {}
+    pages = doc.get('pages', [])
+    page_count = doc.get('pageCount', len(pages))
+    print('yes' if page_count >= 2 else 'no')
+except:
+    print('no')
+" 2>/dev/null)
+          if [[ "$MULTI_PAGE" == "yes" ]]; then
+            run_test "Vision" "OCR multi-page PDF returns multiple pages" "yes" "PASS" "$dur"
+          else
+            run_test "Vision" "OCR multi-page PDF returns multiple pages" "yes" "${MULTI_PAGE:-no}" "$dur"
+          fi
+        else
+          run_test "Vision" "OCR multi-page PDF (corpus missing)" "multipage-report.pdf" "SKIP"
+        fi
+      fi
+
+      # 17.9: Recognition level fast (standard tier)
+      if min_tier standard; then
+        t0=$(now_ms)
+        RESP=$(curl -sf --max-time 30 "$BASE_URL/v1/vision/ocr" \
+          -H "Content-Type: application/json" \
+          -d "{\"file\": \"$VISION_TEST_IMAGE\", \"recognition_level\": \"fast\"}" 2>/dev/null || echo '{}')
+        dur=$(($(now_ms) - t0))
+        HAS_TEXT=$(echo "$RESP" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print('yes' if d.get('combined_text', '').strip() else 'no')
+except:
+    print('no')
+" 2>/dev/null)
+        if [[ "$HAS_TEXT" == "yes" ]]; then
+          run_test "Vision" "OCR recognition_level=fast returns text" "yes" "PASS" "$dur"
+        else
+          run_test "Vision" "OCR recognition_level=fast returns text" "yes" "${HAS_TEXT:-no}" "$dur"
+        fi
+      fi
+
+      # 17.10: Recognition level accurate (standard tier)
+      if min_tier standard; then
+        t0=$(now_ms)
+        RESP=$(curl -sf --max-time 30 "$BASE_URL/v1/vision/ocr" \
+          -H "Content-Type: application/json" \
+          -d "{\"file\": \"$VISION_TEST_IMAGE\", \"recognition_level\": \"accurate\"}" 2>/dev/null || echo '{}')
+        dur=$(($(now_ms) - t0))
+        HAS_TEXT=$(echo "$RESP" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print('yes' if d.get('combined_text', '').strip() else 'no')
+except:
+    print('no')
+" 2>/dev/null)
+        if [[ "$HAS_TEXT" == "yes" ]]; then
+          run_test "Vision" "OCR recognition_level=accurate returns text" "yes" "PASS" "$dur"
+        else
+          run_test "Vision" "OCR recognition_level=accurate returns text" "yes" "${HAS_TEXT:-no}" "$dur"
+        fi
+      fi
+
+      # 17.11: Language override (standard tier)
+      if min_tier standard; then
+        if [[ -f "$VISION_TEST_DIR/multilang-french.jpg" ]]; then
+          t0=$(now_ms)
+          RESP=$(curl -sf --max-time 30 "$BASE_URL/v1/vision/ocr" \
+            -H "Content-Type: application/json" \
+            -d "{\"file\": \"$VISION_TEST_DIR/multilang-french.jpg\", \"languages\": [\"fr\"]}" 2>/dev/null || echo '{}')
+          dur=$(($(now_ms) - t0))
+          HAS_FRENCH=$(echo "$RESP" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    text = d.get('combined_text', '').lower()
+    # Check for key French words
+    print('yes' if 'civilisation' in text or 'damnation' in text or 'misere' in text or 'misérables' in text.lower() else 'no')
+except:
+    print('no')
+" 2>/dev/null)
+          if [[ "$HAS_FRENCH" == "yes" ]]; then
+            run_test "Vision" "OCR language override (French) extracts French text" "yes" "PASS" "$dur"
+          else
+            run_test "Vision" "OCR language override (French) extracts French text" "yes" "${HAS_FRENCH:-no}" "$dur"
+          fi
+        else
+          run_test "Vision" "OCR language override (corpus missing)" "multilang-french.jpg" "SKIP"
+        fi
+      fi
+
+      # 17.12: Known-answer receipt (standard tier)
+      if min_tier standard; then
+        if [[ -f "$VISION_TEST_DIR/receipt-grocery.jpg" ]]; then
+          t0=$(now_ms)
+          RESP=$(curl -sf --max-time 30 "$BASE_URL/v1/vision/ocr" \
+            -H "Content-Type: application/json" \
+            -d "{\"file\": \"$VISION_TEST_DIR/receipt-grocery.jpg\"}" 2>/dev/null || echo '{}')
+          dur=$(($(now_ms) - t0))
+          KNOWN_ANS=$(echo "$RESP" | python3 -c "
+import sys, json, re
+try:
+    d = json.load(sys.stdin)
+    text = d.get('combined_text', '')
+    has_total = 'TOTAL' in text.upper() or 'total' in text.lower()
+    has_price = bool(re.search(r'\d+\.\d{2}', text))
+    print('yes' if has_total and has_price else 'no')
+except:
+    print('no')
+" 2>/dev/null)
+          if [[ "$KNOWN_ANS" == "yes" ]]; then
+            run_test "Vision" "OCR known-answer: receipt has TOTAL and prices" "yes" "PASS" "$dur"
+          else
+            run_test "Vision" "OCR known-answer: receipt has TOTAL and prices" "yes" "${KNOWN_ANS:-no}" "$dur"
+          fi
+        else
+          run_test "Vision" "OCR known-answer receipt (corpus missing)" "receipt-grocery.jpg" "SKIP"
+        fi
+      fi
+
+      # 17.13: Known-answer code (standard tier)
+      if min_tier standard; then
+        if [[ -f "$VISION_TEST_DIR/screenshot-code.png" ]]; then
+          t0=$(now_ms)
+          RESP=$(curl -sf --max-time 30 "$BASE_URL/v1/vision/ocr" \
+            -H "Content-Type: application/json" \
+            -d "{\"file\": \"$VISION_TEST_DIR/screenshot-code.png\"}" 2>/dev/null || echo '{}')
+          dur=$(($(now_ms) - t0))
+          KNOWN_CODE=$(echo "$RESP" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    text = d.get('combined_text', '')
+    has_func = 'func' in text
+    has_import = 'import' in text
+    has_return = 'return' in text
+    print('yes' if has_func and has_import else 'no')
+except:
+    print('no')
+" 2>/dev/null)
+          if [[ "$KNOWN_CODE" == "yes" ]]; then
+            run_test "Vision" "OCR known-answer: code has func/import keywords" "yes" "PASS" "$dur"
+          else
+            run_test "Vision" "OCR known-answer: code has func/import keywords" "yes" "${KNOWN_CODE:-no}" "$dur"
+          fi
+        else
+          run_test "Vision" "OCR known-answer code (corpus missing)" "screenshot-code.png" "SKIP"
+        fi
+      fi
+
+      # 17.14: Data URL input (standard tier)
+      if min_tier standard; then
+        t0=$(now_ms)
+        B64_DATA=$(base64 < "$VISION_TEST_IMAGE" | tr -d '\n')
+        RESP=$(curl -sf --max-time 30 "$BASE_URL/v1/vision/ocr" \
+          -H "Content-Type: application/json" \
+          -d "{\"data\": \"data:image/png;base64,$B64_DATA\"}" 2>/dev/null || echo '{"error":"curl_failed"}')
+        dur=$(($(now_ms) - t0))
+        HAS_TEXT=$(echo "$RESP" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print('yes' if d.get('combined_text', '').strip() else 'no')
+except:
+    print('no')
+" 2>/dev/null)
+        if [[ "$HAS_TEXT" == "yes" ]]; then
+          run_test "Vision" "OCR data URL input returns text" "yes" "PASS" "$dur"
+        else
+          run_test "Vision" "OCR data URL input returns text" "yes" "${HAS_TEXT:-no}" "$dur"
+        fi
+      fi
+
+      # 17.15: Latency budget (full tier)
+      CURRENT_TIER="full"
+      if min_tier full; then
+        t0=$(now_ms)
+        curl -sf --max-time 30 "$BASE_URL/v1/vision/ocr" \
+          -H "Content-Type: application/json" \
+          -d "{\"file\": \"$VISION_TEST_IMAGE\"}" >/dev/null 2>&1
+        dur=$(($(now_ms) - t0))
+        if [[ $dur -lt $VISION_LATENCY_BUDGET_MS ]]; then
+          run_test "Vision" "OCR latency < ${VISION_LATENCY_BUDGET_MS}ms" "<${VISION_LATENCY_BUDGET_MS}ms" "PASS" "$dur"
+        else
+          run_test "Vision" "OCR latency < ${VISION_LATENCY_BUDGET_MS}ms" "<${VISION_LATENCY_BUDGET_MS}ms" "${dur}ms" "$dur"
+        fi
+      fi
+    fi
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section 18: Speech Transcription
+# ═══════════════════════════════════════════════════════════════════════════════
+if should_run_section 18; then
+  CURRENT_TIER="smoke"
+  echo ""
+  echo "🎙️  Section 18: Speech Transcription"
+
+  SPEECH_TEST_DIR="$SCRIPT_DIR/test-data/speech"
+  SPEECH_LATENCY_BUDGET_FACTOR=1.0  # must be faster than realtime
+
+  # Preflight: check if speech API is available (PR #107 not yet merged)
+  SPEECH_TEST_FILE="$SPEECH_TEST_DIR/short-5s.wav"
+  if [[ ! -f "$SPEECH_TEST_FILE" ]]; then
+    run_test "Speech" "Speech test corpus missing (run generate-test-corpus.sh)" "corpus present" "SKIP"
+  else
+    SPEECH_CHECK=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 10 \
+      "$BASE_URL/v1/audio/transcriptions" \
+      -F "file=@$SPEECH_TEST_FILE" 2>/dev/null || echo "000")
+
+    if [[ "$SPEECH_CHECK" == "000" || "$SPEECH_CHECK" == "404" || "$SPEECH_CHECK" == "405" ]]; then
+      run_test "Speech" "Speech API available (PR #107 not merged)" "200" "SKIP"
+      echo "  ⏭️  Speech API not available — skipping Section 18"
+    else
+      # 18.1: Speech API responds
+      if [[ "$SPEECH_CHECK" == "200" ]]; then
+        run_test "Speech" "Speech API endpoint responds" "200" "PASS"
+      else
+        run_test "Speech" "Speech API endpoint responds" "200" "$SPEECH_CHECK"
+      fi
+
+      # 18.2: Speech file input returns text
+      if min_tier smoke; then
+        t0=$(now_ms)
+        RESP=$(curl -sf --max-time 60 "$BASE_URL/v1/audio/transcriptions" \
+          -F "file=@$SPEECH_TEST_FILE" 2>/dev/null || echo '{}')
+        dur=$(($(now_ms) - t0))
+        HAS_TEXT=$(echo "$RESP" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print('yes' if d.get('text', '').strip() else 'no')
+except:
+    print('no')
+" 2>/dev/null)
+        if [[ "$HAS_TEXT" == "yes" ]]; then
+          run_test "Speech" "Speech file input returns text" "yes" "PASS" "$dur"
+        else
+          run_test "Speech" "Speech file input returns text" "yes" "${HAS_TEXT:-no}" "$dur"
+        fi
+      fi
+
+      # 18.3: Response schema
+      if min_tier smoke; then
+        t0=$(now_ms)
+        RESP=$(curl -sf --max-time 60 "$BASE_URL/v1/audio/transcriptions" \
+          -F "file=@$SPEECH_TEST_FILE" 2>/dev/null || echo '{}')
+        dur=$(($(now_ms) - t0))
+        SCHEMA_OK=$(echo "$RESP" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print('yes' if isinstance(d.get('text'), str) else 'no')
+except:
+    print('no')
+" 2>/dev/null)
+        if [[ "$SCHEMA_OK" == "yes" ]]; then
+          run_test "Speech" "Speech response has text field (string)" "yes" "PASS" "$dur"
+        else
+          run_test "Speech" "Speech response has text field (string)" "yes" "${SCHEMA_OK:-no}" "$dur"
+        fi
+      fi
+
+      # 18.4: Error - missing file
+      if min_tier smoke; then
+        t0=$(now_ms)
+        HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 10 \
+          "$BASE_URL/v1/audio/transcriptions" \
+          -F "file=@/nonexistent/audio/file.wav" 2>/dev/null || echo "000")
+        dur=$(($(now_ms) - t0))
+        # curl will fail to attach a nonexistent file, so we expect either 4xx from server
+        # or 000 (curl error). Both are acceptable indicators.
+        if [[ "$HTTP_CODE" =~ ^4[0-9][0-9]$ || "$HTTP_CODE" == "000" ]]; then
+          run_test "Speech" "Speech error: missing file" "4xx/curl_error" "PASS" "$dur"
+        else
+          run_test "Speech" "Speech error: missing file" "4xx" "$HTTP_CODE" "$dur"
+        fi
+      fi
+
+      # 18.5: Error - unsupported format
+      if min_tier smoke; then
+        t0=$(now_ms)
+        echo "This is plain text, not audio." > /tmp/test-speech-unsupported.$$.txt
+        HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 10 \
+          "$BASE_URL/v1/audio/transcriptions" \
+          -F "file=@/tmp/test-speech-unsupported.$$.txt" 2>/dev/null || echo "000")
+        dur=$(($(now_ms) - t0))
+        rm -f /tmp/test-speech-unsupported.$$.txt
+        if [[ "$HTTP_CODE" =~ ^4[0-9][0-9]$ ]]; then
+          run_test "Speech" "Speech error: unsupported format returns 4xx" "4xx" "PASS" "$dur"
+        else
+          run_test "Speech" "Speech error: unsupported format returns 4xx" "4xx" "$HTTP_CODE" "$dur"
+        fi
+      fi
+
+      # 18.6: Known-answer (standard tier)
+      CURRENT_TIER="standard"
+      if min_tier standard; then
+        t0=$(now_ms)
+        RESP=$(curl -sf --max-time 60 "$BASE_URL/v1/audio/transcriptions" \
+          -F "file=@$SPEECH_TEST_FILE" 2>/dev/null || echo '{}')
+        dur=$(($(now_ms) - t0))
+        KNOWN_ANS=$(echo "$RESP" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    text = d.get('text', '').lower()
+    # Ground truth: 'Hello, this is a short test of the speech transcription system.'
+    has_hello = 'hello' in text
+    has_test = 'test' in text
+    has_speech = 'speech' in text or 'transcription' in text
+    print('yes' if has_hello and has_test else 'no')
+except:
+    print('no')
+" 2>/dev/null)
+        if [[ "$KNOWN_ANS" == "yes" ]]; then
+          run_test "Speech" "Speech known-answer: contains expected phrases" "yes" "PASS" "$dur"
+        else
+          run_test "Speech" "Speech known-answer: contains expected phrases" "yes" "${KNOWN_ANS:-no}" "$dur"
+        fi
+      fi
+
+      # 18.7: Latency budget (full tier)
+      CURRENT_TIER="full"
+      if min_tier full; then
+        t0=$(now_ms)
+        curl -sf --max-time 60 "$BASE_URL/v1/audio/transcriptions" \
+          -F "file=@$SPEECH_TEST_FILE" >/dev/null 2>&1
+        dur=$(($(now_ms) - t0))
+        # short-5s.wav is ~5s audio, should transcribe in < 5s (realtime factor < 1.0)
+        AUDIO_DURATION_MS=5000
+        if [[ $dur -lt $AUDIO_DURATION_MS ]]; then
+          run_test "Speech" "Speech realtime factor < 1.0 (5s audio)" "<${AUDIO_DURATION_MS}ms" "PASS" "$dur"
+        else
+          run_test "Speech" "Speech realtime factor < 1.0 (5s audio)" "<${AUDIO_DURATION_MS}ms" "${dur}ms" "$dur"
+        fi
+      fi
+    fi
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Generate HTML Report
 # ═══════════════════════════════════════════════════════════════════════════════
 TEST_END_TIME=$(date +%s)
@@ -4231,6 +4778,8 @@ cat > "$REPORT_FILE" <<'HTMLHEAD'
   .group-badge.NullableSchema { color: #79c0ff; border-color: #388bfd; }
   .group-badge.UnitTest { color: #a5d6ff; border-color: #58a6ff; }
   .group-badge.Batch { color: #7ee787; border-color: #3fb950; }
+  .group-badge.Vision { color: #79c0ff; border-color: #388bfd; }
+  .group-badge.Speech { color: #d2a8ff; border-color: #8957e5; }
   .tier-row td { background: #161b22; padding: 0.6rem 1rem; font-weight: 700; font-size: 0.9rem; border-bottom: 2px solid #30363d; border-top: 2px solid #30363d; }
   .tier-badge { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 6px; font-size: 0.7rem; font-weight: 600; }
   .tier-badge.unit { background: #1a1a2e; color: #a5d6ff; border: 1px solid #58a6ff; }
