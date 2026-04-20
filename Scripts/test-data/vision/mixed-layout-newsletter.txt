@@ -1,23 +1,4 @@
-TECH WEEKLY NEWSLETTER
-Issue #47 | March 2024
-
-BREAKING: AI Chip Shortage Expected Through 2025
-
-Industry analysts predict continued supply constraints for
-advanced AI accelerators as demand from cloud providers
-outpaces manufacturing capacity.
-
-SIDEBAR: Quick Stats
-- Global AI market: $196B (2024)
-- YoY growth: 37.3%
-- Top investor: Microsoft ($13B)
-
-FEATURE: The Rise of Local AI
-Running large language models on consumer hardware is no
-longer science fiction. Apple Silicon and dedicated NPUs
-are making on-device inference practical for everyday use.
-
-UPCOMING EVENTS
-- AI Summit SF: April 12-14
-- WWDC 2024: June 10
-- NeurIPS: December 9-15
+Page 1
+d'E.TE :ntworg YoY -
+82) H :ota qot -
+Ar-St linqA: 72 timmua IA -

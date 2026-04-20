@@ -315,6 +315,7 @@ async def benchmark_vision_ocr(session: aiohttp.ClientSession, base_url: str,
         "pass": passed,
         "runs": runs,
         "extracted_preview": extracted[:200] if extracted else "",
+        "_full_extracted": extracted,
     }
 
 
@@ -382,6 +383,7 @@ async def benchmark_speech(session: aiohttp.ClientSession, base_url: str,
         "pass": passed,
         "runs": runs,
         "transcribed_preview": transcribed[:200] if transcribed else "",
+        "_full_transcribed": transcribed,
     }
 
 
@@ -476,6 +478,8 @@ async def main():
     parser.add_argument("--speech-only", action="store_true")
     parser.add_argument("--skip-competitors", action="store_true")
     parser.add_argument("--output-dir", type=str, default=str(RESULTS_DIR))
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Capture actual OCR/speech output as new ground truth .txt files")
     args = parser.parse_args()
 
     base_url = f"http://127.0.0.1:{args.port}"
@@ -530,6 +534,15 @@ async def main():
                         speedup = result["tesseract_latency_ms"] / result["afm_latency_ms"] if result["afm_latency_ms"] > 0 else 0
                         tess_str = f" | Tess={result['tesseract_latency_ms']:.0f}ms ({speedup:.1f}x)"
                     print(f" {result['afm_latency_ms']:.0f}ms | {cer_str} | {gpu_str}{tess_str} | {status}")
+
+                    # Calibrate: save actual OCR output as ground truth
+                    if args.calibrate and result.get("extracted_preview"):
+                        gt_path = fp.parent / (fp.stem + ".txt")
+                        # Get full text from last run
+                        full_text = result.get("_full_extracted", result.get("extracted_preview", ""))
+                        gt_path.write_text(full_text + "\n")
+                        print(f"    → Calibrated: {gt_path.name}")
+
                     results.append(result)
             print()
 
@@ -589,7 +602,7 @@ async def main():
                         results.append(result)
             print()
 
-    # ─── Write Results ───────────────────────────────────────────────────────
+    # ─── Write Results (strip internal fields) ────────────────────────────────
     with open(jsonl_path, "w") as f:
         # Metadata line
         meta = {
@@ -602,7 +615,9 @@ async def main():
         }
         f.write(json.dumps(meta) + "\n")
         for r in results:
-            f.write(json.dumps(r) + "\n")
+            # Strip internal fields (prefixed with _) from JSONL output
+            clean = {k: v for k, v in r.items() if not k.startswith("_")}
+            f.write(json.dumps(clean) + "\n")
 
     # ─── Summary ─────────────────────────────────────────────────────────────
     vision_results = [r for r in results if r["category"] == "vision"]
@@ -686,11 +701,12 @@ async def main():
         try:
             subprocess.run(
                 [sys.executable, str(report_script), "--output", report_path, str(jsonl_path)],
-                check=True
+                capture_output=True, check=True
             )
             print(f"  Report: {report_path}")
             # Auto-open in browser on macOS
-            subprocess.run(["open", report_path], check=False)
+            subprocess.run(["open", report_path], check=False,
+                          capture_output=True)
         except subprocess.CalledProcessError as e:
             print(f"  Report generation failed: {e}")
     print("=" * 60)
