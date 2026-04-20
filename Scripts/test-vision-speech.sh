@@ -37,6 +37,7 @@ BENCHMARK_ONLY=false
 ASSERTIONS_ONLY=false
 SKIP_CORPUS_GEN=false
 NO_SERVER=false
+AFM_MODEL=""
 VLM_MODEL=""
 
 while [[ $# -gt 0 ]]; do
@@ -50,12 +51,14 @@ while [[ $# -gt 0 ]]; do
     --assertions-only) ASSERTIONS_ONLY=true; shift ;;
     --skip-corpus-gen) SKIP_CORPUS_GEN=true; shift ;;
     --no-server) NO_SERVER=true; shift ;;
+    --model) AFM_MODEL="$2"; shift 2 ;;
     --vlm-model) VLM_MODEL="$2"; shift 2 ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS]"
       echo ""
       echo "Options:"
       echo "  --port PORT          AFM server port (default: $DEFAULT_PORT)"
+      echo "  --model MODEL        MLX model for AFM server (default: Apple Foundation Models mode)"
       echo "  --vlm-model MODEL    MLX VLM model for comparison (starts on --vlm-port)"
       echo "  --vlm-port PORT      VLM server port (default: $DEFAULT_VLM_PORT)"
       echo "  --runs N             Benchmark runs per file (default: $DEFAULT_RUNS)"
@@ -154,11 +157,12 @@ if [[ "$MACOS_MAJOR" -lt "$REQUIRED_MACOS_VERSION" ]]; then
   warn "Vision OCR tests will be skipped"
 fi
 
-# Check afm binary
-if [[ ! -x "$AFM_BIN" ]]; then
+# Check afm binary (only needed if we're managing servers)
+if [[ "$NO_SERVER" != "true" && ! -x "$AFM_BIN" ]]; then
   fail "afm binary not found at $AFM_BIN"
   echo "  Build first: swift build -c release"
   echo "  Or set AFM_BIN=/path/to/afm"
+  echo "  Or use --no-server if server is already running"
   exit 1
 fi
 
@@ -174,21 +178,41 @@ fi
 if [[ "$NO_SERVER" != "true" ]]; then
   # Check if server is already running on our port
   if curl -sf --max-time 2 "$BASE_URL/health" >/dev/null 2>&1; then
+    # Not our process — no PID tracking; if it dies mid-run, benchmarks will fail with connection errors
     info "Server already running at $BASE_URL — using it"
   else
     info "Starting AFM server on port $PORT ..."
 
-    # Kill any stale process on the port
+    # Kill any stale afm process on the port (SIGTERM first, then SIGKILL)
     stale_pid=$(lsof -ti :"$PORT" 2>/dev/null || true)
     if [[ -n "$stale_pid" ]]; then
-      warn "Killing stale process on port $PORT (PID $stale_pid)"
-      kill -KILL $stale_pid 2>/dev/null || true
-      sleep 1
+      # Only kill if it's actually an afm process
+      stale_cmd=$(ps -o comm= -p "$stale_pid" 2>/dev/null || true)
+      if [[ "$stale_cmd" == *afm* ]]; then
+        warn "Stopping stale afm on port $PORT (PID $stale_pid)"
+        kill "$stale_pid" 2>/dev/null || true
+        sleep 2
+        kill -0 "$stale_pid" 2>/dev/null && kill -KILL "$stale_pid" 2>/dev/null || true
+        sleep 1
+      else
+        fail "Port $PORT in use by '$stale_cmd' (PID $stale_pid) — not an afm process, refusing to kill"
+        exit 1
+      fi
+    fi
+
+    # Export model cache if set
+    if [[ -n "$MODEL_CACHE" ]]; then
+      export MACAFM_MLX_MODEL_CACHE="$MODEL_CACHE"
     fi
 
     AFM_SERVER_LOG="/tmp/afm-vision-speech-server-$$.log"
-    env ${MODEL_CACHE:+MACAFM_MLX_MODEL_CACHE="$MODEL_CACHE"} \
+    # If --model specified, use MLX backend; otherwise Apple Foundation Models mode
+    if [[ -n "$AFM_MODEL" ]]; then
+      "$AFM_BIN" mlx -m "$AFM_MODEL" --port "$PORT" > "$AFM_SERVER_LOG" 2>&1 &
+    else
+      # Apple Foundation Models mode — Vision OCR works without a model
       "$AFM_BIN" --port "$PORT" > "$AFM_SERVER_LOG" 2>&1 &
+    fi
     AFM_SERVER_PID=$!
 
     info "Waiting for server (PID $AFM_SERVER_PID) ..."
@@ -224,28 +248,39 @@ if [[ -n "$VLM_MODEL" ]]; then
 
     stale_pid=$(lsof -ti :"$VLM_PORT" 2>/dev/null || true)
     if [[ -n "$stale_pid" ]]; then
-      warn "Killing stale process on port $VLM_PORT (PID $stale_pid)"
-      kill -KILL $stale_pid 2>/dev/null || true
-      sleep 1
+      stale_cmd=$(ps -o comm= -p "$stale_pid" 2>/dev/null || true)
+      if [[ "$stale_cmd" == *afm* ]]; then
+        warn "Stopping stale afm on port $VLM_PORT (PID $stale_pid)"
+        kill "$stale_pid" 2>/dev/null || true
+        sleep 2
+        kill -0 "$stale_pid" 2>/dev/null && kill -KILL "$stale_pid" 2>/dev/null || true
+        sleep 1
+      else
+        fail "Port $VLM_PORT in use by '$stale_cmd' (PID $stale_pid) — not an afm process, refusing to kill"
+        warn "Continuing without VLM comparison"
+        VLM_URL=""
+        VLM_MODEL=""
+      fi
     fi
 
-    VLM_SERVER_LOG="/tmp/afm-vlm-server-$$.log"
-    env ${MODEL_CACHE:+MACAFM_MLX_MODEL_CACHE="$MODEL_CACHE"} \
+    if [[ -n "$VLM_MODEL" ]]; then
+      VLM_SERVER_LOG="/tmp/afm-vlm-server-$$.log"
       "$AFM_BIN" mlx -m "$VLM_MODEL" --port "$VLM_PORT" --vlm > "$VLM_SERVER_LOG" 2>&1 &
-    VLM_SERVER_PID=$!
+      VLM_SERVER_PID=$!
 
-    info "Waiting for VLM server (PID $VLM_SERVER_PID) — this may take a minute for large models ..."
-    if wait_for_server "$VLM_URL" "$VLM_STARTUP_TIMEOUT_SECONDS" "VLM"; then
-      ok "VLM server ready"
-    else
-      fail "VLM server failed to start within ${VLM_STARTUP_TIMEOUT_SECONDS}s"
-      echo "  Log: $VLM_SERVER_LOG"
-      tail -5 "$VLM_SERVER_LOG" 2>/dev/null || true
-      warn "Continuing without VLM comparison"
-      VLM_URL=""
-      VLM_MODEL=""
-      kill_server $VLM_SERVER_PID
-      VLM_SERVER_PID=0
+      info "Waiting for VLM server (PID $VLM_SERVER_PID) — this may take a minute for large models ..."
+      if wait_for_server "$VLM_URL" "$VLM_STARTUP_TIMEOUT_SECONDS" "VLM"; then
+        ok "VLM server ready"
+      else
+        fail "VLM server failed to start within ${VLM_STARTUP_TIMEOUT_SECONDS}s"
+        echo "  Log: $VLM_SERVER_LOG"
+        tail -5 "$VLM_SERVER_LOG" 2>/dev/null || true
+        warn "Continuing without VLM comparison"
+        VLM_URL=""
+        VLM_MODEL=""
+        kill_server $VLM_SERVER_PID
+        VLM_SERVER_PID=0
+      fi
     fi
   fi
 fi
