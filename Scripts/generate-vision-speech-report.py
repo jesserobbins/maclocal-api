@@ -145,7 +145,7 @@ def generate_html(meta: dict, results: list, output_path: str):
   <h2>Vision OCR Results</h2>
   <table>
     <thead>
-      <tr><th>Document</th><th>Wall (ms)</th><th>CPU (ms)</th><th>GPU (ms)</th><th>Tess (ms)</th><th>Speedup</th><th>CER</th><th>Status</th></tr>
+      <tr><th>Document</th><th>Wall (ms)</th><th>CPU (ms)</th><th>GPU (ms)</th><th>ANE* (ms)</th><th>Tess (ms)</th><th>Speedup</th><th>CER</th><th>Status</th></tr>
     </thead>
     <tbody>
 """)
@@ -172,18 +172,22 @@ def generate_html(meta: dict, results: list, output_path: str):
             else:
                 speedup_str = "—"
 
+            ane_ms = max(0, latency - (cpu_time or 0) - (gpu_time or 0)) if cpu_time is not None else None
+            ane_str = f"{ane_ms:.0f}" if ane_ms is not None else "—"
+
             html_parts.append(f"""      <tr>
         <td>{html_module.escape(r['file'])}</td>
         <td class="metric">{latency:.0f}</td>
         <td class="metric">{cpu_str}</td>
         <td class="metric">{gpu_str}</td>
+        <td class="metric" style="font-weight:600;">{ane_str}</td>
         <td class="metric">{tess_str}</td>
         <td class="metric">{speedup_str}</td>
         <td class="metric {cer_class}">{cer_str}</td>
         <td><span class="badge {badge_class}">{'PASS' if passed else 'FAIL'}</span></td>
       </tr>
 """)
-        html_parts.append("    </tbody>\n  </table>\n</div>\n")
+        html_parts.append(f'    </tbody>\n  </table>\n  <p style="color:{MUTED_COLOR}; font-size:0.75rem; margin-top:0.5rem;">* ANE = Wall − CPU − GPU (inferred accelerator time)</p>\n</div>\n')
 
     # ─── Speech Matrix ───────────────────────────────────────────────────────
     if speech_results:
@@ -192,7 +196,7 @@ def generate_html(meta: dict, results: list, output_path: str):
   <h2>Speech Transcription Results</h2>
   <table>
     <thead>
-      <tr><th>Audio</th><th>Duration</th><th>Wall (ms)</th><th>CPU (ms)</th><th>GPU (ms)</th><th>Whisper (ms)</th><th>Speedup</th><th>WER</th><th>RTF</th><th>Status</th></tr>
+      <tr><th>Audio</th><th>Duration</th><th>Wall (ms)</th><th>CPU (ms)</th><th>GPU (ms)</th><th>ANE* (ms)</th><th>Whisper (ms)</th><th>Speedup</th><th>WER</th><th>RTF</th><th>Status</th></tr>
     </thead>
     <tbody>
 """)
@@ -231,12 +235,16 @@ def generate_html(meta: dict, results: list, output_path: str):
             else:
                 speedup_str = "—"
 
+            ane_ms = max(0, latency - (cpu_time or 0) - (gpu_time or 0)) if cpu_time is not None else None
+            ane_str = f"{ane_ms:.0f}" if ane_ms is not None else "—"
+
             html_parts.append(f"""      <tr>
         <td>{html_module.escape(r['file'])}</td>
         <td class="metric">{duration:.1f}s</td>
         <td class="metric">{latency:.0f}</td>
         <td class="metric">{cpu_str}</td>
         <td class="metric">{gpu_str}</td>
+        <td class="metric" style="font-weight:600;">{ane_str}</td>
         <td class="metric">{whisp_str}</td>
         <td class="metric">{speedup_str}</td>
         <td class="metric {wer_class}">{wer_str}</td>
