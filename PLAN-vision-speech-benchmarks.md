@@ -8,6 +8,13 @@ Build a comprehensive test and benchmark framework for AFM's Vision OCR and Spee
 3. Produces publishable HTML reports matching the kruks.ai/macafm/ style
 4. Extends the existing assertion test suite with vision/speech correctness checks
 
+### Key Architecture Assumptions
+
+- **Vision OCR is model-independent**: The `/v1/vision/ocr` endpoint uses Apple Vision framework directly — no LLM model needs to be loaded. The server just needs to be running (any backend, or `--vision-only` if added).
+- **Speech transcription is not yet merged**: PR #107 describes the API (`POST /v1/audio/transcriptions`, `afm speech -f <file>`) but the code is not in the current source tree. Benchmark and assertion code should be written against the documented API and gated behind availability checks.
+- **Existing sections end at 16**: `test-assertions.sh` currently has Sections 0-16. Vision OCR becomes Section 17, Speech becomes Section 18.
+- **Test data lives in `Scripts/test-data/`**: Currently contains only `opencode-system-prompt.json`. New corpus adds `vision/` and `speech/` subdirectories.
+
 ---
 
 ## Phase 1: Test Corpus — Diverse Reference Documents & Audio
@@ -23,7 +30,7 @@ Each document has a source image/PDF plus a ground-truth `.txt` file with expect
 | Receipt | `receipt-grocery.jpg` | Typical grocery store receipt with items, prices, totals | Generated (typeset) |
 | Receipt | `receipt-restaurant.jpg` | Restaurant bill with tip line | Generated (typeset) |
 | Invoice | `invoice-standard.pdf` | Business invoice with line items, tax, totals | Generated (typeset) |
-| Menu | `menu-restaurant.jpg` | Multi-column restaurant menu (reuse `afm-test/ocr-test-1.jpg` if suitable) | Existing or Creative Commons |
+| Menu | `menu-restaurant.jpg` | Multi-column restaurant menu | Creative Commons or generated |
 | Business Card | `business-card.jpg` | Standard business card with name, title, phone, email | Generated |
 | Handwritten Note | `handwritten-note.jpg` | Legible handwritten text on lined paper | Public domain sample |
 | Academic Paper | `academic-paper-page1.pdf` | First page of a scientific paper with title, abstract, two-column text | arXiv (CC-BY, public domain) |
@@ -38,6 +45,9 @@ Each document has a source image/PDF plus a ground-truth `.txt` file with expect
 | Low Quality | `low-quality-scan.jpg` | Poor quality scan with noise/skew | Generated (degrade a clean doc) |
 | Whiteboard | `whiteboard-notes.jpg` | Photo of whiteboard with handwritten text and diagrams | Creative Commons or generated |
 | Medical/Label | `prescription-label.jpg` | Prescription or product label with small dense text | Generated |
+| High-DPI Photo | `photo-document-4k.jpg` | 4K photo of a printed document at slight angle (camera OCR) | Generated (print + photograph) |
+| Mixed Layout | `mixed-layout-newsletter.pdf` | Newsletter with headers, body text, sidebars, pull quotes, images | Generated (typeset) |
+| Rotated/Skewed | `rotated-scan.jpg` | Document scanned at 10-15 degree rotation | Generated (rotate a clean doc) |
 
 **Ground truth files:** Each `<name>.txt` contains the expected OCR output. For images where exact match is impractical (handwriting, low quality), the ground truth includes key phrases that must appear.
 
@@ -69,7 +79,7 @@ Each audio file has a ground-truth `.txt` transcript.
 - **Creative Commons audio**: Freesound.org, archive.org for environmental audio, conversations
 - **Generated via macOS `say` TTS**: For controlled test cases (numbers, technical terms, specific phrases) — e.g., `say -o output.aiff "The meeting is at 3:45 PM on January 15th"`
 - **Downsampled/degraded**: Take clean audio and add noise or reduce sample rate for edge case tests
-- **Existing**: Reuse `afm-test/speech-test.wav` and `afm-test/speech-test-long.wav`
+- **Existing (if available)**: Reuse `afm-test/speech-test.wav` and `afm-test/speech-test-long.wav` if present in the working tree (these are untracked test fixtures, not guaranteed to exist on all machines)
 
 ### 1C. Corpus Generator Script (`Scripts/generate-test-corpus.sh`)
 
@@ -113,17 +123,24 @@ Follows the existing `benchmark_afm_vs_mlxlm.py` pattern:
 ### Key Metrics
 
 **Vision OCR:**
-- Latency (ms) per document
-- Character Error Rate (CER) vs ground truth
-- Word-level accuracy %
+- Latency (ms) per document — median across 3 runs (first run excluded as warmup)
+- Character Error Rate (CER) vs ground truth — using `python-Levenshtein` or `jiwer`
+- Word-level accuracy % — intersection of word sets / union (Jaccard similarity)
 - Pages per second (for multi-page PDFs)
 - Document type pass/fail (did it extract the key content?)
+- Structured extraction accuracy: for table documents, compare extracted CSV structure
 
 **Speech Transcription:**
-- Latency (ms)
-- Realtime factor (audio_duration / processing_time)
-- Word Error Rate (WER)
-- Per-category accuracy (clean vs noisy vs accented)
+- Latency (ms) — median across 3 runs
+- Realtime factor (processing_time / audio_duration) — lower is better, <1.0 = faster than realtime
+- Word Error Rate (WER) — standard metric via `jiwer` library
+- Per-category accuracy breakdown (clean vs noisy vs accented vs multi-speaker)
+
+**Statistical methodology:**
+- Each test case runs 3 times minimum (configurable via `--runs N`)
+- Report median latency and p95 (not mean — avoids outlier skew)
+- First run of each document is excluded from timing (Vision framework warmup)
+- Accuracy metrics are deterministic (single run is sufficient)
 
 ### Competitor Setup
 
@@ -135,7 +152,7 @@ tesseract input.jpg output --oem 1  # LSTM engine
 
 **Whisper (whisper.cpp or openai-whisper):**
 ```bash
-# Option A: whisper.cpp (preferred — also runs on Apple Silicon)
+# Option A: whisper.cpp (preferred — also runs on Apple Silicon, uses CoreML/Metal)
 brew install whisper-cpp
 whisper-cpp -m models/ggml-base.en.bin -f audio.wav
 
@@ -143,6 +160,12 @@ whisper-cpp -m models/ggml-base.en.bin -f audio.wav
 pip install openai-whisper
 whisper audio.wav --model base
 ```
+
+**Whisper model selection for fair comparison:**
+- `base.en` (74M params): fastest, English-only — use as the "speed" competitor
+- `small.en` (244M params): good accuracy/speed tradeoff — use as the primary comparison point
+- `medium.en` (769M params): higher accuracy — optional "quality ceiling" reference
+- Report which Whisper model was used alongside each result
 
 The benchmark script checks for installed competitors and gracefully skips missing ones with a warning.
 
@@ -152,7 +175,21 @@ The benchmark script checks for installed competitors and gracefully skips missi
 
 ### Section 17: Vision OCR (extend `Scripts/test-assertions.sh`)
 
-Tests use the running AFM server and `curl` to hit `/v1/vision/ocr`:
+Tests use the running AFM server and `curl` to hit `POST /v1/vision/ocr`. Vision OCR does NOT require a model to be loaded — it uses Apple Vision framework directly. The server just needs to be running.
+
+**Example test patterns:**
+```bash
+# File path input
+curl -s "$BASE_URL/v1/vision/ocr" -H "Content-Type: application/json" \
+  -d '{"file": "/path/to/test.png"}'
+
+# Base64 input
+curl -s "$BASE_URL/v1/vision/ocr" -H "Content-Type: application/json" \
+  -d '{"data": "'"$(base64 < test.png)"'", "media_type": "image/png"}'
+
+# Multipart upload
+curl -s "$BASE_URL/v1/vision/ocr" -F "file=@/path/to/test.png"
+```
 
 | Test | Tier | What it checks |
 |------|------|----------------|
@@ -173,7 +210,11 @@ Tests use the running AFM server and `curl` to hit `/v1/vision/ocr`:
 
 ### Section 18: Speech Transcription (extend `Scripts/test-assertions.sh`)
 
-**Note:** Speech API endpoints may not be in the codebase yet. These tests should be written to match the API described in the user's PR (#107): `POST /v1/audio/transcriptions` and `afm speech -f <file>` CLI.
+**Note:** Speech API endpoints are NOT in the codebase yet. PR #107 describes `POST /v1/audio/transcriptions` and `afm speech -f <file>` CLI but the code has not been merged. Implementation strategy:
+- Write tests against the documented API shape now
+- Gate Section 18 behind a preflight check: `curl -sf "$BASE_URL/v1/audio/transcriptions" -X OPTIONS` or check `afm speech --help` exit code
+- If speech is unavailable, skip the entire section with a clear message: "Speech API not available (PR #107 not merged)"
+- Once speech lands, tests activate automatically with no code changes needed
 
 | Test | Tier | What it checks |
 |------|------|----------------|
@@ -225,9 +266,11 @@ Top-level script that orchestrates the full benchmark:
 
 ### Integration with existing infrastructure
 
-- Assertion tests added as Sections 17 & 18 in `test-assertions.sh` so they run with `--tier standard`
-- Benchmark JSONL format compatible with existing report infrastructure
-- Test corpus stored under `Scripts/test-data/` (already gitignored for large files)
+- Assertion tests added as Sections 17 & 18 in `test-assertions.sh` so they run with `--tier standard` and `--section 17` / `--section 18`
+- Benchmark Python script follows the pattern of `Scripts/benchmarks/benchmark_afm_vs_mlxlm.py` (async aiohttp, JSONL output, matplotlib charts)
+- Report generation follows the pattern of `Scripts/generate-report.py` and `Scripts/generate-structured-outputs-report.py`
+- Test corpus stored under `Scripts/test-data/vision/` and `Scripts/test-data/speech/`
+- Multi-model runner `Scripts/test-assertions-multi.sh` automatically picks up new sections
 
 ---
 
@@ -276,8 +319,9 @@ Scripts/
 
 ---
 
-## Open Questions
+## Open Questions / Decisions
 
-1. **Speech API availability**: The speech transcription endpoints (`POST /v1/audio/transcriptions`, `afm speech` CLI) are described in PR #107 but don't appear in the current source. The assertion tests and benchmarks for speech should be written against the documented API and will become active once the speech code is merged.
-2. **Large test files**: Audio files (especially 60s+) may be too large for git. Consider git-lfs or a download script that fetches from a known URL.
-3. **macOS version requirements**: Vision OCR requires macOS 26.0+. Tests should skip gracefully on older systems.
+1. **Speech API availability**: The speech transcription endpoints (`POST /v1/audio/transcriptions`, `afm speech` CLI) are described in PR #107 but don't appear in the current source. **Decision:** Write tests now, gate behind availability check, activate automatically when merged.
+2. **Large test files**: Audio files (especially 60s+) may be too large for git. **Decision:** Use `Scripts/generate-test-corpus.sh` as a download/generation script. Commit only small generated fixtures (<1MB each). Large files are downloaded on first run and cached locally. Add `Scripts/test-data/speech/*.wav` and `Scripts/test-data/vision/` to `.gitignore` with an exception for ground-truth `.txt` files.
+3. **macOS version requirements**: Vision OCR requires macOS 26.0+. **Decision:** Preflight check uses `sw_vers` to verify `ProductVersion >= 26.0`. Skip with clear message on older systems.
+4. **Tesseract language packs**: Tesseract needs language-specific tessdata for multi-language tests. The corpus generator should install required packs (`tesseract-lang` brew formula) or skip those tests.
