@@ -145,28 +145,41 @@ def generate_html(meta: dict, results: list, output_path: str):
   <h2>Vision OCR Results</h2>
   <table>
     <thead>
-      <tr><th>Document</th><th>Latency (ms)</th><th>CER</th><th>Word Acc</th><th>Status</th><th>Preview</th></tr>
+      <tr><th>Document</th><th>AFM (ms)</th><th>Tesseract (ms)</th><th>Speedup</th><th>CER</th><th>GPU%</th><th>Status</th><th>Preview</th></tr>
     </thead>
     <tbody>
 """)
         for r in vision_results:
             latency = r.get("afm_latency_ms", 0)
+            tess_latency = r.get("tesseract_latency_ms")
             cer = r.get("afm_cer")
-            word_acc = r.get("afm_word_acc")
             passed = r.get("pass")
             preview = html_module.escape(r.get("extracted_preview", "")[:80])
+            gpu_pct = r.get("afm_gpu_pct")
+            cpu_pct = r.get("afm_cpu_pct")
 
             cer_class = "good" if cer is not None and cer < 0.05 else ("warn" if cer is not None and cer < 0.15 else "bad")
             badge_class = "pass" if passed else "fail"
 
             cer_str = f"{cer:.3f}" if cer is not None else "N/A"
-            wacc_str = f"{word_acc:.1%}" if word_acc is not None else "N/A"
+            tess_str = f"{tess_latency:.0f}" if tess_latency is not None else "—"
+            speedup_str = ""
+            if tess_latency is not None and latency > 0:
+                speedup = tess_latency / latency
+                speedup_color = PASS_TEXT if speedup > 1 else FAIL_TEXT
+                speedup_str = f'<span style="color:{speedup_color}; font-weight:600;">{speedup:.1f}x</span>'
+            else:
+                speedup_str = "—"
+
+            gpu_str = f"{gpu_pct:.0f}%" if gpu_pct is not None else "0% (ANE)"
 
             html_parts.append(f"""      <tr>
         <td>{html_module.escape(r['file'])}</td>
         <td class="metric">{latency:.0f}</td>
+        <td class="metric">{tess_str}</td>
+        <td class="metric">{speedup_str}</td>
         <td class="metric {cer_class}">{cer_str}</td>
-        <td class="metric">{wacc_str}</td>
+        <td class="metric" style="color:{PASS_TEXT};">{gpu_str}</td>
         <td><span class="badge {badge_class}">{'PASS' if passed else 'FAIL'}</span></td>
         <td class="preview">{preview}</td>
       </tr>
@@ -180,7 +193,7 @@ def generate_html(meta: dict, results: list, output_path: str):
   <h2>Speech Transcription Results</h2>
   <table>
     <thead>
-      <tr><th>Audio</th><th>Duration (s)</th><th>Latency (ms)</th><th>WER</th><th>RTF</th><th>Status</th><th>Preview</th></tr>
+      <tr><th>Audio</th><th>Duration</th><th>AFM (ms)</th><th>Whisper (ms)</th><th>Speedup</th><th>WER</th><th>RTF</th><th>GPU%</th><th>Status</th></tr>
     </thead>
     <tbody>
 """)
@@ -195,39 +208,153 @@ def generate_html(meta: dict, results: list, output_path: str):
                 continue
 
             latency = r.get("afm_latency_ms", 0)
+            whisp_latency = r.get("whisper_latency_ms")
             wer = r.get("afm_wer")
             rtf = r.get("afm_rtf", 0)
             duration = r.get("audio_duration_s", 0)
             passed = r.get("pass")
-            preview = html_module.escape(r.get("transcribed_preview", "")[:80])
+            gpu_pct = r.get("afm_gpu_pct")
 
             wer_class = "good" if wer is not None and wer < 0.10 else ("warn" if wer is not None and wer < 0.20 else "bad")
             rtf_class = "good" if rtf < 0.5 else ("warn" if rtf < 1.0 else "bad")
             badge_class = "pass" if passed else "fail"
 
             wer_str = f"{wer:.3f}" if wer is not None else "N/A"
+            whisp_str = f"{whisp_latency:.0f}" if whisp_latency is not None else "—"
+            speedup_str = ""
+            if whisp_latency is not None and latency > 0:
+                speedup = whisp_latency / latency
+                speedup_color = PASS_TEXT if speedup > 1 else FAIL_TEXT
+                speedup_str = f'<span style="color:{speedup_color}; font-weight:600;">{speedup:.1f}x</span>'
+            else:
+                speedup_str = "—"
+            gpu_str = f"{gpu_pct:.0f}%" if gpu_pct is not None else "0% (ANE)"
 
             html_parts.append(f"""      <tr>
         <td>{html_module.escape(r['file'])}</td>
-        <td class="metric">{duration:.1f}</td>
+        <td class="metric">{duration:.1f}s</td>
         <td class="metric">{latency:.0f}</td>
+        <td class="metric">{whisp_str}</td>
+        <td class="metric">{speedup_str}</td>
         <td class="metric {wer_class}">{wer_str}</td>
         <td class="metric {rtf_class}">{rtf:.2f}x</td>
+        <td class="metric" style="color:{PASS_TEXT};">{gpu_str}</td>
         <td><span class="badge {badge_class}">{'PASS' if passed else 'FAIL'}</span></td>
-        <td class="preview">{preview}</td>
       </tr>
 """)
         html_parts.append("    </tbody>\n  </table>\n</div>\n")
 
-    # ─── Competitor Comparison ───────────────────────────────────────────────
-    has_tesseract = any(r.get("tesseract_cer") is not None for r in vision_results)
-    has_whisper = any(r.get("whisper_wer") is not None for r in speech_results)
+    # ─── Speed Comparison (Hero Section) ────────────────────────────────────
+    has_tess_speed = any(r.get("tesseract_latency_ms") is not None for r in vision_results)
+    has_whisp_speed = any(r.get("whisper_latency_ms") is not None for r in speech_results)
 
-    if has_tesseract or has_whisper:
-        html_parts.append('<div class="section">\n  <h2>Competitor Comparison</h2>\n  <div class="comparison">\n')
+    if has_tess_speed or has_whisp_speed:
+        html_parts.append(f"""
+<div class="section">
+  <h2 style="font-size:1.5rem; color:{ACCENT_COLOR};">Speed Comparison — AFM (Apple ANE) vs Alternatives</h2>
+  <p style="color:{MUTED_COLOR}; margin-bottom:1rem;">Lower is better. AFM uses the Apple Neural Engine (0% GPU), competitors use GPU/CPU.</p>
+""")
 
-        if has_tesseract:
-            html_parts.append('    <div class="card">\n      <h3>OCR: AFM vs Tesseract (CER)</h3>\n')
+        # ─── Speed: OCR ─────────────────────────────────────────────────────
+        if has_tess_speed:
+            # Calculate aggregate speedup
+            paired = [(r["afm_latency_ms"], r["tesseract_latency_ms"])
+                      for r in vision_results
+                      if r.get("tesseract_latency_ms") is not None and r.get("afm_latency_ms")]
+            if paired:
+                avg_afm = sum(a for a, _ in paired) / len(paired)
+                avg_tess = sum(t for _, t in paired) / len(paired)
+                speedup = avg_tess / avg_afm if avg_afm > 0 else 0
+                speedup_color = PASS_TEXT if speedup > 1 else FAIL_TEXT
+
+                html_parts.append(f"""
+  <div class="card" style="margin-bottom:1.5rem;">
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:1rem;">
+      <h3 style="color:{TEXT_COLOR}; margin:0;">OCR Latency: AFM Vision vs Tesseract</h3>
+      <div style="font-size:1.5rem; font-weight:700; color:{speedup_color};">{speedup:.1f}x {'faster' if speedup > 1 else 'slower'}</div>
+    </div>
+    <table>
+      <thead><tr><th>Document</th><th>AFM (ms)</th><th>Tesseract (ms)</th><th>Speedup</th><th>Winner</th></tr></thead>
+      <tbody>
+""")
+                for r in vision_results:
+                    tess_ms = r.get("tesseract_latency_ms")
+                    if tess_ms is None:
+                        continue
+                    afm_ms = r.get("afm_latency_ms", 0)
+                    row_speedup = tess_ms / afm_ms if afm_ms > 0 else 0
+                    winner = "AFM" if afm_ms < tess_ms else "Tesseract"
+                    winner_color = ACCENT_COLOR if winner == "AFM" else MUTED_COLOR
+                    bar_max = max(afm_ms, tess_ms, 1)
+                    afm_pct = int(afm_ms / bar_max * 100)
+                    tess_pct = int(tess_ms / bar_max * 100)
+
+                    html_parts.append(f"""        <tr>
+          <td>{html_module.escape(r['file'])}</td>
+          <td class="metric"><div class="bar-container"><span style="min-width:60px;">{afm_ms:.0f}</span><div class="bar afm" style="width:{afm_pct}%; max-width:200px;"></div></div></td>
+          <td class="metric"><div class="bar-container"><span style="min-width:60px;">{tess_ms:.0f}</span><div class="bar competitor" style="width:{tess_pct}%; max-width:200px;"></div></div></td>
+          <td class="metric" style="color:{PASS_TEXT if row_speedup > 1 else FAIL_TEXT}; font-weight:600;">{row_speedup:.1f}x</td>
+          <td style="color:{winner_color}; font-weight:600;">{winner}</td>
+        </tr>
+""")
+                html_parts.append("      </tbody>\n    </table>\n  </div>\n")
+
+        # ─── Speed: Speech ───────────────────────────────────────────────────
+        if has_whisp_speed:
+            paired = [(r["afm_latency_ms"], r["whisper_latency_ms"])
+                      for r in speech_results
+                      if r.get("whisper_latency_ms") is not None and r.get("afm_latency_ms")]
+            if paired:
+                avg_afm = sum(a for a, _ in paired) / len(paired)
+                avg_whisp = sum(w for _, w in paired) / len(paired)
+                speedup = avg_whisp / avg_afm if avg_afm > 0 else 0
+                speedup_color = PASS_TEXT if speedup > 1 else FAIL_TEXT
+
+                html_parts.append(f"""
+  <div class="card" style="margin-bottom:1.5rem;">
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:1rem;">
+      <h3 style="color:{TEXT_COLOR}; margin:0;">Speech Latency: AFM Speech vs Whisper</h3>
+      <div style="font-size:1.5rem; font-weight:700; color:{speedup_color};">{speedup:.1f}x {'faster' if speedup > 1 else 'slower'}</div>
+    </div>
+    <table>
+      <thead><tr><th>Audio</th><th>Duration</th><th>AFM (ms)</th><th>Whisper (ms)</th><th>Speedup</th><th>Winner</th></tr></thead>
+      <tbody>
+""")
+                for r in speech_results:
+                    whisp_ms = r.get("whisper_latency_ms")
+                    if whisp_ms is None:
+                        continue
+                    afm_ms = r.get("afm_latency_ms", 0)
+                    duration = r.get("audio_duration_s", 0)
+                    row_speedup = whisp_ms / afm_ms if afm_ms > 0 else 0
+                    winner = "AFM" if afm_ms < whisp_ms else "Whisper"
+                    winner_color = ACCENT_COLOR if winner == "AFM" else MUTED_COLOR
+                    bar_max = max(afm_ms, whisp_ms, 1)
+                    afm_pct = int(afm_ms / bar_max * 100)
+                    whisp_pct = int(whisp_ms / bar_max * 100)
+
+                    html_parts.append(f"""        <tr>
+          <td>{html_module.escape(r['file'])}</td>
+          <td class="metric">{duration:.1f}s</td>
+          <td class="metric"><div class="bar-container"><span style="min-width:60px;">{afm_ms:.0f}</span><div class="bar afm" style="width:{afm_pct}%; max-width:200px;"></div></div></td>
+          <td class="metric"><div class="bar-container"><span style="min-width:60px;">{whisp_ms:.0f}</span><div class="bar competitor" style="width:{whisp_pct}%; max-width:200px;"></div></div></td>
+          <td class="metric" style="color:{PASS_TEXT if row_speedup > 1 else FAIL_TEXT}; font-weight:600;">{row_speedup:.1f}x</td>
+          <td style="color:{winner_color}; font-weight:600;">{winner}</td>
+        </tr>
+""")
+                html_parts.append("      </tbody>\n    </table>\n  </div>\n")
+
+        html_parts.append("</div>\n")
+
+    # ─── Accuracy Comparison ────────────────────────────────────────────────
+    has_tesseract_acc = any(r.get("tesseract_cer") is not None for r in vision_results)
+    has_whisper_acc = any(r.get("whisper_wer") is not None for r in speech_results)
+
+    if has_tesseract_acc or has_whisper_acc:
+        html_parts.append('<div class="section">\n  <h2>Accuracy Comparison</h2>\n  <div class="comparison">\n')
+
+        if has_tesseract_acc:
+            html_parts.append('    <div class="card">\n      <h3>OCR: AFM vs Tesseract (CER — lower is better)</h3>\n')
             for r in vision_results:
                 if r.get("tesseract_cer") is None:
                     continue
@@ -244,8 +371,8 @@ def generate_html(meta: dict, results: list, output_path: str):
 """)
             html_parts.append("    </div>\n")
 
-        if has_whisper:
-            html_parts.append('    <div class="card">\n      <h3>Speech: AFM vs Whisper (WER)</h3>\n')
+        if has_whisper_acc:
+            html_parts.append('    <div class="card">\n      <h3>Speech: AFM vs Whisper (WER — lower is better)</h3>\n')
             for r in speech_results:
                 if r.get("whisper_wer") is None:
                     continue

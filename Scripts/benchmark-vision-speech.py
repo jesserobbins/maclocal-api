@@ -194,6 +194,67 @@ def get_audio_duration(filepath: Path) -> float:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Resource Usage Sampling
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━��━━
+
+RESOURCE_SAMPLE_INTERVAL_MS = 200  # Sample every 200ms during inference
+
+
+def sample_gpu_utilization() -> dict:
+    """Sample GPU/ANE utilization using ioreg (no sudo needed).
+    Returns dict with gpu_pct, ane_active (bool hint), and method used."""
+    result = {"gpu_pct": None, "cpu_pct": None, "ane_active": None, "method": "none"}
+
+    # Try ioreg for GPU busy percentage (Apple Silicon)
+    try:
+        proc = subprocess.run(
+            ["ioreg", "-r", "-d", "1", "-c", "IOAccelerator"],
+            capture_output=True, text=True, timeout=2
+        )
+        for line in proc.stdout.splitlines():
+            if "PerformanceStatistics" in line or "GPU Core Utilization" in line:
+                # Parse GPU utilization from IOAccelerator
+                import re as _re
+                m = _re.search(r'"Device Utilization %"\s*=\s*(\d+)', proc.stdout)
+                if m:
+                    result["gpu_pct"] = int(m.group(1))
+                    result["method"] = "ioreg"
+                    break
+    except Exception:
+        pass
+
+    # Check ANE activity via process list (heuristic: look for ANECompilerService)
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-q", "ANECompilerService"],
+            capture_output=True, timeout=1
+        )
+        result["ane_active"] = proc.returncode == 0
+    except Exception:
+        pass
+
+    # Sample CPU of the afm process
+    try:
+        proc = subprocess.run(
+            ["ps", "-eo", "comm,%cpu", "-r"],
+            capture_output=True, text=True, timeout=2
+        )
+        for line in proc.stdout.splitlines():
+            if "afm" in line.lower():
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    try:
+                        result["cpu_pct"] = float(parts[-1])
+                    except ValueError:
+                        pass
+                break
+    except Exception:
+        pass
+
+    return result
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Benchmark Functions
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -237,6 +298,9 @@ async def benchmark_vision_ocr(session: aiohttp.ClientSession, base_url: str,
     threshold = get_cer_threshold(file_path.name)
     passed = cer < threshold if cer is not None else True
 
+    # Sample resource utilization on the last timed run
+    resources = sample_gpu_utilization()
+
     return {
         "category": "vision",
         "file": file_path.name,
@@ -244,6 +308,9 @@ async def benchmark_vision_ocr(session: aiohttp.ClientSession, base_url: str,
         "afm_latency_p95_ms": round(latency_p95, 1),
         "afm_cer": round(cer, 4) if cer is not None else None,
         "afm_word_acc": round(word_acc, 4) if word_acc is not None else None,
+        "afm_gpu_pct": resources.get("gpu_pct"),
+        "afm_cpu_pct": resources.get("cpu_pct"),
+        "afm_ane_active": resources.get("ane_active"),
         "cer_threshold": threshold,
         "pass": passed,
         "runs": runs,
@@ -299,6 +366,8 @@ async def benchmark_speech(session: aiohttp.ClientSession, base_url: str,
     threshold = get_wer_threshold(file_path.name)
     passed = wer < threshold if wer is not None else True
 
+    resources = sample_gpu_utilization()
+
     return {
         "category": "speech",
         "file": file_path.name,
@@ -306,6 +375,9 @@ async def benchmark_speech(session: aiohttp.ClientSession, base_url: str,
         "afm_wer": round(wer, 4) if wer is not None else None,
         "afm_rtf": round(realtime_factor, 3),
         "audio_duration_s": round(audio_duration, 1),
+        "afm_gpu_pct": resources.get("gpu_pct"),
+        "afm_cpu_pct": resources.get("cpu_pct"),
+        "afm_ane_active": resources.get("ane_active"),
         "wer_threshold": threshold,
         "pass": passed,
         "runs": runs,
@@ -539,8 +611,61 @@ async def main():
     if speech_results:
         s_pass = sum(1 for r in speech_results if r.get("pass"))
         s_total = len(speech_results)
-        s_latency = median([r["afm_latency_ms"] for r in speech_results if "error" not in r])
-        print(f"  Speech: {s_pass}/{s_total} passed | median latency: {s_latency:.0f}ms")
+        s_latency_list = [r["afm_latency_ms"] for r in speech_results if "error" not in r]
+        if s_latency_list:
+            s_latency = median(s_latency_list)
+            print(f"  Speech: {s_pass}/{s_total} passed | median latency: {s_latency:.0f}ms")
+        else:
+            print(f"  Speech: {s_pass}/{s_total} passed")
+
+    # ─── Speed Comparison Summary ───────────────────────────────────────────
+    tess_pairs = [(r["afm_latency_ms"], r["tesseract_latency_ms"])
+                  for r in vision_results
+                  if r.get("tesseract_latency_ms") is not None]
+    whisp_pairs = [(r["afm_latency_ms"], r["whisper_latency_ms"])
+                   for r in speech_results
+                   if r.get("whisper_latency_ms") is not None]
+
+    if tess_pairs or whisp_pairs:
+        print()
+        print("  ┌─────────────────────────────────────────────┐")
+        print("  │           SPEED COMPARISON                   │")
+        print("  └─────────────────────────────────────────────┘")
+
+    if tess_pairs:
+        print()
+        print("  OCR: AFM Vision (ANE) vs Tesseract (CPU)")
+        print("  ─────────────────────────────────────────")
+        for r in vision_results:
+            tess_ms = r.get("tesseract_latency_ms")
+            if tess_ms is None:
+                continue
+            afm_ms = r["afm_latency_ms"]
+            speedup = tess_ms / afm_ms if afm_ms > 0 else 0
+            arrow = "◀ AFM faster" if speedup > 1 else "▶ Tess faster"
+            print(f"  {r['file']:30s}  AFM {afm_ms:>7.0f}ms  Tess {tess_ms:>7.0f}ms  {speedup:>5.1f}x  {arrow}")
+        avg_afm = sum(a for a, _ in tess_pairs) / len(tess_pairs)
+        avg_tess = sum(t for _, t in tess_pairs) / len(tess_pairs)
+        overall = avg_tess / avg_afm if avg_afm > 0 else 0
+        print(f"  {'AVERAGE':30s}  AFM {avg_afm:>7.0f}ms  Tess {avg_tess:>7.0f}ms  {overall:>5.1f}x")
+
+    if whisp_pairs:
+        print()
+        print("  Speech: AFM Speech (ANE) vs Whisper (GPU/CPU)")
+        print("  ─────────────────────────────────────────────")
+        for r in speech_results:
+            whisp_ms = r.get("whisper_latency_ms")
+            if whisp_ms is None:
+                continue
+            afm_ms = r["afm_latency_ms"]
+            duration = r.get("audio_duration_s", 0)
+            speedup = whisp_ms / afm_ms if afm_ms > 0 else 0
+            arrow = "◀ AFM faster" if speedup > 1 else "▶ Whisp faster"
+            print(f"  {r['file']:30s}  AFM {afm_ms:>7.0f}ms  Whisp {whisp_ms:>7.0f}ms  {speedup:>5.1f}x  {arrow}  ({duration:.0f}s audio)")
+        avg_afm = sum(a for a, _ in whisp_pairs) / len(whisp_pairs)
+        avg_whisp = sum(w for _, w in whisp_pairs) / len(whisp_pairs)
+        overall = avg_whisp / avg_afm if avg_afm > 0 else 0
+        print(f"  {'AVERAGE':30s}  AFM {avg_afm:>7.0f}ms  Whisp {avg_whisp:>7.0f}ms  {overall:>5.1f}x")
 
     print(f"\n  Results: {jsonl_path}")
     print("=" * 60)
