@@ -1,0 +1,1 @@
+In machine learning, gradient descent is an optimization algorithm used to minimize the loss function by iteratively moving in the direction of steepest descent as defined by the negative of the gradient.
