@@ -197,59 +197,89 @@ def get_audio_duration(filepath: Path) -> float:
 # Resource Usage Sampling
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━��━━
 
-RESOURCE_SAMPLE_INTERVAL_MS = 200  # Sample every 200ms during inference
+GPU_SAMPLER_BINARY = SCRIPT_DIR / "gpu-per-pid"
 
 
-def sample_gpu_utilization() -> dict:
-    """Sample GPU/ANE utilization using ioreg (no sudo needed).
-    Returns dict with gpu_pct, ane_active (bool hint), and method used."""
-    result = {"gpu_pct": None, "cpu_pct": None, "ane_active": None, "method": "none"}
-
-    # Try ioreg for GPU busy percentage (Apple Silicon)
+def get_per_pid_gpu_ns() -> dict[int, int]:
+    """Get per-process accumulated GPU nanoseconds via IOKit AGXDeviceUserClient.
+    Returns {pid: gpu_nanoseconds}. Requires the compiled gpu-per-pid helper."""
+    if not GPU_SAMPLER_BINARY.exists():
+        return {}
     try:
         proc = subprocess.run(
-            ["ioreg", "-r", "-d", "1", "-c", "IOAccelerator"],
-            capture_output=True, text=True, timeout=2
+            [str(GPU_SAMPLER_BINARY)],
+            capture_output=True, text=True, timeout=5
         )
-        for line in proc.stdout.splitlines():
-            if "PerformanceStatistics" in line or "GPU Core Utilization" in line:
-                # Parse GPU utilization from IOAccelerator
-                import re as _re
-                m = _re.search(r'"Device Utilization %"\s*=\s*(\d+)', proc.stdout)
-                if m:
-                    result["gpu_pct"] = int(m.group(1))
-                    result["method"] = "ioreg"
-                    break
+        data = json.loads(proc.stdout)
+        return {entry["pid"]: entry["gpu_ns"] for entry in data}
     except Exception:
-        pass
+        return {}
 
-    # Check ANE activity via process list (heuristic: look for ANECompilerService)
-    try:
-        proc = subprocess.run(
-            ["pgrep", "-q", "ANECompilerService"],
-            capture_output=True, timeout=1
-        )
-        result["ane_active"] = proc.returncode == 0
-    except Exception:
-        pass
 
-    # Sample CPU of the afm process
+def get_afm_pid() -> int | None:
+    """Get the afm server PID."""
     try:
-        proc = subprocess.run(
-            ["ps", "-eo", "comm,%cpu", "-r"],
-            capture_output=True, text=True, timeout=2
-        )
-        for line in proc.stdout.splitlines():
-            if "afm" in line.lower():
-                parts = line.strip().split()
-                if len(parts) >= 2:
-                    try:
-                        result["cpu_pct"] = float(parts[-1])
-                    except ValueError:
-                        pass
-                break
+        proc = subprocess.run(["pgrep", "-f", "afm"], capture_output=True, text=True)
+        pids = proc.stdout.strip().split('\n')
+        return int(pids[0]) if pids and pids[0] else None
+    except Exception:
+        return None
+
+
+def get_process_cpu_ns(pid: int) -> int | None:
+    """Get cumulative CPU time (user+sys) in nanoseconds for a process via libproc."""
+    try:
+        import ctypes, ctypes.util
+        libproc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib")
+
+        class proc_taskinfo(ctypes.Structure):
+            _fields_ = [
+                ("pti_virtual_size", ctypes.c_uint64),
+                ("pti_resident_size", ctypes.c_uint64),
+                ("pti_total_user", ctypes.c_uint64),
+                ("pti_total_system", ctypes.c_uint64),
+            ] + [("_pad", ctypes.c_uint64)] * 10
+
+        info = proc_taskinfo()
+        ret = libproc.proc_pidinfo(pid, 4, 0, ctypes.byref(info), ctypes.sizeof(info))
+        if ret > 0:
+            return info.pti_total_user + info.pti_total_system
     except Exception:
         pass
+    return None
+
+
+def sample_resources_before(afm_pid: int | None) -> dict:
+    """Take a resource snapshot before an operation."""
+    snapshot = {"gpu_ns": {}, "cpu_ns": None, "afm_pid": afm_pid}
+    snapshot["gpu_ns"] = get_per_pid_gpu_ns()
+    if afm_pid:
+        snapshot["cpu_ns"] = get_process_cpu_ns(afm_pid)
+    return snapshot
+
+
+def sample_resources_after(before: dict, wall_time_s: float) -> dict:
+    """Take a resource snapshot after and compute deltas."""
+    afm_pid = before.get("afm_pid")
+    after_gpu = get_per_pid_gpu_ns()
+    after_cpu = get_process_cpu_ns(afm_pid) if afm_pid else None
+
+    result = {"afm_gpu_time_ms": None, "afm_cpu_time_ms": None,
+              "afm_gpu_pct": None, "afm_cpu_pct": None}
+
+    # GPU delta for afm process
+    if afm_pid and afm_pid in before["gpu_ns"] and afm_pid in after_gpu:
+        gpu_delta_ns = after_gpu[afm_pid] - before["gpu_ns"][afm_pid]
+        result["afm_gpu_time_ms"] = round(gpu_delta_ns / 1e6, 2)
+        if wall_time_s > 0:
+            result["afm_gpu_pct"] = round((gpu_delta_ns / 1e9) / wall_time_s * 100, 1)
+
+    # CPU delta for afm process
+    if before.get("cpu_ns") is not None and after_cpu is not None:
+        cpu_delta_ns = after_cpu - before["cpu_ns"]
+        result["afm_cpu_time_ms"] = round(cpu_delta_ns / 1e6, 2)
+        if wall_time_s > 0:
+            result["afm_cpu_pct"] = round((cpu_delta_ns / 1e9) / wall_time_s * 100, 1)
 
     return result
 
@@ -298,9 +328,6 @@ async def benchmark_vision_ocr(session: aiohttp.ClientSession, base_url: str,
     threshold = get_cer_threshold(file_path.name)
     passed = cer < threshold if cer is not None else True
 
-    # Sample resource utilization on the last timed run
-    resources = sample_gpu_utilization()
-
     return {
         "category": "vision",
         "file": file_path.name,
@@ -308,9 +335,6 @@ async def benchmark_vision_ocr(session: aiohttp.ClientSession, base_url: str,
         "afm_latency_p95_ms": round(latency_p95, 1),
         "afm_cer": round(cer, 4) if cer is not None else None,
         "afm_word_acc": round(word_acc, 4) if word_acc is not None else None,
-        "afm_gpu_pct": resources.get("gpu_pct"),
-        "afm_cpu_pct": resources.get("cpu_pct"),
-        "afm_ane_active": resources.get("ane_active"),
         "cer_threshold": threshold,
         "pass": passed,
         "runs": runs,
@@ -367,8 +391,6 @@ async def benchmark_speech(session: aiohttp.ClientSession, base_url: str,
     threshold = get_wer_threshold(file_path.name)
     passed = wer < threshold if wer is not None else True
 
-    resources = sample_gpu_utilization()
-
     return {
         "category": "speech",
         "file": file_path.name,
@@ -376,9 +398,6 @@ async def benchmark_speech(session: aiohttp.ClientSession, base_url: str,
         "afm_wer": round(wer, 4) if wer is not None else None,
         "afm_rtf": round(realtime_factor, 3),
         "audio_duration_s": round(audio_duration, 1),
-        "afm_gpu_pct": resources.get("gpu_pct"),
-        "afm_cpu_pct": resources.get("cpu_pct"),
-        "afm_ane_active": resources.get("ane_active"),
         "wer_threshold": threshold,
         "pass": passed,
         "runs": runs,
@@ -500,6 +519,14 @@ async def main():
     print()
 
     results = []
+    afm_pid = get_afm_pid()
+    if afm_pid:
+        print(f"  AFM PID: {afm_pid}")
+        if GPU_SAMPLER_BINARY.exists():
+            print(f"  GPU profiling: per-process (IOKit AGXDeviceUserClient)")
+        else:
+            print(f"  GPU profiling: unavailable (compile Scripts/gpu-per-pid)")
+    print()
 
     async with aiohttp.ClientSession() as session:
         # ─── Vision OCR Benchmarks ───────────────────────────────────────────
@@ -517,7 +544,12 @@ async def main():
             else:
                 for fp in vision_files:
                     print(f"  Benchmarking: {fp.name} ...", end="", flush=True)
+                    res_before = sample_resources_before(afm_pid)
+                    t_wall_start = time.perf_counter()
                     result = await benchmark_vision_ocr(session, base_url, fp, args.runs)
+                    wall_s = time.perf_counter() - t_wall_start
+                    resources = sample_resources_after(res_before, wall_s)
+                    result.update(resources)
 
                     # Competitor: Tesseract
                     if not args.skip_competitors and fp.suffix in (".jpg", ".png"):
@@ -528,7 +560,13 @@ async def main():
 
                     status = "PASS" if result["pass"] else "FAIL"
                     cer_str = f"CER={result['afm_cer']:.3f}" if result.get("afm_cer") is not None else "N/A"
-                    gpu_str = f"GPU={result['afm_gpu_pct']:.0f}%" if result.get("afm_gpu_pct") is not None else "GPU=0%(ANE)"
+                    # Show actual per-process GPU time
+                    gpu_time = result.get("afm_gpu_time_ms")
+                    cpu_time = result.get("afm_cpu_time_ms")
+                    if gpu_time is not None:
+                        gpu_str = f"GPU={gpu_time:.1f}ms CPU={cpu_time:.0f}ms" if cpu_time else f"GPU={gpu_time:.1f}ms"
+                    else:
+                        gpu_str = "ANE"
                     tess_str = ""
                     if result.get("tesseract_latency_ms") is not None:
                         speedup = result["tesseract_latency_ms"] / result["afm_latency_ms"] if result["afm_latency_ms"] > 0 else 0
@@ -579,7 +617,12 @@ async def main():
                 else:
                     for fp in speech_files:
                         print(f"  Benchmarking: {fp.name} ...", end="", flush=True)
+                        res_before = sample_resources_before(afm_pid)
+                        t_wall_start = time.perf_counter()
                         result = await benchmark_speech(session, base_url, fp, args.runs)
+                        wall_s = time.perf_counter() - t_wall_start
+                        resources = sample_resources_after(res_before, wall_s)
+                        result.update(resources)
 
                         if result.get("error"):
                             print(f" {result['error']}")
@@ -593,7 +636,12 @@ async def main():
 
                             status = "PASS" if result["pass"] else "FAIL"
                             wer_str = f"WER={result['afm_wer']:.3f}" if result.get("afm_wer") is not None else "N/A"
-                            gpu_str = f"GPU={result['afm_gpu_pct']:.0f}%" if result.get("afm_gpu_pct") is not None else "GPU=0%(ANE)"
+                            gpu_time = result.get("afm_gpu_time_ms")
+                            cpu_time = result.get("afm_cpu_time_ms")
+                            if gpu_time is not None:
+                                gpu_str = f"GPU={gpu_time:.1f}ms CPU={cpu_time:.0f}ms" if cpu_time else f"GPU={gpu_time:.1f}ms"
+                            else:
+                                gpu_str = "ANE"
                             whisp_str = ""
                             if result.get("whisper_latency_ms") is not None:
                                 speedup = result["whisper_latency_ms"] / result["afm_latency_ms"] if result["afm_latency_ms"] > 0 else 0
