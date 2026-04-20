@@ -1,0 +1,31 @@
+Page 1
+Efficient Neural Architecture Search via Parameter Sharing
+Hieu Pham, Melody Y. Guan, Barret Zoph, Quoc V. Le, Jeff Dean
+Google Brain
+Abstract
+We propose Efficient Neural Architecture Search (ENAS), a fast and inexpensive approach for automatic model design. In ENAS, a controller learns to discover neural
+network architectures by searching for an optimal subgraph within a large computational graph. The controller is trained with policy gradient to select a subgraph that
+maximizes the expected reward on the validation set. Meanwhile the model corresponding to the selected subgraph is trained to minimize a canonical cross entropy loss.
+Sharing parameters among child models allows ENAS to deliver strong empirical performances while requiring significantly fewer GPU-hours than existing methods. On
+the Penn Treebank dataset, ENAS discovers a novel architecture that achieves a test perplexity of 55.8.
+parameters of the child models to minimize the expected loss function. In the second
+1. Introduction
+Neural Architecture Search (NAS) has emerged as a promising technique for automating
+phase, we train the controller's parameters to maximize the expected reward, which is
+computed on the validation dataset.
+The controller is a recurrent network that generates architectural decisions sequentially. At
+each step, the controller samples an action from a softmax classifier and uses this action to
+determine a connection or operation in the child architecture. The training signal comes
+large-scale computing resources.
+In this paper, we propose ENAS, which substantially reduces the computational cost by
+forcing all child models to share parameters. The key insight is that the search space can
+be represented as a single directed acyclic graph (DAG), and each child architecture can
+be viewed as a subgraph of this larger graph.
+2. Methods
+from the validation accuracy of the sampled architecture.
+3. Experiments
+We evaluate ENAS on two benchmark tasks: language modeling on Penn Treebank and
+image classification on CIFAR-10. For language modeling, ENAS discovers a recurrent
+cell that achieves a test perplexity of 55.8, outperforming the state-of-the-art NASCell
+which achieves 62.4.
+Our approach consists of two interleaving phases. In the first phase, we train the shared
