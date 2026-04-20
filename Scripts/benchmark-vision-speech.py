@@ -249,12 +249,26 @@ def get_process_cpu_ns(pid: int) -> int | None:
     return None
 
 
+def get_process_memory_mb(pid: int) -> float | None:
+    """Get resident memory (RSS) in MB for a process."""
+    try:
+        proc = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=2
+        )
+        rss_kb = int(proc.stdout.strip())
+        return round(rss_kb / 1024, 1)
+    except Exception:
+        return None
+
+
 def sample_resources_before(afm_pid: int | None) -> dict:
     """Take a resource snapshot before an operation."""
     snapshot = {"gpu_ns": {}, "cpu_ns": None, "afm_pid": afm_pid}
     snapshot["gpu_ns"] = get_per_pid_gpu_ns()
     if afm_pid:
         snapshot["cpu_ns"] = get_process_cpu_ns(afm_pid)
+        snapshot["mem_mb"] = get_process_memory_mb(afm_pid)
     return snapshot
 
 
@@ -265,7 +279,8 @@ def sample_resources_after(before: dict, wall_time_s: float) -> dict:
     after_cpu = get_process_cpu_ns(afm_pid) if afm_pid else None
 
     result = {"afm_gpu_time_ms": None, "afm_cpu_time_ms": None,
-              "afm_gpu_pct": None, "afm_cpu_pct": None}
+              "afm_gpu_pct": None, "afm_cpu_pct": None,
+              "afm_memory_mb": None}
 
     # GPU delta for afm process
     if afm_pid and afm_pid in before["gpu_ns"] and afm_pid in after_gpu:
@@ -280,6 +295,10 @@ def sample_resources_after(before: dict, wall_time_s: float) -> dict:
         result["afm_cpu_time_ms"] = round(cpu_delta_ns / 1e6, 2)
         if wall_time_s > 0:
             result["afm_cpu_pct"] = round((cpu_delta_ns / 1e9) / wall_time_s * 100, 1)
+
+    # Memory (peak during operation — sample after)
+    if afm_pid:
+        result["afm_memory_mb"] = get_process_memory_mb(afm_pid)
 
     return result
 
@@ -652,13 +671,11 @@ async def main():
 
                     status = "PASS" if result["pass"] else "FAIL"
                     cer_str = f"CER={result['afm_cer']:.3f}" if result.get("afm_cer") is not None else "N/A"
-                    # Show actual per-process GPU time
                     gpu_time = result.get("afm_gpu_time_ms")
                     cpu_time = result.get("afm_cpu_time_ms")
-                    if gpu_time is not None:
-                        gpu_str = f"GPU={gpu_time:.1f}ms CPU={cpu_time:.0f}ms" if cpu_time else f"GPU={gpu_time:.1f}ms"
-                    else:
-                        gpu_str = "ANE"
+                    res_str = ""
+                    if cpu_time is not None and gpu_time is not None:
+                        res_str = f" | CPU={cpu_time:.0f}ms GPU={gpu_time:.1f}ms"
                     comp_str = ""
                     if result.get("tesseract_latency_ms") is not None:
                         speedup = result["tesseract_latency_ms"] / result["afm_latency_ms"] if result["afm_latency_ms"] > 0 else 0
@@ -668,7 +685,7 @@ async def main():
                         vlm_gpu = result.get("vlm_gpu_time_ms")
                         vlm_gpu_str = f" GPU={vlm_gpu:.0f}ms" if vlm_gpu else ""
                         comp_str += f" | VLM={result['vlm_latency_ms']:.0f}ms ({speedup:.1f}x){vlm_gpu_str}"
-                    print(f" {result['afm_latency_ms']:.0f}ms | {cer_str} | {gpu_str}{comp_str} | {status}")
+                    print(f" {result['afm_latency_ms']:.0f}ms | {cer_str}{res_str}{comp_str} | {status}")
 
                     # Calibrate: save actual OCR output as ground truth
                     if args.calibrate and result.get("extracted_preview"):
@@ -735,15 +752,14 @@ async def main():
                             wer_str = f"WER={result['afm_wer']:.3f}" if result.get("afm_wer") is not None else "N/A"
                             gpu_time = result.get("afm_gpu_time_ms")
                             cpu_time = result.get("afm_cpu_time_ms")
-                            if gpu_time is not None:
-                                gpu_str = f"GPU={gpu_time:.1f}ms CPU={cpu_time:.0f}ms" if cpu_time else f"GPU={gpu_time:.1f}ms"
-                            else:
-                                gpu_str = "ANE"
+                            res_str = ""
+                            if cpu_time is not None and gpu_time is not None:
+                                res_str = f" | CPU={cpu_time:.0f}ms GPU={gpu_time:.1f}ms"
                             whisp_str = ""
                             if result.get("whisper_latency_ms") is not None:
                                 speedup = result["whisper_latency_ms"] / result["afm_latency_ms"] if result["afm_latency_ms"] > 0 else 0
                                 whisp_str = f" | Whisp={result['whisper_latency_ms']:.0f}ms ({speedup:.1f}x)"
-                            print(f" {result['afm_latency_ms']:.0f}ms | {wer_str} | RTF={result['afm_rtf']:.2f} | {gpu_str}{whisp_str} | {status}")
+                            print(f" {result['afm_latency_ms']:.0f}ms | {wer_str} | RTF={result['afm_rtf']:.2f}{res_str}{whisp_str} | {status}")
                         results.append(result)
             print()
 
@@ -807,61 +823,85 @@ async def main():
         print("  │           SPEED COMPARISON                   │")
         print("  └─────────────────────────────────────────────┘")
 
+    # ─── Resource Usage Summary ───────────────────────────────────────────
+    afm_mem = next((r.get("afm_memory_mb") for r in results if r.get("afm_memory_mb")), None)
+    if any(r.get("afm_cpu_time_ms") is not None for r in vision_results):
+        print()
+        print("  ┌─────────────────────────────────────────────┐")
+        print("  │        AFM RESOURCE USAGE (per-process)     │")
+        print("  └─────────────────────────────────────────────┘")
+        if afm_mem:
+            print(f"  Memory: {afm_mem:.0f} MB")
+        print()
+        print(f"  {'Document':30s} {'Wall':>8s} {'CPU':>8s} {'GPU':>8s}")
+        print(f"  {'─'*30} {'─'*8} {'─'*8} {'─'*8}")
+        for r in vision_results:
+            cpu = r.get("afm_cpu_time_ms")
+            gpu = r.get("afm_gpu_time_ms")
+            if cpu is None:
+                continue
+            print(f"  {r['file']:30s} {r['afm_latency_ms']:>7.0f}ms {cpu:>7.0f}ms {gpu:>7.1f}ms")
+
     if tess_pairs:
         print()
-        print("  OCR: AFM Vision (ANE) vs Tesseract (CPU)")
-        print("  ─────────────────────────────────────────")
+        print("  ┌─────────────────────────────────────────────┐")
+        print("  │    AFM Vision vs Tesseract                  │")
+        print("  └─────────────────────────────────────────────┘")
+        print(f"  {'Document':30s} {'AFM':>8s} {'Tess':>8s} {'Speedup':>8s}")
+        print(f"  {'─'*30} {'─'*8} {'─'*8} {'─'*8}")
         for r in vision_results:
             tess_ms = r.get("tesseract_latency_ms")
             if tess_ms is None:
                 continue
             afm_ms = r["afm_latency_ms"]
             speedup = tess_ms / afm_ms if afm_ms > 0 else 0
-            arrow = "◀ AFM faster" if speedup > 1 else "▶ Tess faster"
-            print(f"  {r['file']:30s}  AFM {afm_ms:>7.0f}ms  Tess {tess_ms:>7.0f}ms  {speedup:>5.1f}x  {arrow}")
+            print(f"  {r['file']:30s} {afm_ms:>7.0f}ms {tess_ms:>7.0f}ms {speedup:>7.1f}x")
         avg_afm = sum(a for a, _ in tess_pairs) / len(tess_pairs)
         avg_tess = sum(t for _, t in tess_pairs) / len(tess_pairs)
         overall = avg_tess / avg_afm if avg_afm > 0 else 0
-        print(f"  {'AVERAGE':30s}  AFM {avg_afm:>7.0f}ms  Tess {avg_tess:>7.0f}ms  {overall:>5.1f}x")
+        print(f"  {'AVERAGE':30s} {avg_afm:>7.0f}ms {avg_tess:>7.0f}ms {overall:>7.1f}x")
 
     if vlm_pairs:
         vlm_tool = next((r.get("vlm_tool", "MLX VLM") for r in vision_results if r.get("vlm_tool")), "MLX VLM")
         print()
-        print(f"  OCR: AFM Vision (ANE) vs {vlm_tool} (GPU)")
-        print("  ─────────────────────────────────────────────")
+        print(f"  ┌─────────────────────────────────────────────────────────┐")
+        print(f"  │    AFM Vision vs {vlm_tool:40s} │")
+        print(f"  └─────────────────────────────────────────────────────────┘")
+        print(f"  {'Document':30s} {'AFM':>8s} {'VLM':>9s} {'Speedup':>8s}  {'AFM GPU':>8s} {'VLM GPU':>9s}")
+        print(f"  {'─'*30} {'─'*8} {'─'*9} {'─'*8}  {'─'*8} {'─'*9}")
         for r in vision_results:
             vlm_ms = r.get("vlm_latency_ms")
             if vlm_ms is None:
                 continue
             afm_ms = r["afm_latency_ms"]
             speedup = vlm_ms / afm_ms if afm_ms > 0 else 0
-            arrow = "◀ AFM faster" if speedup > 1 else "▶ VLM faster"
             afm_gpu = r.get("afm_gpu_time_ms", 0) or 0
             vlm_gpu = r.get("vlm_gpu_time_ms")
-            gpu_note = f"  (AFM GPU={afm_gpu:.0f}ms VLM GPU={vlm_gpu:.0f}ms)" if vlm_gpu else ""
-            print(f"  {r['file']:30s}  AFM {afm_ms:>7.0f}ms  VLM {vlm_ms:>7.0f}ms  {speedup:>5.1f}x  {arrow}{gpu_note}")
+            vlm_gpu_str = f"{vlm_gpu:>8.0f}ms" if vlm_gpu else f"{'—':>9s}"
+            print(f"  {r['file']:30s} {afm_ms:>7.0f}ms {vlm_ms:>8.0f}ms {speedup:>7.1f}x  {afm_gpu:>7.1f}ms {vlm_gpu_str}")
         avg_afm = sum(a for a, _, _, _ in vlm_pairs) / len(vlm_pairs)
         avg_vlm = sum(v for _, v, _, _ in vlm_pairs) / len(vlm_pairs)
         overall = avg_vlm / avg_afm if avg_afm > 0 else 0
-        print(f"  {'AVERAGE':30s}  AFM {avg_afm:>7.0f}ms  VLM {avg_vlm:>7.0f}ms  {overall:>5.1f}x")
+        print(f"  {'AVERAGE':30s} {avg_afm:>7.0f}ms {avg_vlm:>8.0f}ms {overall:>7.1f}x")
 
     if whisp_pairs:
         print()
-        print("  Speech: AFM Speech (ANE) vs Whisper (GPU/CPU)")
-        print("  ─────────────────────────────────────────────")
+        print("  ┌─────────────────────────────────────────────┐")
+        print("  │    AFM Speech vs Whisper                    │")
+        print("  └─────────────────────────────────────────────┘")
+        print(f"  {'Audio':30s} {'AFM':>8s} {'Whisper':>9s} {'Speedup':>8s}")
+        print(f"  {'─'*30} {'─'*8} {'─'*9} {'─'*8}")
         for r in speech_results:
             whisp_ms = r.get("whisper_latency_ms")
             if whisp_ms is None:
                 continue
             afm_ms = r["afm_latency_ms"]
-            duration = r.get("audio_duration_s", 0)
             speedup = whisp_ms / afm_ms if afm_ms > 0 else 0
-            arrow = "◀ AFM faster" if speedup > 1 else "▶ Whisp faster"
-            print(f"  {r['file']:30s}  AFM {afm_ms:>7.0f}ms  Whisp {whisp_ms:>7.0f}ms  {speedup:>5.1f}x  {arrow}  ({duration:.0f}s audio)")
+            print(f"  {r['file']:30s} {afm_ms:>7.0f}ms {whisp_ms:>8.0f}ms {speedup:>7.1f}x")
         avg_afm = sum(a for a, _ in whisp_pairs) / len(whisp_pairs)
         avg_whisp = sum(w for _, w in whisp_pairs) / len(whisp_pairs)
         overall = avg_whisp / avg_afm if avg_afm > 0 else 0
-        print(f"  {'AVERAGE':30s}  AFM {avg_afm:>7.0f}ms  Whisp {avg_whisp:>7.0f}ms  {overall:>5.1f}x")
+        print(f"  {'AVERAGE':30s} {avg_afm:>7.0f}ms {avg_whisp:>8.0f}ms {overall:>7.1f}x")
 
     print(f"\n  Results: {jsonl_path}")
 
