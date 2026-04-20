@@ -114,3 +114,4 @@ Scripts/benchmark-results/vision-speech-*
 
 # Worktrees
 .worktrees/
+Scripts/__pycache__/
