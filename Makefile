@@ -1,7 +1,7 @@
 # AFM - Apple Foundation Models API
 # Makefile for building and distributing the portable CLI
 
-.PHONY: build clean install uninstall portable dist test help submodules submodule-status webui build-with-webui patch patch-check
+.PHONY: build clean clean-reports clean-benchmarks clean-all install uninstall portable dist test test-vision help submodules submodule-status webui build-with-webui patch patch-check
 
 PATCH_SH  := Scripts/apply-mlx-patches.sh
 PATCH_STAMP := vendor/mlx-swift-lm/.patches-applied
@@ -73,6 +73,33 @@ clean:
 	@rm -f dist/*.tar.gz
 	@echo "✅ Clean complete"
 
+# Clean test report artifacts (assertion HTML/JSONL reports)
+clean-reports:
+	@echo "🧹 Cleaning test reports..."
+	@rm -rf test-reports/assertions-report-*.html test-reports/assertions-report-*.jsonl
+	@rm -rf test-reports/smart-analysis-*.md
+	@rm -rf test-reports/prefix-cache-bench-*
+	@echo "  Removed: $$(find test-reports -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ') files remain"
+	@echo "✅ Reports cleaned"
+
+# Clean benchmark results (vision/speech JSONL + HTML reports)
+clean-benchmarks:
+	@echo "🧹 Cleaning benchmark results..."
+	@rm -rf Scripts/benchmark-results/vision-speech-*
+	@rm -rf Scripts/benchmark-results/concurrency-benchmark-*
+	@echo "✅ Benchmarks cleaned"
+
+# Clean generated test corpus (binary images/audio — ground truth .txt preserved)
+clean-corpus:
+	@echo "🧹 Cleaning generated test corpus (preserving ground truth .txt)..."
+	@rm -f Scripts/test-data/vision/*.jpg Scripts/test-data/vision/*.png Scripts/test-data/vision/*.pdf
+	@rm -f Scripts/test-data/speech/*.wav Scripts/test-data/speech/*.mp3 Scripts/test-data/speech/*.m4a
+	@echo "✅ Corpus cleaned (run Scripts/generate-test-corpus.sh to regenerate)"
+
+# Clean everything: build + reports + benchmarks
+clean-all: clean clean-reports clean-benchmarks
+	@echo "✅ All clean"
+
 # Install to system (requires sudo)
 install: build
 	@echo "📦 Installing AFM to /usr/local/bin..."
@@ -98,6 +125,10 @@ test: build
 		/tmp/afm-test-$$$$ --version > /dev/null 2>&1 && \
 		echo "✅ Portability test passed" || echo "⚠️  Portability test failed"; \
 		rm -f /tmp/afm-test-$$$$
+
+# Run vision/speech benchmark suite (auto-starts server)
+test-vision: build
+	@./Scripts/test-vision-speech.sh
 
 # Development build (debug)
 debug: $(PATCH_STAMP)
@@ -125,18 +156,24 @@ help:
 	@echo "  uninstall       - Remove from /usr/local/bin"
 	@echo "  dist            - Create distribution package"
 	@echo "  test            - Test the binary and portability"
+	@echo "  test-vision     - Run vision/speech benchmarks (auto-starts server)"
 	@echo "  debug           - Build debug version"
 	@echo "  run             - Build and run debug server"
 	@echo "  submodules      - Initialize git submodules"
 	@echo "  webui           - Build webui from llama.cpp (requires Node.js)"
 	@echo "  build-with-webui - Build with webui included"
+	@echo "  clean-reports   - Remove test report HTML/JSONL files"
+	@echo "  clean-benchmarks - Remove benchmark result files"
+	@echo "  clean-corpus    - Remove generated test images/audio (keeps .txt ground truth)"
+	@echo "  clean-all       - Clean build + reports + benchmarks"
 	@echo "  help            - Show this help"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make build              # Build portable executable"
 	@echo "  make build-with-webui   # Build with webui support"
 	@echo "  make install            # Build and install to system"
-	@echo "  make dist               # Create distribution package"
+	@echo "  make test-vision        # Run vision/speech benchmarks"
+	@echo "  make clean-all          # Clean everything"
 	@echo "  make test               # Test binary works"
 	@echo ""
 	@echo "Output: .build/release/afm (portable executable)"
