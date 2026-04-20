@@ -1,0 +1,15 @@
+CORNER STORE
+789 Elm Street
+
+Date: 2024-06-22  09:15
+
+Coffee Large         3.50
+Muffin Blueberry     2.75
+Newspaper            1.50
+Gum Spearmint        1.25
+
+Total                9.00
+Cash                10.00
+Change               1.00
+
+Have a great day!

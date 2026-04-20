@@ -1,8 +1,8 @@
 Quarterly Revenue Report ($ millions)
 
-Division,Q1 2024,Q2 2024,Q3 2024,Q4 2024,YoY Growth
-Cloud Services,142.3,156.8,168.4,182.1,28.0%
-Enterprise Software,89.7,92.1,95.4,98.2,9.5%
-Hardware,67.2,58.9,71.3,84.6,25.9%
-Consulting,34.5,36.2,38.1,41.7,20.9%
-Total,333.7,344.0,373.2,406.6,21.8%
+Division  Q1 2024  Q2 2024  Q3 2024  Q4 2024  YoY Growth
+Cloud Services  142.3  156.8  168.4  182.1  28.0%
+Enterprise Software  89.7  92.1  95.4  98.2  9.5%
+Hardware  67.2  58.9  71.3  84.6  25.9%
+Consulting  34.5  36.2  38.1  41.7  20.9%
+Total  333.7  344.0  373.2  406.6  21.8%

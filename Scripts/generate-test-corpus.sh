@@ -502,6 +502,67 @@ HTML
     skip "prescription-label.jpg"
   fi
 
+  # ─── rotated-scan.jpg ─────────────────────────────────────────────────────
+  if should_generate "$VISION_DIR/rotated-scan.jpg"; then
+    info "Generating rotated-scan.jpg (rotated receipt)"
+    # Generate a simple receipt then rotate it 15 degrees to simulate a skewed scan
+    html_to_image "$(cat <<'HTML'
+<html><body style="font-family:Courier,monospace;font-size:14px;padding:40px;background:#f5f5f0;color:black;transform:rotate(3deg);margin-top:30px;">
+<pre style="line-height:1.6;">
+CORNER STORE
+789 Elm Street
+
+Date: 2024-06-22  09:15
+
+Coffee Large         3.50
+Muffin Blueberry     2.75
+Newspaper            1.50
+Gum Spearmint        1.25
+
+Total                9.00
+Cash                10.00
+Change               1.00
+
+Have a great day!
+</pre></body></html>
+HTML
+)" "$VISION_DIR/rotated-scan.jpg" 450 500
+    # Apply rotation via sips
+    if has_cmd sips; then
+      sips --rotate 15 "$VISION_DIR/rotated-scan.jpg" >/dev/null 2>&1 || true
+    fi
+    ok "rotated-scan.jpg"
+  else
+    skip "rotated-scan.jpg"
+  fi
+
+  # ─── low-quality-scan.jpg ───────────────────────────────────────────────────
+  if should_generate "$VISION_DIR/low-quality-scan.jpg"; then
+    info "Generating low-quality-scan.jpg (low-res degraded image)"
+    html_to_image "$(cat <<'HTML'
+<html><body style="font-family:Arial,sans-serif;font-size:16px;padding:40px;background:#f8f8f8;color:#333;">
+<h3 style="margin-bottom:10px;">MEMO</h3>
+<p><strong>To:</strong> All Staff</p>
+<p><strong>From:</strong> Human Resources</p>
+<p><strong>Date:</strong> March 1, 2024</p>
+<p><strong>Subject:</strong> Office Closure Notice</p>
+<hr>
+<p>Please be advised that the office will be closed on Friday, March 15, 2024 for building maintenance. All employees should work from home on that day.</p>
+<p>Contact HR at ext. 4500 with questions.</p>
+</body></html>
+HTML
+)" "$VISION_DIR/low-quality-scan.jpg" 600 400
+    # Degrade quality via sips (resize down then back up to simulate low-quality scan)
+    if has_cmd sips; then
+      sips --resampleWidth 200 "$VISION_DIR/low-quality-scan.jpg" >/dev/null 2>&1 || true
+      sips --resampleWidth 600 "$VISION_DIR/low-quality-scan.jpg" >/dev/null 2>&1 || true
+      sips -s formatOptions 20 "$VISION_DIR/low-quality-scan.jpg" --out "$VISION_DIR/low-quality-scan.jpg" >/dev/null 2>&1 || true
+    fi
+    ok "low-quality-scan.jpg"
+  else
+    skip "low-quality-scan.jpg"
+  fi
+
   # ─── mixed-layout-newsletter.pdf ─────────────────────────────────────────
   if should_generate "$VISION_DIR/mixed-layout-newsletter.pdf"; then
     info "Generating mixed-layout-newsletter.pdf"
@@ -666,6 +727,62 @@ generate_speech_corpus() {
   else
     skip "accented-indian.wav"
   fi
+
+  # ─── accented-british.wav ─────────────────────────────────────────────────
+  if should_generate "$SPEECH_DIR/accented-british.wav"; then
+    local BRITISH_VOICE="Daniel"
+    if say -v "$BRITISH_VOICE" "" 2>/dev/null; then
+      info "Generating accented-british.wav (macOS say -v $BRITISH_VOICE)"
+      say -v "$BRITISH_VOICE" -o "$SPEECH_DIR/accented-british.aiff" \
+        "The quarterly financial results exceeded our expectations. Revenue grew by twelve percent year over year, driven primarily by strong performance in the cloud services division."
+    else
+      info "Generating accented-british.wav (macOS say, default voice)"
+      say -o "$SPEECH_DIR/accented-british.aiff" \
+        "The quarterly financial results exceeded our expectations. Revenue grew by twelve percent year over year, driven primarily by strong performance in the cloud services division."
+    fi
+    if has_cmd afconvert; then
+      afconvert "$SPEECH_DIR/accented-british.aiff" "$SPEECH_DIR/accented-british.wav" -d LEI16 -f WAVE
+      rm -f "$SPEECH_DIR/accented-british.aiff"
+    else
+      mv "$SPEECH_DIR/accented-british.aiff" "$SPEECH_DIR/accented-british.wav"
+    fi
+    ok "accented-british.wav"
+  else
+    skip "accented-british.wav"
+  fi
+
+  # ─── phone-call.wav ──────────────────────────────────────────────────────
+  if should_generate "$SPEECH_DIR/phone-call.wav"; then
+    info "Generating phone-call.wav (8kHz downsampled)"
+    say -o "$SPEECH_DIR/phone-call.aiff" \
+      "Thank you for calling customer support. Your account balance is four hundred and twenty three dollars and seventeen cents. Your next payment of fifty dollars is due on April first."
+    if has_cmd afconvert; then
+      # Convert to 8kHz WAV to simulate phone-quality audio
+      afconvert "$SPEECH_DIR/phone-call.aiff" "$SPEECH_DIR/phone-call.wav" -d LEI16 -f WAVE -r 8000
+      rm -f "$SPEECH_DIR/phone-call.aiff"
+    else
+      mv "$SPEECH_DIR/phone-call.aiff" "$SPEECH_DIR/phone-call.wav"
+    fi
+    ok "phone-call.wav"
+  else
+    skip "phone-call.wav"
+  fi
+
+  # ─── fast-speech.wav ─────────────────────────────────────────────────────
+  if should_generate "$SPEECH_DIR/fast-speech.wav"; then
+    info "Generating fast-speech.wav (high speech rate)"
+    say -r 260 -o "$SPEECH_DIR/fast-speech.aiff" \
+      "In machine learning, gradient descent is an optimization algorithm used to minimize the loss function by iteratively moving in the direction of steepest descent as defined by the negative of the gradient."
+    if has_cmd afconvert; then
+      afconvert "$SPEECH_DIR/fast-speech.aiff" "$SPEECH_DIR/fast-speech.wav" -d LEI16 -f WAVE
+      rm -f "$SPEECH_DIR/fast-speech.aiff"
+    else
+      mv "$SPEECH_DIR/fast-speech.aiff" "$SPEECH_DIR/fast-speech.wav"
+    fi
+    ok "fast-speech.wav"
+  else
+    skip "fast-speech.wav"
+  fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -688,6 +805,8 @@ verify_corpus() {
     "book-page.jpg"
     "menu-restaurant.jpg"
     "prescription-label.jpg"
+    "rotated-scan.jpg"
+    "low-quality-scan.jpg"
     "mixed-layout-newsletter.pdf"
     "multipage-report.pdf"
   )
@@ -700,6 +819,9 @@ verify_corpus() {
     "long-narration.wav"
     "spanish-speech.wav"
     "accented-indian.wav"
+    "accented-british.wav"
+    "phone-call.wav"
+    "fast-speech.wav"
   )
 
   local vision_present=0

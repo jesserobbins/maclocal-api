@@ -262,18 +262,19 @@ async def benchmark_speech(session: aiohttp.ClientSession, base_url: str,
         t0 = time.perf_counter()
         try:
             form = aiohttp.FormData()
-            form.add_field("file", open(file_path, "rb"),
-                          filename=file_path.name,
-                          content_type="audio/wav")
-            async with session.post(
-                f"{base_url}/v1/audio/transcriptions",
-                data=form,
-                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
-            ) as resp:
-                if resp.status == 404:
-                    return {"category": "speech", "file": file_path.name,
-                            "error": "Speech API not available (404)", "pass": None}
-                data = await resp.json()
+            with open(file_path, "rb") as f:
+                form.add_field("file", f,
+                              filename=file_path.name,
+                              content_type="audio/wav")
+                async with session.post(
+                    f"{base_url}/v1/audio/transcriptions",
+                    data=form,
+                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+                ) as resp:
+                    if resp.status == 404:
+                        return {"category": "speech", "file": file_path.name,
+                                "error": "Speech API not available (404)", "pass": None}
+                    data = await resp.json()
         except Exception as e:
             data = {"error": str(e), "text": ""}
         elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -460,24 +461,25 @@ async def main():
             print("--- Speech Transcription ---")
 
             # Check if speech API is available
+            speech_available = False
             try:
                 async with session.post(
                     f"{base_url}/v1/audio/transcriptions",
                     data=aiohttp.FormData(),
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as resp:
-                    if resp.status == 404:
+                    if resp.status == 200:
+                        speech_available = True
+                    elif resp.status == 404:
                         print("  Speech API not available (404) — skipping")
                         print("  (PR #107 not yet merged)")
                         print()
                     else:
-                        speech_available = True
+                        print(f"  Speech API probe returned HTTP {resp.status} — skipping")
+                        print()
             except Exception:
                 print("  Speech API not available — skipping")
-                speech_available = False
-
-            if 'speech_available' not in dir() or not speech_available:
-                speech_available = False
+                print()
 
             if speech_available:
                 speech_files = sorted(SPEECH_DIR.glob("*.wav"))
