@@ -524,7 +524,12 @@ async def main():
 
                     status = "PASS" if result["pass"] else "FAIL"
                     cer_str = f"CER={result['afm_cer']:.3f}" if result.get("afm_cer") is not None else "N/A"
-                    print(f" {result['afm_latency_ms']:.0f}ms | {cer_str} | {status}")
+                    gpu_str = f"GPU={result['afm_gpu_pct']:.0f}%" if result.get("afm_gpu_pct") is not None else "GPU=0%(ANE)"
+                    tess_str = ""
+                    if result.get("tesseract_latency_ms") is not None:
+                        speedup = result["tesseract_latency_ms"] / result["afm_latency_ms"] if result["afm_latency_ms"] > 0 else 0
+                        tess_str = f" | Tess={result['tesseract_latency_ms']:.0f}ms ({speedup:.1f}x)"
+                    print(f" {result['afm_latency_ms']:.0f}ms | {cer_str} | {gpu_str}{tess_str} | {status}")
                     results.append(result)
             print()
 
@@ -575,7 +580,12 @@ async def main():
 
                             status = "PASS" if result["pass"] else "FAIL"
                             wer_str = f"WER={result['afm_wer']:.3f}" if result.get("afm_wer") is not None else "N/A"
-                            print(f" {result['afm_latency_ms']:.0f}ms | {wer_str} | RTF={result['afm_rtf']:.2f} | {status}")
+                            gpu_str = f"GPU={result['afm_gpu_pct']:.0f}%" if result.get("afm_gpu_pct") is not None else "GPU=0%(ANE)"
+                            whisp_str = ""
+                            if result.get("whisper_latency_ms") is not None:
+                                speedup = result["whisper_latency_ms"] / result["afm_latency_ms"] if result["afm_latency_ms"] > 0 else 0
+                                whisp_str = f" | Whisp={result['whisper_latency_ms']:.0f}ms ({speedup:.1f}x)"
+                            print(f" {result['afm_latency_ms']:.0f}ms | {wer_str} | RTF={result['afm_rtf']:.2f} | {gpu_str}{whisp_str} | {status}")
                         results.append(result)
             print()
 
@@ -668,6 +678,21 @@ async def main():
         print(f"  {'AVERAGE':30s}  AFM {avg_afm:>7.0f}ms  Whisp {avg_whisp:>7.0f}ms  {overall:>5.1f}x")
 
     print(f"\n  Results: {jsonl_path}")
+
+    # ─── Generate and open HTML report ──────────────────────────────────────
+    report_script = SCRIPT_DIR / "generate-vision-speech-report.py"
+    if report_script.exists():
+        report_path = str(jsonl_path).replace(".jsonl", "-report.html")
+        try:
+            subprocess.run(
+                [sys.executable, str(report_script), "--output", report_path, str(jsonl_path)],
+                check=True
+            )
+            print(f"  Report: {report_path}")
+            # Auto-open in browser on macOS
+            subprocess.run(["open", report_path], check=False)
+        except subprocess.CalledProcessError as e:
+            print(f"  Report generation failed: {e}")
     print("=" * 60)
 
 
