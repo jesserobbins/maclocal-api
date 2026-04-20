@@ -145,23 +145,24 @@ def generate_html(meta: dict, results: list, output_path: str):
   <h2>Vision OCR Results</h2>
   <table>
     <thead>
-      <tr><th>Document</th><th>AFM (ms)</th><th>Tesseract (ms)</th><th>Speedup</th><th>CER</th><th>GPU%</th><th>Status</th><th>Preview</th></tr>
+      <tr><th>Document</th><th>Wall (ms)</th><th>CPU (ms)</th><th>GPU (ms)</th><th>Tess (ms)</th><th>Speedup</th><th>CER</th><th>Status</th></tr>
     </thead>
     <tbody>
 """)
         for r in vision_results:
             latency = r.get("afm_latency_ms", 0)
             tess_latency = r.get("tesseract_latency_ms")
+            cpu_time = r.get("afm_cpu_time_ms")
+            gpu_time = r.get("afm_gpu_time_ms")
             cer = r.get("afm_cer")
             passed = r.get("pass")
-            preview = html_module.escape(r.get("extracted_preview", "")[:80])
-            gpu_pct = r.get("afm_gpu_pct")
-            cpu_pct = r.get("afm_cpu_pct")
 
             cer_class = "good" if cer is not None and cer < 0.05 else ("warn" if cer is not None and cer < 0.15 else "bad")
             badge_class = "pass" if passed else "fail"
 
             cer_str = f"{cer:.3f}" if cer is not None else "N/A"
+            cpu_str = f"{cpu_time:.0f}" if cpu_time is not None else "—"
+            gpu_str = f"{gpu_time:.1f}" if gpu_time is not None else "—"
             tess_str = f"{tess_latency:.0f}" if tess_latency is not None else "—"
             speedup_str = ""
             if tess_latency is not None and latency > 0:
@@ -171,17 +172,15 @@ def generate_html(meta: dict, results: list, output_path: str):
             else:
                 speedup_str = "—"
 
-            gpu_str = f"{gpu_pct:.0f}%" if gpu_pct is not None else "0% (ANE)"
-
             html_parts.append(f"""      <tr>
         <td>{html_module.escape(r['file'])}</td>
         <td class="metric">{latency:.0f}</td>
+        <td class="metric">{cpu_str}</td>
+        <td class="metric">{gpu_str}</td>
         <td class="metric">{tess_str}</td>
         <td class="metric">{speedup_str}</td>
         <td class="metric {cer_class}">{cer_str}</td>
-        <td class="metric" style="color:{PASS_TEXT};">{gpu_str}</td>
         <td><span class="badge {badge_class}">{'PASS' if passed else 'FAIL'}</span></td>
-        <td class="preview">{preview}</td>
       </tr>
 """)
         html_parts.append("    </tbody>\n  </table>\n</div>\n")
@@ -193,7 +192,7 @@ def generate_html(meta: dict, results: list, output_path: str):
   <h2>Speech Transcription Results</h2>
   <table>
     <thead>
-      <tr><th>Audio</th><th>Duration</th><th>AFM (ms)</th><th>Whisper (ms)</th><th>Speedup</th><th>WER</th><th>RTF</th><th>GPU%</th><th>Status</th></tr>
+      <tr><th>Audio</th><th>Duration</th><th>Wall (ms)</th><th>CPU (ms)</th><th>GPU (ms)</th><th>Whisper (ms)</th><th>Speedup</th><th>WER</th><th>RTF</th><th>Status</th></tr>
     </thead>
     <tbody>
 """)
@@ -209,17 +208,20 @@ def generate_html(meta: dict, results: list, output_path: str):
 
             latency = r.get("afm_latency_ms", 0)
             whisp_latency = r.get("whisper_latency_ms")
+            cpu_time = r.get("afm_cpu_time_ms")
+            gpu_time = r.get("afm_gpu_time_ms")
             wer = r.get("afm_wer")
             rtf = r.get("afm_rtf", 0)
             duration = r.get("audio_duration_s", 0)
             passed = r.get("pass")
-            gpu_pct = r.get("afm_gpu_pct")
 
             wer_class = "good" if wer is not None and wer < 0.10 else ("warn" if wer is not None and wer < 0.20 else "bad")
             rtf_class = "good" if rtf < 0.5 else ("warn" if rtf < 1.0 else "bad")
             badge_class = "pass" if passed else "fail"
 
             wer_str = f"{wer:.3f}" if wer is not None else "N/A"
+            cpu_str = f"{cpu_time:.0f}" if cpu_time is not None else "—"
+            gpu_str = f"{gpu_time:.1f}" if gpu_time is not None else "—"
             whisp_str = f"{whisp_latency:.0f}" if whisp_latency is not None else "—"
             speedup_str = ""
             if whisp_latency is not None and latency > 0:
@@ -228,17 +230,17 @@ def generate_html(meta: dict, results: list, output_path: str):
                 speedup_str = f'<span style="color:{speedup_color}; font-weight:600;">{speedup:.1f}x</span>'
             else:
                 speedup_str = "—"
-            gpu_str = f"{gpu_pct:.0f}%" if gpu_pct is not None else "0% (ANE)"
 
             html_parts.append(f"""      <tr>
         <td>{html_module.escape(r['file'])}</td>
         <td class="metric">{duration:.1f}s</td>
         <td class="metric">{latency:.0f}</td>
+        <td class="metric">{cpu_str}</td>
+        <td class="metric">{gpu_str}</td>
         <td class="metric">{whisp_str}</td>
         <td class="metric">{speedup_str}</td>
         <td class="metric {wer_class}">{wer_str}</td>
         <td class="metric {rtf_class}">{rtf:.2f}x</td>
-        <td class="metric" style="color:{PASS_TEXT};">{gpu_str}</td>
         <td><span class="badge {badge_class}">{'PASS' if passed else 'FAIL'}</span></td>
       </tr>
 """)
@@ -251,8 +253,8 @@ def generate_html(meta: dict, results: list, output_path: str):
     if has_tess_speed or has_whisp_speed:
         html_parts.append(f"""
 <div class="section">
-  <h2 style="font-size:1.5rem; color:{ACCENT_COLOR};">Speed Comparison — AFM (Apple ANE) vs Alternatives</h2>
-  <p style="color:{MUTED_COLOR}; margin-bottom:1rem;">Lower is better. AFM uses the Apple Neural Engine (0% GPU), competitors use GPU/CPU.</p>
+  <h2 style="font-size:1.5rem; color:{ACCENT_COLOR};">Speed Comparison — Wall Clock | CPU | GPU | Memory</h2>
+  <p style="color:{MUTED_COLOR}; margin-bottom:1rem;">Lower is better. Shows actual per-process resource usage.</p>
 """)
 
         # ─── Speed: OCR ─────────────────────────────────────────────────────
