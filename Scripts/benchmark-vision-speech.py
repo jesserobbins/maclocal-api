@@ -675,7 +675,8 @@ async def main():
                     cpu_time = result.get("afm_cpu_time_ms")
                     res_str = ""
                     if cpu_time is not None and gpu_time is not None:
-                        res_str = f" | CPU={cpu_time:.0f}ms GPU={gpu_time:.1f}ms"
+                        ane_time = max(0, result["afm_latency_ms"] - cpu_time - gpu_time)
+                        res_str = f" | CPU={cpu_time:.0f}ms GPU={gpu_time:.1f}ms ANE≈{ane_time:.0f}ms"
                     comp_str = ""
                     if result.get("tesseract_latency_ms") is not None:
                         speedup = result["tesseract_latency_ms"] / result["afm_latency_ms"] if result["afm_latency_ms"] > 0 else 0
@@ -754,7 +755,8 @@ async def main():
                             cpu_time = result.get("afm_cpu_time_ms")
                             res_str = ""
                             if cpu_time is not None and gpu_time is not None:
-                                res_str = f" | CPU={cpu_time:.0f}ms GPU={gpu_time:.1f}ms"
+                                ane_time = max(0, result["afm_latency_ms"] - cpu_time - gpu_time)
+                                res_str = f" | CPU={cpu_time:.0f}ms GPU={gpu_time:.1f}ms ANE≈{ane_time:.0f}ms"
                             whisp_str = ""
                             if result.get("whisper_latency_ms") is not None:
                                 speedup = result["whisper_latency_ms"] / result["afm_latency_ms"] if result["afm_latency_ms"] > 0 else 0
@@ -833,14 +835,19 @@ async def main():
         if afm_mem:
             print(f"  Memory: {afm_mem:.0f} MB")
         print()
-        print(f"  {'Document':30s} {'Wall':>8s} {'CPU':>8s} {'GPU':>8s}")
-        print(f"  {'─'*30} {'─'*8} {'─'*8} {'─'*8}")
+        print(f"  {'Document':30s} {'Wall':>8s} {'CPU':>8s} {'GPU':>8s} {'ANE*':>8s} {'Mem':>8s}")
+        print(f"  {'─'*30} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8}")
         for r in vision_results:
             cpu = r.get("afm_cpu_time_ms")
             gpu = r.get("afm_gpu_time_ms")
             if cpu is None:
                 continue
-            print(f"  {r['file']:30s} {r['afm_latency_ms']:>7.0f}ms {cpu:>7.0f}ms {gpu:>7.1f}ms")
+            wall = r["afm_latency_ms"]
+            ane = max(0, wall - cpu - gpu)
+            print(f"  {r['file']:30s} {wall:>7.0f}ms {cpu:>7.0f}ms {gpu:>7.1f}ms {ane:>7.0f}ms")
+        if afm_mem:
+            print(f"\n  Memory: {afm_mem:.0f} MB")
+        print(f"  * ANE = Wall - CPU - GPU (inferred accelerator time)")
 
     if tess_pairs:
         print()
