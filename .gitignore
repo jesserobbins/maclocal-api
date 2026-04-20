@@ -113,8 +113,8 @@ Scripts/test-data/speech/*.aiff
 # Keep ground truth text files (tracked)
 !Scripts/test-data/vision/*.txt
 !Scripts/test-data/speech/*.txt
-# Benchmark results (regenerated)
-Scripts/benchmark-results/
+# Vision/Speech benchmark results (regenerated on each run)
+Scripts/benchmark-results/vision-speech-*
 
 # Worktrees
 .worktrees/
