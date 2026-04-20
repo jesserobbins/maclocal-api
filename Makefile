@@ -1,7 +1,7 @@
 # AFM - Apple Foundation Models API
 # Makefile for building and distributing the portable CLI
 
-.PHONY: build clean clean-reports clean-benchmarks clean-all install uninstall portable dist test test-vision help submodules submodule-status webui build-with-webui patch patch-check
+.PHONY: build clean clean-reports clean-benchmarks clean-corpus clean-all install uninstall portable dist test test-vision help submodules submodule-status webui build-with-webui patch patch-check
 
 PATCH_SH  := Scripts/apply-mlx-patches.sh
 PATCH_STAMP := vendor/mlx-swift-lm/.patches-applied
@@ -79,7 +79,7 @@ clean-reports:
 	@rm -rf test-reports/assertions-report-*.html test-reports/assertions-report-*.jsonl
 	@rm -rf test-reports/smart-analysis-*.md
 	@rm -rf test-reports/prefix-cache-bench-*
-	@echo "  Removed: $$(find test-reports -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ') files remain"
+	@echo "  $$(find test-reports -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ') files remaining in test-reports/"
 	@echo "✅ Reports cleaned"
 
 # Clean benchmark results (vision/speech JSONL + HTML reports)
