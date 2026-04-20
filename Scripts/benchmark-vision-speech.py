@@ -513,33 +513,24 @@ def benchmark_tesseract(file_path: Path) -> dict | None:
     if not _has_command("tesseract"):
         return None
 
+    # Single invocation: /usr/bin/time -l wraps tesseract to capture peak RSS
+    # OCR text comes from stdout, timing/memory stats from stderr
     t0 = time.perf_counter()
-    try:
-        result = subprocess.run(
-            ["tesseract", str(file_path), "stdout", "--oem", "1"],
-            capture_output=True, text=True, timeout=60
-        )
-        extracted = result.stdout.strip()
-        # Capture tesseract's peak memory via /usr/bin/time if available
-        pid = result.pid if hasattr(result, 'pid') else None
-    except Exception as e:
-        return {"tool": "tesseract", "error": str(e)}
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-
-    # Get tesseract memory: re-run with /usr/bin/time to capture RSS
     mem_mb = None
     try:
-        mem_result = subprocess.run(
+        result = subprocess.run(
             ["/usr/bin/time", "-l", "tesseract", str(file_path), "stdout", "--oem", "1"],
             capture_output=True, text=True, timeout=60
         )
-        for line in mem_result.stderr.splitlines():
+        extracted = result.stdout.strip()
+        for line in result.stderr.splitlines():
             if "maximum resident set size" in line:
                 rss_bytes = int(line.strip().split()[0])
                 mem_mb = round(rss_bytes / (1024 * 1024), 1)
                 break
-    except Exception:
-        pass
+    except Exception as e:
+        return {"tool": "tesseract", "error": str(e)}
+    elapsed_ms = (time.perf_counter() - t0) * 1000
 
     gt_path = file_path.parent / (file_path.stem + ".txt")
     ground_truth = gt_path.read_text().strip() if gt_path.exists() else ""
@@ -879,9 +870,9 @@ async def main():
         print("  │    AFM Vision vs Tesseract                  │")
         print("  └─────────────────────────────────────────────┘")
         # Get representative memory values
-        tess_mem = next((r.get("tesseract_memory_mb") for r in vision_results if r.get("tesseract_memory_mb")), None)
-        tess_mem_str = f"  Tesseract: {tess_mem:.0f} MB" if tess_mem else ""
-        afm_mem_str = f"  AFM: {afm_mem:.0f} MB" if afm_mem else ""
+        tess_mem = next((r["tesseract_memory_mb"] for r in vision_results if r.get("tesseract_memory_mb") is not None), None)
+        tess_mem_str = f"  Tesseract: {tess_mem:.0f} MB" if tess_mem is not None else ""
+        afm_mem_str = f"  AFM: {afm_mem:.0f} MB" if afm_mem is not None else ""
         if afm_mem_str or tess_mem_str:
             print(f"  Memory:{afm_mem_str}{tess_mem_str}")
         print(f"  {'Document':30s} {'AFM':>8s} {'Tess':>8s} {'Speedup':>8s}")
@@ -904,9 +895,9 @@ async def main():
         print(f"  ┌─────────────────────────────────────────────────────────┐")
         print(f"  │    AFM Vision vs {vlm_tool:40s} │")
         print(f"  └─────────────────────────────────────────────────────────┘")
-        vlm_mem = next((r.get("vlm_memory_mb") for r in vision_results if r.get("vlm_memory_mb")), None)
-        vlm_mem_str = f"  VLM: {vlm_mem:.0f} MB" if vlm_mem else ""
-        afm_mem_str2 = f"  AFM: {afm_mem:.0f} MB" if afm_mem else ""
+        vlm_mem = next((r["vlm_memory_mb"] for r in vision_results if r.get("vlm_memory_mb") is not None), None)
+        vlm_mem_str = f"  VLM: {vlm_mem:.0f} MB" if vlm_mem is not None else ""
+        afm_mem_str2 = f"  AFM: {afm_mem:.0f} MB" if afm_mem is not None else ""
         if afm_mem_str2 or vlm_mem_str:
             print(f"  Memory:{afm_mem_str2}{vlm_mem_str}")
         print(f"  {'Document':30s} {'AFM':>8s} {'VLM':>9s} {'Speedup':>8s}  {'AFM GPU':>8s} {'VLM GPU':>9s}")
@@ -917,9 +908,9 @@ async def main():
                 continue
             afm_ms = r["afm_latency_ms"]
             speedup = vlm_ms / afm_ms if afm_ms > 0 else 0
-            afm_gpu = r.get("afm_gpu_time_ms", 0) or 0
+            afm_gpu = r.get("afm_gpu_time_ms") or 0
             vlm_gpu = r.get("vlm_gpu_time_ms")
-            vlm_gpu_str = f"{vlm_gpu:>8.0f}ms" if vlm_gpu else f"{'—':>9s}"
+            vlm_gpu_str = f"{vlm_gpu:>8.0f}ms" if vlm_gpu is not None else f"{'—':>9s}"
             print(f"  {r['file']:30s} {afm_ms:>7.0f}ms {vlm_ms:>8.0f}ms {speedup:>7.1f}x  {afm_gpu:>7.1f}ms {vlm_gpu_str}")
         avg_afm = sum(a for a, _, _, _ in vlm_pairs) / len(vlm_pairs)
         avg_vlm = sum(v for _, v, _, _ in vlm_pairs) / len(vlm_pairs)
