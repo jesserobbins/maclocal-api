@@ -51,6 +51,7 @@ xcuserdata/
 # IDE
 .vscode/
 .idea/
+.claude/
 
 # Logs
 *.log
@@ -70,6 +71,9 @@ test_lora.fmadapter
 
 # Build-from-scratch test workspace
 build-from-scratch/
+
+# Local test workspace
+afm-test/
 
 # Vendor patch stamp
 vendor/mlx-swift-lm/.patches-applied
@@ -97,3 +101,6 @@ vendor/llama.cpp/tools/server/public/
 .codex/*secret*
 .codex/*auth*.json
 /default.metallib
+
+# Worktrees
+.worktrees/
