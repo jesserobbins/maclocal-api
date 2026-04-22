@@ -49,7 +49,6 @@ struct ChatCompletionsController: RouteCollection {
         var fallbackModel = "foundation"
         var fallbackMessages: [Message] = []
         var fallbackMaxTokens = 2000
-        var visionCleanupURLs: [URL] = []
         do {
             let chatRequest = try req.content.decode(ChatCompletionRequest.self)
             fallbackModel = chatRequest.model ?? "foundation"
@@ -100,40 +99,58 @@ struct ChatCompletionsController: RouteCollection {
             let processedMessages: [Message]
             if #available(macOS 26.0, *) {
                 foundationService = try await FoundationModelService.createWithSharedAdapter(instructions: instructions, temperature: temperature, randomness: randomness, permissiveGuardrails: permissiveGuardrails)
-                let shouldApplyVisionOCR = chatRequest.messages.contains { message in
+                // Detect media content that should bypass the Foundation Model
+                let hasImages = chatRequest.messages.contains { message in
                     guard let content = message.content, case .parts(let parts) = content else { return false }
                     return parts.contains(where: { $0.type == "image_url" })
                 }
-                if shouldApplyVisionOCR {
-                    // Run OCR and return results directly — Foundation Models has a
-                    // 4096 token context limit that OCR text easily exceeds.  Bypass
-                    // the LLM entirely, matching `afm vision -f` behaviour.
-                    let visionOptions = VisionRequestOptions()
-                    let visionProcessed = try await VisionAPIController.extractOCRTextFromMessages(chatRequest.messages, options: visionOptions)
-                    visionCleanupURLs = visionProcessed.cleanupURLs
+                let hasAudio = chatRequest.messages.contains { message in
+                    guard let content = message.content, case .parts(let parts) = content else { return false }
+                    return parts.contains(where: { $0.type == "input_audio" })
+                }
+
+                if hasImages || hasAudio {
+                    // Run on-device extraction and return results directly —
+                    // Foundation Models has a 4096 token context limit that
+                    // extracted text easily exceeds.  Bypass the LLM entirely.
+                    var extractedTexts: [String] = []
+                    var allCleanupURLs: [URL] = []
+
+                    if hasImages {
+                        let visionProcessed = try await VisionAPIController.extractOCRTextFromMessages(chatRequest.messages, options: VisionRequestOptions())
+                        extractedTexts.append(contentsOf: visionProcessed.ocrTexts)
+                        allCleanupURLs.append(contentsOf: visionProcessed.cleanupURLs)
+                    }
+                    if hasAudio {
+                        let speechProcessed = try await SpeechAPIController.extractTranscriptionFromMessages(chatRequest.messages, options: SpeechRequestOptions())
+                        extractedTexts.append(contentsOf: speechProcessed.transcriptionTexts)
+                        allCleanupURLs.append(contentsOf: speechProcessed.cleanupURLs)
+                    }
+
                     defer {
-                        for url in visionCleanupURLs {
+                        for url in allCleanupURLs {
                             try? FileManager.default.removeItem(at: url)
                         }
                     }
 
-                    let ocrContent = visionProcessed.ocrTexts.joined(separator: "\n\n")
+                    let extractedContent = extractedTexts.joined(separator: "\n\n")
 
                     if chatRequest.stream == true && streamingEnabled {
-                        return try await createVisionStreamingResponse(
+                        return try await createBypassStreamingResponse(
                             req: req,
                             chatRequest: chatRequest,
-                            ocrContent: ocrContent
+                            content: extractedContent
                         )
                     } else {
-                        let promptTokens = estimateTokens(for: chatRequest.messages)
-                        let completionTokens = estimateTokens(for: ocrContent)
+                        // No LLM was invoked — OCR text comes directly from
+                        // Apple Vision.  Mirror `afm vision -f`, which does
+                        // not report token usage, by leaving prompt/completion
+                        // tokens at zero rather than producing a misleading
+                        // estimate over image-bearing message parts.
                         let response = ChatCompletionResponse(
                             model: chatRequest.model ?? "foundation",
-                            content: ocrContent,
-                            finishReason: "stop",
-                            promptTokens: promptTokens,
-                            completionTokens: completionTokens
+                            content: extractedContent,
+                            finishReason: "stop"
                         )
                         return try await createSuccessResponse(req: req, response: response)
                     }
@@ -143,12 +160,6 @@ struct ChatCompletionsController: RouteCollection {
             } else {
                 throw FoundationModelError.notAvailable
             }
-            defer {
-                for url in visionCleanupURLs {
-                    try? FileManager.default.removeItem(at: url)
-                }
-            }
-
             // Check if streaming is requested and enabled
             if chatRequest.stream == true && streamingEnabled {
                 return try await createStreamingResponse(req: req, chatRequest: chatRequest, processedMessages: processedMessages, foundationService: foundationService)
@@ -490,9 +501,9 @@ struct ChatCompletionsController: RouteCollection {
         return httpResponse
     }
 
-    /// Stream OCR results directly to the client, bypassing the Foundation Model.
-    /// Mirrors what `afm vision -f` does: run Vision OCR and return extracted text.
-    private func createVisionStreamingResponse(req: Request, chatRequest: ChatCompletionRequest, ocrContent: String) async throws -> Response {
+    /// Stream extracted content directly to the client, bypassing the Foundation Model.
+    /// Used for Vision OCR and Speech transcription results.
+    private func createBypassStreamingResponse(req: Request, chatRequest: ChatCompletionRequest, content: String) async throws -> Response {
         let httpResponse = Response(status: .ok)
         httpResponse.headers.add(name: .contentType, value: "text/event-stream")
         httpResponse.headers.add(name: .cacheControl, value: "no-cache")
@@ -503,18 +514,16 @@ struct ChatCompletionsController: RouteCollection {
 
         let streamId = UUID().uuidString
         let model = chatRequest.model ?? "foundation"
-        let promptTokens = estimateTokens(for: chatRequest.messages)
-        let completionTokens = estimateTokens(for: ocrContent)
 
         httpResponse.body = .init(asyncStream: { writer in
             let encoder = JSONEncoder()
 
             do {
-                // Send content in a single chunk (OCR is already complete)
+                // Send content in a single chunk (extraction is already complete)
                 let contentChunk = ChatCompletionStreamResponse(
                     id: streamId,
                     model: model,
-                    content: ocrContent,
+                    content: content,
                     isFirst: true
                 )
                 let contentData = try encoder.encode(contentChunk)
@@ -522,7 +531,10 @@ struct ChatCompletionsController: RouteCollection {
                     try await writer.write(.buffer(.init(string: "data: \(jsonString)\n\n")))
                 }
 
-                // Send final chunk with finish_reason
+                // Send final chunk with finish_reason.  No usage chunk is
+                // emitted: the Foundation Model was bypassed, so there are no
+                // LLM tokens to report — matching `afm vision -f`, which
+                // prints OCR text without any usage metrics.
                 let finalChunk = ChatCompletionStreamResponse(
                     id: streamId,
                     model: model,
@@ -532,24 +544,6 @@ struct ChatCompletionsController: RouteCollection {
                 )
                 let finalData = try encoder.encode(finalChunk)
                 if let jsonString = String(data: finalData, encoding: .utf8) {
-                    try await writer.write(.buffer(.init(string: "data: \(jsonString)\n\n")))
-                }
-
-                // Send usage chunk
-                let usage = StreamUsage(
-                    promptTokens: promptTokens,
-                    completionTokens: completionTokens,
-                    completionTime: 0,
-                    promptTime: 0
-                )
-                let usageChunk = ChatCompletionStreamResponse(
-                    id: streamId,
-                    model: model,
-                    usage: usage,
-                    timings: nil
-                )
-                let usageData = try encoder.encode(usageChunk)
-                if let jsonString = String(data: usageData, encoding: .utf8) {
                     try await writer.write(.buffer(.init(string: "data: \(jsonString)\n\n")))
                 }
 
