@@ -545,21 +545,35 @@ def benchmark_tesseract(file_path: Path) -> dict | None:
 
 
 def benchmark_whisper(file_path: Path, model: str = "base.en") -> dict | None:
-    """Run whisper-cpp on a file for comparison."""
-    if not _has_command("whisper-cpp"):
+    """Run whisper.cpp on a file for comparison.
+
+    The upstream CLI was renamed from ``whisper-cpp`` to ``whisper-cli`` in
+    whisper.cpp 1.7+; Homebrew's ``whisper-cpp`` formula ships the new name.
+    Probe both and use whichever is on PATH.
+    """
+    whisper_bin = next((b for b in ("whisper-cli", "whisper-cpp") if _has_command(b)), None)
+    if whisper_bin is None:
         return None
 
-    # Find model file
+    # Find model file. Homebrew stores models next to the binary prefix under
+    # share/whisper-cpp/models when download-ggml-model.sh is used; ~/.cache
+    # is the most common manual location.
+    brew_prefixes = []
+    try:
+        brew = subprocess.run(["brew", "--prefix", "whisper-cpp"],
+                              capture_output=True, text=True, timeout=2)
+        if brew.returncode == 0 and brew.stdout.strip():
+            brew_prefixes.append(Path(brew.stdout.strip()))
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        pass
     model_paths = [
-        Path(f"/usr/local/share/whisper-cpp/models/ggml-{model}.bin"),
         Path.home() / f".cache/whisper/ggml-{model}.bin",
+        Path(f"/usr/local/share/whisper-cpp/models/ggml-{model}.bin"),
+        Path(f"/opt/homebrew/share/whisper-cpp/models/ggml-{model}.bin"),
+        *[p / f"share/whisper-cpp/models/ggml-{model}.bin" for p in brew_prefixes],
         Path(f"models/ggml-{model}.bin"),
     ]
-    model_path = None
-    for mp in model_paths:
-        if mp.exists():
-            model_path = mp
-            break
+    model_path = next((mp for mp in model_paths if mp.exists()), None)
 
     if model_path is None:
         return {"tool": f"whisper-{model}", "error": "model file not found"}
@@ -567,7 +581,7 @@ def benchmark_whisper(file_path: Path, model: str = "base.en") -> dict | None:
     t0 = time.perf_counter()
     try:
         result = subprocess.run(
-            ["whisper-cpp", "-m", str(model_path), "-f", str(file_path),
+            [whisper_bin, "-m", str(model_path), "-f", str(file_path),
              "--no-timestamps", "--print-progress", "false"],
             capture_output=True, text=True, timeout=120
         )
