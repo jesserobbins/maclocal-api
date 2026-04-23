@@ -303,6 +303,11 @@ fi
 # Step 2: Assertion Tests (Sections 17 & 18)
 # ═══════════════════════════════════════════════════════════════════════════════
 ASSERTION_EXIT=0
+ASSERTION_JSONLS=()
+newest_assertion_jsonl() {
+  ls -t "$PROJECT_ROOT/test-reports"/assertions-report-*.jsonl 2>/dev/null | head -1
+}
+
 if [[ "$BENCHMARK_ONLY" != "true" ]]; then
   echo ""
   echo "═══ Running Assertion Tests ═══"
@@ -316,6 +321,8 @@ if [[ "$BENCHMARK_ONLY" != "true" ]]; then
     ASSERTION_EXIT=1
     warn "Section 17 had failures"
   fi
+  vision_jsonl=$(newest_assertion_jsonl)
+  [[ -n "$vision_jsonl" ]] && ASSERTION_JSONLS+=("$vision_jsonl")
 
   echo ""
 
@@ -326,6 +333,10 @@ if [[ "$BENCHMARK_ONLY" != "true" ]]; then
   else
     # Don't fail on speech — it's expected to skip if API not merged
     warn "Section 18 had failures or was skipped"
+  fi
+  speech_jsonl=$(newest_assertion_jsonl)
+  if [[ -n "$speech_jsonl" && "$speech_jsonl" != "$vision_jsonl" ]]; then
+    ASSERTION_JSONLS+=("$speech_jsonl")
   fi
 fi
 
@@ -361,21 +372,50 @@ if [[ "$ASSERTIONS_ONLY" != "true" ]]; then
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Step 4: Generate Report (benchmark script auto-generates, but handle edge cases)
+# Step 4: Generate Reports (benchmark detail + merged suite report)
 # ═══════════════════════════════════════════════════════════════════════════════
 if [[ -n "$BENCHMARK_JSONL" ]]; then
   REPORT_HTML="${BENCHMARK_JSONL%.jsonl}-report.html"
   if [[ ! -f "$REPORT_HTML" ]]; then
     echo ""
-    echo "═══ Generating Report ═══"
+    echo "═══ Generating Benchmark Report ═══"
     echo ""
     python3 "$SCRIPT_DIR/generate-vision-speech-report.py" --output "$REPORT_HTML" "$BENCHMARK_JSONL"
   fi
   if [[ -f "$REPORT_HTML" ]]; then
-    ok "Report: $REPORT_HTML"
+    ok "Benchmark detail: $REPORT_HTML"
+  fi
+fi
+
+# Merged suite report — combines machine info + assertions + benchmark into one HTML.
+MERGED_HTML=""
+if [[ -n "$BENCHMARK_JSONL" || ${#ASSERTION_JSONLS[@]} -gt 0 ]]; then
+  echo ""
+  echo "═══ Generating Merged Suite Report ═══"
+  echo ""
+  # Derive timestamp from benchmark JSONL if present, else now.
+  if [[ -n "$BENCHMARK_JSONL" ]]; then
+    MERGED_TS=$(basename "$BENCHMARK_JSONL" .jsonl | sed 's/^vision-speech-//')
+  else
+    MERGED_TS=$(date +%Y%m%d_%H%M%S)
+  fi
+  mkdir -p "$SCRIPT_DIR/benchmark-results"
+  MERGED_HTML="$SCRIPT_DIR/benchmark-results/suite-report-${MERGED_TS}.html"
+
+  MERGED_ARGS=(--output "$MERGED_HTML")
+  [[ -n "$BENCHMARK_JSONL" ]] && MERGED_ARGS+=(--benchmark "$BENCHMARK_JSONL")
+  for aj in "${ASSERTION_JSONLS[@]}"; do
+    MERGED_ARGS+=(--assertion "$aj")
+  done
+
+  if python3 "$SCRIPT_DIR/generate-suite-report.py" "${MERGED_ARGS[@]}"; then
+    ok "Merged report: $MERGED_HTML"
     if command -v open &>/dev/null; then
-      open "$REPORT_HTML" 2>/dev/null || true
+      open "$MERGED_HTML" 2>/dev/null || true
     fi
+  else
+    warn "Merged report generation failed"
+    MERGED_HTML=""
   fi
 fi
 
@@ -392,6 +432,9 @@ else
 fi
 if [[ -n "$BENCHMARK_JSONL" ]]; then
   echo "  Benchmark:  $BENCHMARK_JSONL"
+fi
+if [[ -n "$MERGED_HTML" ]]; then
+  echo "  Merged:     $MERGED_HTML"
 fi
 if [[ "$AFM_SERVER_PID" -gt 0 ]]; then
   echo "  (AFM server will be stopped on exit)"

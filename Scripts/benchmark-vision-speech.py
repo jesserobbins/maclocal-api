@@ -597,6 +597,131 @@ def _has_command(cmd: str) -> bool:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Machine info
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BYTES_PER_GB = 1024 ** 3
+
+
+def _sysctl(key: str) -> str | None:
+    try:
+        out = subprocess.run(["sysctl", "-n", key], capture_output=True, text=True, check=True, timeout=2)
+        return out.stdout.strip() or None
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+
+def _gpu_core_count() -> int | None:
+    # system_profiler is ~1-2s but only runs once per benchmark.
+    try:
+        out = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType", "-json"],
+            capture_output=True, text=True, check=True, timeout=5,
+        )
+        data = json.loads(out.stdout)
+        for gpu in data.get("SPDisplaysDataType", []):
+            cores = gpu.get("sppci_cores")
+            if cores:
+                try:
+                    return int(cores)
+                except (ValueError, TypeError):
+                    pass
+    except (subprocess.CalledProcessError, FileNotFoundError,
+            subprocess.TimeoutExpired, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _afm_binary_info() -> dict:
+    info: dict = {}
+    afm_bin = os.environ.get("AFM_BIN")
+    if not afm_bin:
+        project_root = Path(__file__).resolve().parent.parent
+        candidate = project_root / ".build" / "release" / "afm"
+        if candidate.exists():
+            afm_bin = str(candidate)
+    if afm_bin and Path(afm_bin).exists():
+        info["path"] = afm_bin
+        try:
+            stat = Path(afm_bin).stat()
+            info["size_mb"] = round(stat.st_size / (1024 * 1024), 1)
+            info["mtime"] = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
+        except OSError:
+            pass
+        try:
+            out = subprocess.run([afm_bin, "--version"], capture_output=True, text=True, timeout=5)
+            version = (out.stdout or out.stderr).strip()
+            if version:
+                info["version"] = version.splitlines()[0][:200]
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+    return info
+
+
+def collect_machine_info() -> dict:
+    import platform, socket
+    info: dict = {
+        "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+    }
+    mac_ver, _, _ = platform.mac_ver()
+    if mac_ver:
+        info["macos"] = mac_ver
+    build = _sysctl("kern.osversion")
+    if build:
+        info["macos_build"] = build
+    chip = _sysctl("machdep.cpu.brand_string")
+    if chip:
+        info["chip"] = chip
+    mem_bytes = _sysctl("hw.memsize")
+    if mem_bytes:
+        try:
+            info["memory_gb"] = round(int(mem_bytes) / BYTES_PER_GB, 1)
+        except ValueError:
+            pass
+    for label, key in (("cpu_cores", "hw.physicalcpu"),
+                       ("cpu_threads", "hw.ncpu"),
+                       ("p_cores", "hw.perflevel0.physicalcpu"),
+                       ("e_cores", "hw.perflevel1.physicalcpu")):
+        val = _sysctl(key)
+        if val:
+            try:
+                info[label] = int(val)
+            except ValueError:
+                pass
+    gpu_cores = _gpu_core_count()
+    if gpu_cores:
+        info["gpu_cores"] = gpu_cores
+    afm = _afm_binary_info()
+    if afm:
+        info["afm_binary"] = afm
+    return info
+
+
+def format_machine_summary(machine: dict) -> list[str]:
+    lines = []
+    chip = machine.get("chip", "unknown chip")
+    cores = []
+    if machine.get("p_cores") and machine.get("e_cores"):
+        cores.append(f"{machine['p_cores']}P+{machine['e_cores']}E")
+    elif machine.get("cpu_cores"):
+        cores.append(f"{machine['cpu_cores']} cores")
+    if machine.get("gpu_cores"):
+        cores.append(f"{machine['gpu_cores']}-core GPU")
+    mem = f"{machine['memory_gb']:g} GB" if machine.get("memory_gb") else "?"
+    macos = machine.get("macos", "?")
+    lines.append(f"  Machine: {chip}" + (f" ({', '.join(cores)})" if cores else ""))
+    lines.append(f"  Memory:  {mem}   macOS: {macos}   Host: {machine.get('hostname', '?')}")
+    afm = machine.get("afm_binary", {})
+    if afm.get("version"):
+        lines.append(f"  AFM:     {afm['version']}")
+    elif afm.get("path"):
+        lines.append(f"  AFM:     {afm['path']} ({afm.get('size_mb', '?')} MB, built {afm.get('mtime', '?')})")
+    return lines
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Main
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -623,12 +748,16 @@ async def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     jsonl_path = output_dir / f"vision-speech-{timestamp}.jsonl"
 
+    machine = collect_machine_info()
+
     print("=" * 60)
     print("  Vision OCR & Speech Transcription Benchmark")
     print("=" * 60)
-    print(f"  Server: {base_url}")
+    for line in format_machine_summary(machine):
+        print(line)
+    print(f"  Server:  {base_url}")
     print(f"  Runs per file: {args.runs} (+ {WARMUP_RUNS} warmup)")
-    print(f"  Output: {jsonl_path}")
+    print(f"  Output:  {jsonl_path}")
     print(f"  Competitors: {'skipped' if args.skip_competitors else 'enabled'}")
     print("=" * 60)
     print()
@@ -790,6 +919,7 @@ async def main():
             "server": base_url,
             "vision_files": len([r for r in results if r["category"] == "vision"]),
             "speech_files": len([r for r in results if r["category"] == "speech"]),
+            "machine": machine,
         }
         f.write(json.dumps(meta) + "\n")
         for r in results:

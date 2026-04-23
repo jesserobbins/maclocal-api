@@ -64,6 +64,7 @@ def generate_html(meta: dict, results: list, output_path: str):
     timestamp = meta.get("timestamp", datetime.now().strftime("%Y%m%d_%H%M%S"))
     server = meta.get("server", "unknown")
     runs = meta.get("runs", "?")
+    machine = meta.get("machine", {}) or {}
 
     # ─── HTML Template ───────────────────────────────────────────────────────
     html_parts = []
@@ -117,6 +118,40 @@ def generate_html(meta: dict, results: list, output_path: str):
 """)
 
     # ─── Header ──────────────────────────────────────────────────────────────
+    machine_bits = []
+    if machine.get("chip"):
+        core_bits = []
+        if machine.get("p_cores") and machine.get("e_cores"):
+            core_bits.append(f"{machine['p_cores']}P+{machine['e_cores']}E")
+        elif machine.get("cpu_cores"):
+            core_bits.append(f"{machine['cpu_cores']} cores")
+        if machine.get("gpu_cores"):
+            core_bits.append(f"{machine['gpu_cores']}-core GPU")
+        label = html_module.escape(machine["chip"])
+        if core_bits:
+            label += f" ({html_module.escape(', '.join(core_bits))})"
+        machine_bits.append(label)
+    if machine.get("memory_gb"):
+        machine_bits.append(f"{machine['memory_gb']:g} GB RAM")
+    if machine.get("macos"):
+        macos_label = f"macOS {machine['macos']}"
+        if machine.get("macos_build"):
+            macos_label += f" ({html_module.escape(machine['macos_build'])})"
+        machine_bits.append(macos_label)
+    if machine.get("hostname"):
+        machine_bits.append(html_module.escape(machine["hostname"]))
+    machine_line = " · ".join(machine_bits)
+
+    afm = machine.get("afm_binary", {}) or {}
+    afm_bits = []
+    if afm.get("version"):
+        afm_bits.append(html_module.escape(afm["version"]))
+    if afm.get("path"):
+        afm_bits.append(f"<code>{html_module.escape(afm['path'])}</code>")
+    if afm.get("mtime"):
+        afm_bits.append(f"built {html_module.escape(afm['mtime'])}")
+    afm_line = " · ".join(afm_bits)
+
     html_parts.append(f"""
 <div class="header">
   <h1>Vision/Speech Benchmark Report</h1>
@@ -125,6 +160,8 @@ def generate_html(meta: dict, results: list, output_path: str):
     Runs: {runs} per file |
     Date: {timestamp}
   </div>
+  {f'<div class="meta">{machine_line}</div>' if machine_line else ''}
+  {f'<div class="meta">AFM: {afm_line}</div>' if afm_line else ''}
 </div>
 """)
 
