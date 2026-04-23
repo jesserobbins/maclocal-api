@@ -231,7 +231,11 @@ if should_run_section U && min_tier unit; then
   #   􁁛  Test "test name here" passed after 0.002 seconds.
   #   􁁕  Test "test name here" failed after 0.003 seconds.
   #   􁁛  Suite XMLToolCallParsingTests passed after 0.006 seconds.
-  UT_PARSED_FILE=$(mktemp /tmp/afm-ut-parsed-XXXXXX.tsv)
+  # Clear any stale literal-template file left by a previous run that
+  # redirected to the unexpanded template (`> /tmp/afm-ut-parsed-XXXXXX.tsv`),
+  # which then blocks BSD mktemp on the next invocation.
+  rm -f "/tmp/afm-ut-parsed-XXXXXX.tsv"
+  UT_PARSED_FILE=$(mktemp -t afm-ut-parsed-XXXXXX)
   echo "$swift_test_output" | python3 -c "
 import sys, re
 
