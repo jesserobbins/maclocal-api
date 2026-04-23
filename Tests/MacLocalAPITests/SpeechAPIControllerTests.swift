@@ -66,19 +66,35 @@ final class SpeechAPIControllerTests: XCTestCase {
     }
 
     func testTranscribeMapsSpeechServiceErrorsToExpectedStatuses() async throws {
-        // recognitionFailed → 422
-        let service422 = FakeSpeechService()
-        service422.transcribeError = SpeechError.recognitionFailed("boom")
-        try SpeechAPIController(makeSpeechService: { service422 }).boot(routes: app)
+        let cases: [(error: SpeechError, expected: HTTPResponseStatus)] = [
+            (.fileNotFound, .notFound),
+            (.unsupportedFormat, .badRequest),
+            (.requestTooLarge(actualBytes: 100, maxBytes: 50), .payloadTooLarge),
+            (.authorizationDenied, .forbidden),
+            (.onDeviceNotAvailable, .serviceUnavailable),
+            (.platformUnavailable, .serviceUnavailable),
+            (.noSpeechFound, .unprocessableEntity),
+            (.recognitionFailed("boom"), .unprocessableEntity)
+        ]
 
-        let payload = Data("fake wav".utf8).base64EncodedString()
-        let body = ByteBuffer(string: #"{"data":"\#(payload)","format":"wav"}"#)
-        var headers = HTTPHeaders()
-        headers.contentType = .json
+        for (err, expected) in cases {
+            // Fresh app per case so each test gets its own route tree.
+            let perCaseApp = try await Application.make(.testing)
 
-        try await app.testable(method: .running(port: 0)).test(.POST, "/v1/audio/transcriptions", headers: headers, body: body) { res async in
-            XCTAssertEqual(res.status, .unprocessableEntity)
-            XCTAssertContains(res.body.string, "Speech recognition failed")
+            let service = FakeSpeechService()
+            service.transcribeError = err
+            try SpeechAPIController(makeSpeechService: { service }).boot(routes: perCaseApp)
+
+            let payload = Data("fake wav".utf8).base64EncodedString()
+            let body = ByteBuffer(string: #"{"data":"\#(payload)","format":"wav"}"#)
+            var headers = HTTPHeaders()
+            headers.contentType = .json
+
+            try await perCaseApp.testable(method: .running(port: 0)).test(.POST, "/v1/audio/transcriptions", headers: headers, body: body) { res async in
+                XCTAssertEqual(res.status, expected, "\(err) should map to \(expected), got \(res.status)")
+            }
+
+            try await perCaseApp.asyncShutdown()
         }
     }
 
