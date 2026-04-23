@@ -260,11 +260,37 @@ final class VisionService {
         guard let observations = request.results else { return [] }
         return observations.map { obs in
             BarcodeResult(
-                type: obs.symbology.rawValue.replacingOccurrences(of: "VNBarcodeSymbology", with: ""),
+                type: Self.friendlyBarcodeSymbology(obs.symbology),
                 payload: obs.payloadStringValue ?? "",
                 boundingBox: obs.boundingBox,
                 confidence: obs.confidence
             )
+        }
+    }
+
+    /// On macOS 13+ `VNBarcodeSymbology.rawValue` is a reverse-DNS string
+    /// (e.g. `"org.iso.QRCode"`), so the previous `replacingOccurrences(of:
+    /// "VNBarcodeSymbology", ...)` strip was a no-op and clients saw the full
+    /// identifier instead of a friendly name.  Map the common symbologies to
+    /// short labels and fall back to the raw value for anything unknown.
+    private static func friendlyBarcodeSymbology(_ symbology: VNBarcodeSymbology) -> String {
+        switch symbology {
+        case .qr: return "QR"
+        case .aztec: return "Aztec"
+        case .codabar: return "Codabar"
+        case .code39: return "Code39"
+        case .code93: return "Code93"
+        case .code128: return "Code128"
+        case .dataMatrix: return "DataMatrix"
+        case .ean8: return "EAN8"
+        case .ean13: return "EAN13"
+        case .i2of5: return "I2of5"
+        case .itf14: return "ITF14"
+        case .microPDF417: return "MicroPDF417"
+        case .microQR: return "MicroQR"
+        case .pdf417: return "PDF417"
+        case .upce: return "UPCE"
+        default: return symbology.rawValue
         }
     }
 

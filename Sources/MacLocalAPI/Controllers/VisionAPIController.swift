@@ -278,6 +278,7 @@ struct VisionAPIController: RouteCollection {
         "application/pdf": "pdf"
     ]
     private static let builtInToolName = "apple_vision_ocr"
+    static let validSaliencyTypes: Set<String> = ["attention", "objectness"]
 
     private let makeVisionService: () -> (any VisionServing)?
 
@@ -462,7 +463,22 @@ struct VisionAPIController: RouteCollection {
 
             case "saliency":
                 let saliencyType = parsed.request.saliencyType ?? "attention"
+                guard Self.validSaliencyTypes.contains(saliencyType) else {
+                    return try await createErrorResponse(
+                        message: "Unknown saliency_type '\(saliencyType)'. Supported: \(Self.validSaliencyTypes.sorted().joined(separator: ", "))",
+                        status: .badRequest
+                    )
+                }
                 let includeHeatMap = parsed.request.includeHeatMap ?? false
+                // A single combined `heat_map` cannot represent multiple inputs: the regions array spans
+                // all inputs but the heat map corresponds to only one.  Reject rather than silently
+                // correlate the wrong image.  Callers that want per-input heat maps should send one request per image.
+                if includeHeatMap && effectiveInputs.count > 1 {
+                    return try await createErrorResponse(
+                        message: "include_heat_map=true is only supported with a single input. Send one request per image or set include_heat_map=false.",
+                        status: .badRequest
+                    )
+                }
                 let allResults = try effectiveInputs.map { input in
                     try visionService.detectSaliency(from: input.path, type: saliencyType, includeHeatMap: includeHeatMap)
                 }
@@ -856,19 +872,28 @@ struct VisionAPIController: RouteCollection {
         var cleanupURLs: [URL] = []
         var imageIndex = 0
 
-        for message in messages {
-            guard let content = message.content, case .parts(let parts) = content else {
-                continue
-            }
+        do {
+            for message in messages {
+                guard let content = message.content, case .parts(let parts) = content else {
+                    continue
+                }
 
-            for part in parts where part.type == "image_url" {
-                guard let imageURL = part.image_url else { continue }
-                let resolved = try resolveImageURL(imageURL)
-                cleanupURLs.append(contentsOf: resolved.cleanupURLs)
-                let ocrText = try await service.extractText(from: resolved.path, options: options)
-                imageIndex += 1
-                ocrTexts.append("[Apple Vision OCR image \(imageIndex)]\n\(ocrText)")
+                for part in parts where part.type == "image_url" {
+                    guard let imageURL = part.image_url else { continue }
+                    let resolved = try resolveImageURL(imageURL)
+                    cleanupURLs.append(contentsOf: resolved.cleanupURLs)
+                    let ocrText = try await service.extractText(from: resolved.path, options: options)
+                    imageIndex += 1
+                    ocrTexts.append("[Apple Vision OCR image \(imageIndex)]\n\(ocrText)")
+                }
             }
+        } catch {
+            // On partial failure the caller never receives `cleanupURLs`, so any temp files
+            // written before the throw would leak.  Clean up here and rethrow.
+            for url in cleanupURLs {
+                try? FileManager.default.removeItem(at: url)
+            }
+            throw error
         }
 
         return (ocrTexts, cleanupURLs)

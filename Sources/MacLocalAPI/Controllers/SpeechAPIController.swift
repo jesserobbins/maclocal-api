@@ -7,7 +7,18 @@ struct SpeechTranscriptionResponse: Content {
     let locale: String
 }
 
+protocol SpeechServing {
+    func transcribe(from filePath: String, options: SpeechRequestOptions) async throws -> String
+}
+
+extension SpeechService: SpeechServing {}
+
 struct SpeechAPIController: RouteCollection {
+    private let makeSpeechService: () -> any SpeechServing
+
+    init(makeSpeechService: @escaping () -> any SpeechServing = { SpeechService() }) {
+        self.makeSpeechService = makeSpeechService
+    }
 
     func boot(routes: RoutesBuilder) throws {
         let v1 = routes.grouped("v1")
@@ -39,7 +50,7 @@ struct SpeechAPIController: RouteCollection {
         let body = try req.content.decode(TranscriptionRequest.self)
         let locale = body.locale ?? "en-US"
         let options = SpeechRequestOptions(locale: locale)
-        let service = SpeechService()
+        let service = makeSpeechService()
         var cleanupURLs: [URL] = []
 
         defer {
@@ -94,21 +105,30 @@ struct SpeechAPIController: RouteCollection {
         var cleanupURLs: [URL] = []
         var audioIndex = 0
 
-        for message in messages {
-            guard let content = message.content, case .parts(let parts) = content else {
-                continue
-            }
+        do {
+            for message in messages {
+                guard let content = message.content, case .parts(let parts) = content else {
+                    continue
+                }
 
-            for part in parts where part.type == "input_audio" {
-                guard let inputAudio = part.input_audio else { continue }
-                let ext = try validatedExtension(inputAudio.format.isEmpty ? "wav" : inputAudio.format)
-                let tempURL = try writeTempAudio(base64: inputAudio.data, ext: ext)
-                cleanupURLs.append(tempURL)
-                let transcription = try await service.transcribe(from: tempURL.path, options: options)
-                audioIndex += 1
-                let labeled = "[Apple Speech transcription \(audioIndex)]\n\(transcription)"
-                transcriptionTexts.append(labeled)
+                for part in parts where part.type == "input_audio" {
+                    guard let inputAudio = part.input_audio else { continue }
+                    let ext = try validatedExtension(inputAudio.format.isEmpty ? "wav" : inputAudio.format)
+                    let tempURL = try writeTempAudio(base64: inputAudio.data, ext: ext)
+                    cleanupURLs.append(tempURL)
+                    let transcription = try await service.transcribe(from: tempURL.path, options: options)
+                    audioIndex += 1
+                    let labeled = "[Apple Speech transcription \(audioIndex)]\n\(transcription)"
+                    transcriptionTexts.append(labeled)
+                }
             }
+        } catch {
+            // On partial failure the caller never receives `cleanupURLs`, so any temp files
+            // written before the throw would leak.  Clean up here and rethrow.
+            for url in cleanupURLs {
+                try? FileManager.default.removeItem(at: url)
+            }
+            throw error
         }
 
         return (transcriptionTexts, cleanupURLs)
