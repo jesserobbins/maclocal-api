@@ -95,12 +95,16 @@ struct SpeechAPIController: RouteCollection {
     /// (the audio-only bypass in `ChatCompletionsController`) streams the
     /// transcriptions directly instead of routing them back through a Foundation
     /// Model prompt, so message reconstruction would be dead code.
-    static func extractTranscriptionFromMessages(_ messages: [Message], options: SpeechRequestOptions) async throws -> (transcriptionTexts: [String], cleanupURLs: [URL]) {
+    static func extractTranscriptionFromMessages(
+        _ messages: [Message],
+        options: SpeechRequestOptions,
+        service injectedService: (any SpeechServing)? = nil
+    ) async throws -> (transcriptionTexts: [String], cleanupURLs: [URL]) {
         guard #available(macOS 13.0, *) else {
             return ([], [])
         }
 
-        let service = SpeechService()
+        let service: any SpeechServing = injectedService ?? SpeechService()
         var transcriptionTexts: [String] = []
         var cleanupURLs: [URL] = []
         var audioIndex = 0

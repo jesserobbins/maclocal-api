@@ -462,7 +462,7 @@ struct VisionAPIController: RouteCollection {
                 ))
 
             case "saliency":
-                let saliencyType = parsed.request.saliencyType ?? "attention"
+                let saliencyType = (parsed.request.saliencyType ?? "attention").lowercased()
                 guard Self.validSaliencyTypes.contains(saliencyType) else {
                     return try await createErrorResponse(
                         message: "Unknown saliency_type '\(saliencyType)'. Supported: \(Self.validSaliencyTypes.sorted().joined(separator: ", "))",
@@ -862,12 +862,16 @@ struct VisionAPIController: RouteCollection {
     /// dead code.  If a future caller needs the OCR text spliced back into the
     /// conversation for downstream LLM input, add a separate helper (e.g.
     /// `injectOCRTextIntoMessages`) that layers on top of this one.
-    static func extractOCRTextFromMessages(_ messages: [Message], options: VisionRequestOptions) async throws -> (ocrTexts: [String], cleanupURLs: [URL]) {
+    static func extractOCRTextFromMessages(
+        _ messages: [Message],
+        options: VisionRequestOptions,
+        service injectedService: (any VisionServing)? = nil
+    ) async throws -> (ocrTexts: [String], cleanupURLs: [URL]) {
         guard #available(macOS 26.0, *) else {
             return ([], [])
         }
 
-        let service = VisionService()
+        let service: any VisionServing = injectedService ?? VisionService()
         var ocrTexts: [String] = []
         var cleanupURLs: [URL] = []
         var imageIndex = 0
