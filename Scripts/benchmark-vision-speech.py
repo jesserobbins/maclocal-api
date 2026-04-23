@@ -1006,11 +1006,13 @@ async def main():
         for r in vision_results:
             cpu = r.get("afm_cpu_time_ms")
             gpu = r.get("afm_gpu_time_ms")
-            if cpu is None:
+            if cpu is None and gpu is None:
                 continue
             wall = r["afm_latency_ms"]
-            ane = max(0, wall - cpu - gpu)
-            print(f"  {r['file']:30s} {wall:>7.0f}ms {cpu:>7.0f}ms {gpu:>7.1f}ms {ane:>7.0f}ms")
+            cpu_val = cpu if cpu is not None else 0.0
+            gpu_val = gpu if gpu is not None else 0.0
+            ane = max(0, wall - cpu_val - gpu_val)
+            print(f"  {r['file']:30s} {wall:>7.0f}ms {cpu_val:>7.0f}ms {gpu_val:>7.1f}ms {ane:>7.0f}ms")
         if afm_mem:
             print(f"\n  Memory: {afm_mem:.0f} MB")
         print(f"  * ANE = Wall - CPU - GPU (inferred accelerator time)")
