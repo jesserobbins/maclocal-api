@@ -369,23 +369,23 @@ async def benchmark_speech(session: aiohttp.ClientSession, base_url: str,
     results = []
     total_runs = runs + WARMUP_RUNS
 
+    # The controller accepts JSON { "file": absolute-path } or { "data": base64 }.
+    # Multipart form uploads end up with the filename (not a resolvable path) in
+    # the decoded model, producing spurious 404s. Send JSON with an absolute path.
+    payload = {"file": str(file_path.resolve())}
+
     for i in range(total_runs):
         t0 = time.perf_counter()
         try:
-            form = aiohttp.FormData()
-            with open(file_path, "rb") as f:
-                form.add_field("file", f,
-                              filename=file_path.name,
-                              content_type="audio/wav")
-                async with session.post(
-                    f"{base_url}/v1/audio/transcriptions",
-                    data=form,
-                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
-                ) as resp:
-                    if resp.status == 404:
-                        return {"category": "speech", "file": file_path.name,
-                                "error": "Speech API not available (404)", "pass": None}
-                    data = await resp.json()
+            async with session.post(
+                f"{base_url}/v1/audio/transcriptions",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+            ) as resp:
+                if resp.status == 404:
+                    return {"category": "speech", "file": file_path.name,
+                            "error": "Speech API not available (404)", "pass": None}
+                data = await resp.json()
         except Exception as e:
             data = {"error": str(e), "text": ""}
         elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -847,25 +847,32 @@ async def main():
         if not args.vision_only:
             print("--- Speech Transcription ---")
 
-            # Check if speech API is available
+            # Check if speech API is available. Send a well-formed JSON probe
+            # using the first available fixture. Any non-404 response (200, 400
+            # validation, 422 semantic error) means the route is registered.
             speech_available = False
+            probe_files = sorted(SPEECH_DIR.glob("*.wav"))
+            probe_payload = ({"file": str(probe_files[0].resolve())}
+                             if probe_files else {"file": "__probe__"})
             try:
                 async with session.post(
                     f"{base_url}/v1/audio/transcriptions",
-                    data=aiohttp.FormData(),
+                    json=probe_payload,
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as resp:
-                    if resp.status == 200:
-                        speech_available = True
-                    elif resp.status == 404:
+                    if resp.status == 404:
                         print("  Speech API not available (404) — skipping")
-                        print("  (PR #107 not yet merged)")
+                        print()
+                    elif resp.status in (405, 501):
+                        print(f"  Speech API returned HTTP {resp.status} — skipping")
                         print()
                     else:
-                        print(f"  Speech API probe returned HTTP {resp.status} — skipping")
-                        print()
-            except Exception:
-                print("  Speech API not available — skipping")
+                        speech_available = True
+                        if resp.status != 200:
+                            print(f"  Speech API probe: HTTP {resp.status} "
+                                  f"(endpoint registered, proceeding)")
+            except Exception as e:
+                print(f"  Speech API probe failed: {e} — skipping")
                 print()
 
             if speech_available:

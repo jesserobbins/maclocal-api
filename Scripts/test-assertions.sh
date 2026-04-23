@@ -4270,14 +4270,16 @@ except:
       # 17.4: Error - missing file
       if min_tier smoke; then
         t0=$(now_ms)
-        HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 10 "$BASE_URL/v1/vision/ocr" \
+        # Drop -f: we want the HTTP code from -w, not a curl failure concatenated
+        # with the || echo fallback (which produced "404000" strings).
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$BASE_URL/v1/vision/ocr" \
           -H "Content-Type: application/json" \
-          -d '{"file": "/nonexistent/path/to/file.png"}' 2>/dev/null || echo "000")
+          -d '{"file": "/nonexistent/path/to/file.png"}' 2>/dev/null || true)
         dur=$(($(now_ms) - t0))
         if [[ "$HTTP_CODE" =~ ^4[0-9][0-9]$ ]]; then
           run_test "Vision" "OCR error: missing file returns 4xx" "4xx" "PASS" "$dur"
         else
-          run_test "Vision" "OCR error: missing file returns 4xx" "4xx" "$HTTP_CODE" "$dur"
+          run_test "Vision" "OCR error: missing file returns 4xx" "4xx" "${HTTP_CODE:-000}" "$dur"
         fi
       fi
 
@@ -4286,15 +4288,15 @@ except:
         t0=$(now_ms)
         # Create a dummy .mp3 file for the test
         echo "not an image" > /tmp/test-vision-unsupported.$$.mp3
-        HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 10 "$BASE_URL/v1/vision/ocr" \
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$BASE_URL/v1/vision/ocr" \
           -H "Content-Type: application/json" \
-          -d "{\"file\": \"/tmp/test-vision-unsupported.$$.mp3\"}" 2>/dev/null || echo "000")
+          -d "{\"file\": \"/tmp/test-vision-unsupported.$$.mp3\"}" 2>/dev/null || true)
         dur=$(($(now_ms) - t0))
         rm -f /tmp/test-vision-unsupported.$$.mp3
         if [[ "$HTTP_CODE" =~ ^4[0-9][0-9]$ ]]; then
           run_test "Vision" "OCR error: unsupported format returns 4xx" "4xx" "PASS" "$dur"
         else
-          run_test "Vision" "OCR error: unsupported format returns 4xx" "4xx" "$HTTP_CODE" "$dur"
+          run_test "Vision" "OCR error: unsupported format returns 4xx" "4xx" "${HTTP_CODE:-000}" "$dur"
         fi
       fi
 
@@ -4311,8 +4313,14 @@ import sys, json
 try:
     d = json.load(sys.stdin)
     docs = d.get('documents', [{}])
-    blocks = docs[0].get('textBlocks', []) if docs else []
-    has_bbox = any('boundingBox' in b for b in blocks) if blocks else False
+    doc0 = docs[0] if docs else {}
+    # API returns snake_case (text_blocks, bounding_box). Blocks may live on
+    # the document or under pages[*] — accept either.
+    blocks = doc0.get('text_blocks') or []
+    if not blocks:
+        for p in doc0.get('pages', []) or []:
+            blocks.extend(p.get('text_blocks') or [])
+    has_bbox = any('bounding_box' in b for b in blocks) if blocks else False
     print('yes' if blocks and has_bbox else 'no')
 except:
     print('no')
@@ -4570,26 +4578,35 @@ if should_run_section 18; then
   if [[ ! -f "$SPEECH_TEST_FILE" ]]; then
     run_test "Speech" "Speech test corpus missing (run generate-test-corpus.sh)" "corpus present" "SKIP"
   else
-    SPEECH_CHECK=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 10 \
+    # The controller accepts JSON with an absolute `file` path or base64 `data`.
+    # Multipart file uploads go through Vapor's form decoder and end up with
+    # the filename (not a server-visible path) in the `file` field, so the
+    # server returns 404. Use JSON against an already-absolute path to the
+    # bundled fixture.
+    SPEECH_JSON_PROBE="{\"file\": \"$SPEECH_TEST_FILE\"}"
+    SPEECH_CHECK=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
       "$BASE_URL/v1/audio/transcriptions" \
-      -F "file=@$SPEECH_TEST_FILE" 2>/dev/null || echo "000")
+      -H "Content-Type: application/json" \
+      -d "$SPEECH_JSON_PROBE" 2>/dev/null || true)
 
+    # 000 = connection error; 404/405 = endpoint not registered → skip.
     if [[ "$SPEECH_CHECK" == "000" || "$SPEECH_CHECK" == "404" || "$SPEECH_CHECK" == "405" ]]; then
-      run_test "Speech" "Speech API available (PR #107 not merged)" "200" "SKIP"
-      echo "  ⏭️  Speech API not available — skipping Section 18"
+      run_test "Speech" "Speech API available" "200" "SKIP"
+      echo "  ⏭️  Speech API not available (HTTP ${SPEECH_CHECK:-000}) — skipping Section 18"
     else
       # 18.1: Speech API responds
       if [[ "$SPEECH_CHECK" == "200" ]]; then
         run_test "Speech" "Speech API endpoint responds" "200" "PASS"
       else
-        run_test "Speech" "Speech API endpoint responds" "200" "$SPEECH_CHECK"
+        run_test "Speech" "Speech API endpoint responds" "200" "${SPEECH_CHECK:-000}"
       fi
 
       # 18.2: Speech file input returns text
       if min_tier smoke; then
         t0=$(now_ms)
-        RESP=$(curl -sf --max-time 60 "$BASE_URL/v1/audio/transcriptions" \
-          -F "file=@$SPEECH_TEST_FILE" 2>/dev/null || echo '{}')
+        RESP=$(curl -s --max-time 60 "$BASE_URL/v1/audio/transcriptions" \
+          -H "Content-Type: application/json" \
+          -d "$SPEECH_JSON_PROBE" 2>/dev/null || echo '{}')
         dur=$(($(now_ms) - t0))
         HAS_TEXT=$(echo "$RESP" | python3 -c "
 import sys, json
@@ -4609,8 +4626,9 @@ except:
       # 18.3: Response schema
       if min_tier smoke; then
         t0=$(now_ms)
-        RESP=$(curl -sf --max-time 60 "$BASE_URL/v1/audio/transcriptions" \
-          -F "file=@$SPEECH_TEST_FILE" 2>/dev/null || echo '{}')
+        RESP=$(curl -s --max-time 60 "$BASE_URL/v1/audio/transcriptions" \
+          -H "Content-Type: application/json" \
+          -d "$SPEECH_JSON_PROBE" 2>/dev/null || echo '{}')
         dur=$(($(now_ms) - t0))
         SCHEMA_OK=$(echo "$RESP" | python3 -c "
 import sys, json
@@ -4630,16 +4648,15 @@ except:
       # 18.4: Error - missing file
       if min_tier smoke; then
         t0=$(now_ms)
-        HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 10 \
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
           "$BASE_URL/v1/audio/transcriptions" \
-          -F "file=@/nonexistent/audio/file.wav" 2>/dev/null || echo "000")
+          -H "Content-Type: application/json" \
+          -d '{"file": "/nonexistent/audio/file.wav"}' 2>/dev/null || true)
         dur=$(($(now_ms) - t0))
-        # curl will fail to attach a nonexistent file, so we expect either 4xx from server
-        # or 000 (curl error). Both are acceptable indicators.
-        if [[ "$HTTP_CODE" =~ ^4[0-9][0-9]$ || "$HTTP_CODE" == "000" ]]; then
-          run_test "Speech" "Speech error: missing file" "4xx/curl_error" "PASS" "$dur"
+        if [[ "$HTTP_CODE" =~ ^4[0-9][0-9]$ ]]; then
+          run_test "Speech" "Speech error: missing file returns 4xx" "4xx" "PASS" "$dur"
         else
-          run_test "Speech" "Speech error: missing file" "4xx" "$HTTP_CODE" "$dur"
+          run_test "Speech" "Speech error: missing file returns 4xx" "4xx" "${HTTP_CODE:-000}" "$dur"
         fi
       fi
 
@@ -4647,15 +4664,16 @@ except:
       if min_tier smoke; then
         t0=$(now_ms)
         echo "This is plain text, not audio." > /tmp/test-speech-unsupported.$$.txt
-        HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 10 \
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
           "$BASE_URL/v1/audio/transcriptions" \
-          -F "file=@/tmp/test-speech-unsupported.$$.txt" 2>/dev/null || echo "000")
+          -H "Content-Type: application/json" \
+          -d "{\"file\": \"/tmp/test-speech-unsupported.$$.txt\"}" 2>/dev/null || true)
         dur=$(($(now_ms) - t0))
         rm -f /tmp/test-speech-unsupported.$$.txt
         if [[ "$HTTP_CODE" =~ ^4[0-9][0-9]$ ]]; then
           run_test "Speech" "Speech error: unsupported format returns 4xx" "4xx" "PASS" "$dur"
         else
-          run_test "Speech" "Speech error: unsupported format returns 4xx" "4xx" "$HTTP_CODE" "$dur"
+          run_test "Speech" "Speech error: unsupported format returns 4xx" "4xx" "${HTTP_CODE:-000}" "$dur"
         fi
       fi
 
@@ -4663,8 +4681,9 @@ except:
       CURRENT_TIER="standard"
       if min_tier standard; then
         t0=$(now_ms)
-        RESP=$(curl -sf --max-time 60 "$BASE_URL/v1/audio/transcriptions" \
-          -F "file=@$SPEECH_TEST_FILE" 2>/dev/null || echo '{}')
+        RESP=$(curl -s --max-time 60 "$BASE_URL/v1/audio/transcriptions" \
+          -H "Content-Type: application/json" \
+          -d "$SPEECH_JSON_PROBE" 2>/dev/null || echo '{}')
         dur=$(($(now_ms) - t0))
         KNOWN_ANS=$(echo "$RESP" | python3 -c "
 import sys, json
@@ -4690,8 +4709,9 @@ except:
       CURRENT_TIER="full"
       if min_tier full; then
         t0=$(now_ms)
-        curl -sf --max-time 60 "$BASE_URL/v1/audio/transcriptions" \
-          -F "file=@$SPEECH_TEST_FILE" >/dev/null 2>&1
+        curl -s --max-time 60 "$BASE_URL/v1/audio/transcriptions" \
+          -H "Content-Type: application/json" \
+          -d "$SPEECH_JSON_PROBE" >/dev/null 2>&1
         dur=$(($(now_ms) - t0))
         # short-5s.wav is ~5s audio, should transcribe in < 5s (realtime factor < 1.0)
         AUDIO_DURATION_MS=5000
