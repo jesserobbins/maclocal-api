@@ -46,20 +46,36 @@ struct SpeechRequestOptions: Sendable {
     /// headless/SSH session can return an immediate error instead of hanging
     /// until the recognition timeout waiting for a dialog no-one will dismiss.
     let promptForAuthorization: Bool
+    /// Per-request vocabulary hint (OpenAI `prompt` field). Merged with
+    /// bundled/env/project contextual vocab via `ContextualVocabResolver`
+    /// when one is attached to the `SpeechService`.
+    let prompt: String?
 
     init(
         locale: String = "en-US",
         maxFileBytes: Int = SpeechRequestOptions.defaultMaxFileBytes,
-        promptForAuthorization: Bool = false
+        promptForAuthorization: Bool = false,
+        prompt: String? = nil
     ) {
         self.locale = locale
         self.maxFileBytes = maxFileBytes
         self.promptForAuthorization = promptForAuthorization
+        self.prompt = prompt
     }
 }
 
 @available(macOS 13.0, *)
 final class SpeechService {
+
+    /// When attached, bundled/env/project contextual vocab is merged into
+    /// every `SFSpeechURLRecognitionRequest.contextualStrings`. `nil`
+    /// preserves the pre-tuning behavior for callers that construct
+    /// `SpeechService()` without the resolver.
+    private let contextualVocabResolver: ContextualVocabResolver?
+
+    init(contextualVocabResolver: ContextualVocabResolver? = nil) {
+        self.contextualVocabResolver = contextualVocabResolver
+    }
 
     func transcribe(from filePath: String) async throws -> String {
         try await transcribe(from: filePath, options: SpeechRequestOptions())
@@ -115,6 +131,15 @@ final class SpeechService {
         let request = SFSpeechURLRecognitionRequest(url: fileURL)
         request.requiresOnDeviceRecognition = true
         request.shouldReportPartialResults = false
+        // Merge per-request prompt with bundled/env/project vocab when a
+        // resolver is attached. contextualStrings bias Apple's recognizer
+        // toward the listed phrases without changing any wire contract.
+        if let resolver = contextualVocabResolver {
+            let merged = resolver.resolve(prompt: options.prompt, locale: options.locale)
+            if !merged.isEmpty {
+                request.contextualStrings = merged
+            }
+        }
 
         // Run recognition with a timeout to prevent hung requests.
         // OSAllocatedUnfairLock guards the one-shot continuation resume.

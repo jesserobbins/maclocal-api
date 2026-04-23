@@ -16,7 +16,19 @@ extension SpeechService: SpeechServing {}
 struct SpeechAPIController: RouteCollection {
     private let makeSpeechService: () -> any SpeechServing
 
-    init(makeSpeechService: @escaping () -> any SpeechServing = { SpeechService() }) {
+    init(makeSpeechService: @escaping () -> any SpeechServing = {
+        // Attach the bundled ContextualVocabResolver so the legacy
+        // SFSpeechRecognizer path picks up bundled/env/project vocab on every
+        // HTTP transcription request. try? fallback → nil resolver if the
+        // bundled file is missing (misconfigured build); preserves legacy
+        // behavior instead of failing the request per-call.
+        if #available(macOS 13.0, *) {
+            let resolver = try? ContextualVocabResolver()
+            return SpeechService(contextualVocabResolver: resolver)
+        } else {
+            return SpeechService()
+        }
+    }) {
         self.makeSpeechService = makeSpeechService
     }
 
