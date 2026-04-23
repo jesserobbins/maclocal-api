@@ -243,10 +243,12 @@ def render_artifacts(benchmark_path: str | None, assertion_paths: list[str]) -> 
             + '</li>'
         )
     for ap in assertion_paths:
-        hp = ap.replace(".jsonl", ".html")
+        # Strip the optional "LABEL=" prefix before rendering the path.
+        path = ap.split("=", 1)[1] if "=" in ap else ap
+        hp = path.replace(".jsonl", ".html")
         link = (f' · <a href="{html_module.escape(os.path.relpath(hp, os.path.dirname(hp)))}">detailed HTML</a>'
                 if os.path.exists(hp) else '')
-        items.append(f'<li>Assertions: <code>{html_module.escape(ap)}</code>{link}</li>')
+        items.append(f'<li>Assertions: <code>{html_module.escape(path)}</code>{link}</li>')
     if not items:
         return ""
     return f"""
@@ -257,6 +259,32 @@ def render_artifacts(benchmark_path: str | None, assertion_paths: list[str]) -> 
 """
 
 
+def _split_label(spec: str) -> tuple[str, str]:
+    # Accept "LABEL=PATH" or bare "PATH". If no label, derive a human-friendly
+    # one from the dominant group in the file once loaded.
+    if "=" in spec:
+        label, path = spec.split("=", 1)
+        return label.strip() or os.path.basename(path), path
+    return "", spec
+
+
+def _derive_label(rows: list, fallback: str) -> str:
+    groups: dict[str, int] = {}
+    for r in rows:
+        g = r.get("group")
+        if g:
+            groups[g] = groups.get(g, 0) + 1
+    if not groups:
+        return fallback
+    dominant = max(groups.items(), key=lambda kv: kv[1])[0]
+    # If there is exactly one meaningful group (e.g., only "Vision" or
+    # "Speech"), name the phase after it. Otherwise, call it a mixed suite.
+    non_preflight = {g: n for g, n in groups.items() if g not in ("Preflight",)}
+    if len(non_preflight) == 1:
+        return f"{dominant} assertions"
+    return f"MLX assertions ({len(non_preflight)} sections)"
+
+
 def generate(
     output_path: str,
     benchmark_jsonl: str | None,
@@ -264,7 +292,14 @@ def generate(
     title: str = "Vision/Speech Suite Report",
 ) -> str:
     bench_meta, bench_rows = (load_jsonl(benchmark_jsonl) if benchmark_jsonl else ({}, []))
-    assertion_sources = [(os.path.basename(p), load_jsonl(p)[1]) for p in assertion_jsonls]
+
+    assertion_sources: list[tuple[str, list]] = []
+    for spec in assertion_jsonls:
+        label, path = _split_label(spec)
+        _, rows = load_jsonl(path)
+        if not label:
+            label = _derive_label(rows, os.path.basename(path))
+        assertion_sources.append((label, rows))
 
     machine = machine_info_from_benchmark(bench_meta)
     timestamp = bench_meta.get("timestamp") or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -353,7 +388,11 @@ def main() -> int:
     if args.benchmark and not os.path.exists(args.benchmark):
         print(f"benchmark JSONL not found: {args.benchmark}", file=sys.stderr)
         return 2
-    missing = [a for a in args.assertion if not os.path.exists(a)]
+    missing = []
+    for a in args.assertion:
+        _, p = _split_label(a)
+        if not os.path.exists(p):
+            missing.append(p)
     if missing:
         print(f"assertion JSONL(s) not found: {missing}", file=sys.stderr)
         return 2

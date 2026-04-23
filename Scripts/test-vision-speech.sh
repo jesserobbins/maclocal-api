@@ -20,17 +20,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 DEFAULT_PORT=9999
 DEFAULT_VLM_PORT=9998
+DEFAULT_MLX_PORT=9997
 DEFAULT_TIER="standard"
+DEFAULT_MLX_TIER="smoke"
 DEFAULT_RUNS=3
 SERVER_STARTUP_TIMEOUT_SECONDS=60
 VLM_STARTUP_TIMEOUT_SECONDS=120
+MLX_STARTUP_TIMEOUT_SECONDS=180
 AFM_BIN="${AFM_BIN:-$PROJECT_ROOT/.build/release/afm}"
 MODEL_CACHE="${MACAFM_MLX_MODEL_CACHE:-}"
 
 # ─── Arguments ────────────────────────────────────────────────────────────────
 PORT="$DEFAULT_PORT"
 VLM_PORT="$DEFAULT_VLM_PORT"
+MLX_PORT="$DEFAULT_MLX_PORT"
 TIER="$DEFAULT_TIER"
+MLX_TIER="$DEFAULT_MLX_TIER"
 RUNS="$DEFAULT_RUNS"
 SKIP_COMPETITORS=false
 BENCHMARK_ONLY=false
@@ -39,12 +44,15 @@ SKIP_CORPUS_GEN=false
 NO_SERVER=false
 AFM_MODEL=""
 VLM_MODEL=""
+MLX_MODEL=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --port) PORT="$2"; shift 2 ;;
     --vlm-port) VLM_PORT="$2"; shift 2 ;;
+    --mlx-port) MLX_PORT="$2"; shift 2 ;;
     --tier) TIER="$2"; shift 2 ;;
+    --mlx-tier) MLX_TIER="$2"; shift 2 ;;
     --runs) RUNS="$2"; shift 2 ;;
     --skip-competitors) SKIP_COMPETITORS=true; shift ;;
     --benchmark-only) BENCHMARK_ONLY=true; shift ;;
@@ -53,16 +61,20 @@ while [[ $# -gt 0 ]]; do
     --no-server) NO_SERVER=true; shift ;;
     --model) AFM_MODEL="$2"; shift 2 ;;
     --vlm-model) VLM_MODEL="$2"; shift 2 ;;
+    --mlx-model) MLX_MODEL="$2"; shift 2 ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS]"
       echo ""
       echo "Options:"
       echo "  --port PORT          AFM server port (default: $DEFAULT_PORT)"
       echo "  --model MODEL        MLX model for AFM server (default: Apple Foundation Models mode)"
-      echo "  --vlm-model MODEL    MLX VLM model for comparison (starts on --vlm-port)"
+      echo "  --vlm-model MODEL    MLX VLM model for benchmark comparison (starts on --vlm-port)"
       echo "  --vlm-port PORT      VLM server port (default: $DEFAULT_VLM_PORT)"
+      echo "  --mlx-model MODEL    MLX model to run Sections 0-16 against (starts on --mlx-port)"
+      echo "  --mlx-port PORT      MLX server port (default: $DEFAULT_MLX_PORT)"
+      echo "  --mlx-tier TIER      Tier for MLX suite: smoke|standard|full (default: $DEFAULT_MLX_TIER)"
       echo "  --runs N             Benchmark runs per file (default: $DEFAULT_RUNS)"
-      echo "  --tier TIER          Assertion tier: smoke|standard|full (default: $DEFAULT_TIER)"
+      echo "  --tier TIER          Vision/Speech assertion tier (default: $DEFAULT_TIER)"
       echo "  --skip-competitors   Skip Tesseract/Whisper comparison"
       echo "  --benchmark-only     Skip assertion tests"
       echo "  --assertions-only    Skip benchmarks"
@@ -72,6 +84,7 @@ while [[ $# -gt 0 ]]; do
       echo "Examples:"
       echo "  $0                                           # Basic run"
       echo "  $0 --vlm-model dealignai/Qwen3.5-VL-9B-4bit-MLX-CRACK  # With VLM comparison"
+      echo "  $0 --mlx-model mlx-community/gemma-3-4b-it-4bit        # Add MLX suite"
       echo "  $0 --no-server --port 9999                   # Server already running"
       exit 0
       ;;
@@ -89,6 +102,7 @@ fail()  { echo "  [FAIL]  $*"; }
 
 AFM_SERVER_PID=0
 VLM_SERVER_PID=0
+MLX_SERVER_PID=0
 
 kill_server() {
   local pid=$1
@@ -113,6 +127,10 @@ cleanup() {
   if [[ "$VLM_SERVER_PID" -gt 0 ]]; then
     info "Stopping VLM server (PID $VLM_SERVER_PID) ..."
     kill_server $VLM_SERVER_PID
+  fi
+  if [[ "$MLX_SERVER_PID" -gt 0 ]]; then
+    info "Stopping MLX server (PID $MLX_SERVER_PID) ..."
+    kill_server $MLX_SERVER_PID
   fi
 }
 trap cleanup EXIT INT TERM
@@ -142,6 +160,9 @@ echo "  Port: $PORT | Tier: $TIER | Runs: $RUNS"
 echo "  Competitors: $(if $SKIP_COMPETITORS; then echo 'skipped'; else echo 'enabled'; fi)"
 if [[ -n "$VLM_MODEL" ]]; then
   echo "  VLM: $VLM_MODEL (port $VLM_PORT)"
+fi
+if [[ -n "$MLX_MODEL" ]]; then
+  echo "  MLX: $MLX_MODEL (port $MLX_PORT, tier $MLX_TIER)"
 fi
 echo ""
 
@@ -286,6 +307,62 @@ if [[ -n "$VLM_MODEL" ]]; then
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Server Lifecycle — MLX (optional, for Sections 0–16)
+# ═══════════════════════════════════════════════════════════════════════════════
+MLX_URL=""
+if [[ -n "$MLX_MODEL" ]]; then
+  MLX_URL="http://127.0.0.1:$MLX_PORT"
+
+  if curl -sf --max-time 2 "$MLX_URL/health" >/dev/null 2>&1; then
+    info "MLX server already running at $MLX_URL — using it"
+  else
+    info "Starting MLX server: $MLX_MODEL on port $MLX_PORT ..."
+
+    stale_pid=$(lsof -ti :"$MLX_PORT" 2>/dev/null || true)
+    if [[ -n "$stale_pid" ]]; then
+      stale_cmd=$(ps -o comm= -p "$stale_pid" 2>/dev/null || true)
+      if [[ "$stale_cmd" == *afm* ]]; then
+        warn "Stopping stale afm on port $MLX_PORT (PID $stale_pid)"
+        kill "$stale_pid" 2>/dev/null || true
+        sleep 2
+        kill -0 "$stale_pid" 2>/dev/null && kill -KILL "$stale_pid" 2>/dev/null || true
+        sleep 1
+      else
+        fail "Port $MLX_PORT in use by '$stale_cmd' (PID $stale_pid) — refusing to kill"
+        warn "Continuing without MLX suite"
+        MLX_URL=""
+        MLX_MODEL=""
+      fi
+    fi
+
+    if [[ -n "$MLX_MODEL" ]]; then
+      MLX_SERVER_LOG="/tmp/afm-mlx-server-$$.log"
+      if [[ -n "$MODEL_CACHE" ]]; then
+        MACAFM_MLX_MODEL_CACHE="$MODEL_CACHE" \
+          "$AFM_BIN" mlx -m "$MLX_MODEL" --port "$MLX_PORT" > "$MLX_SERVER_LOG" 2>&1 &
+      else
+        "$AFM_BIN" mlx -m "$MLX_MODEL" --port "$MLX_PORT" > "$MLX_SERVER_LOG" 2>&1 &
+      fi
+      MLX_SERVER_PID=$!
+
+      info "Waiting for MLX server (PID $MLX_SERVER_PID) — model loading may take a while ..."
+      if wait_for_server "$MLX_URL" "$MLX_STARTUP_TIMEOUT_SECONDS" "MLX"; then
+        ok "MLX server ready"
+      else
+        fail "MLX server failed to start within ${MLX_STARTUP_TIMEOUT_SECONDS}s"
+        echo "  Log: $MLX_SERVER_LOG"
+        tail -5 "$MLX_SERVER_LOG" 2>/dev/null || true
+        warn "Continuing without MLX suite"
+        MLX_URL=""
+        MLX_MODEL=""
+        kill_server $MLX_SERVER_PID
+        MLX_SERVER_PID=0
+      fi
+    fi
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Step 1: Ensure test corpus exists
 # ═══════════════════════════════════════════════════════════════════════════════
 if [[ "$SKIP_CORPUS_GEN" != "true" ]]; then
@@ -322,7 +399,7 @@ if [[ "$BENCHMARK_ONLY" != "true" ]]; then
     warn "Section 17 had failures"
   fi
   vision_jsonl=$(newest_assertion_jsonl)
-  [[ -n "$vision_jsonl" ]] && ASSERTION_JSONLS+=("$vision_jsonl")
+  [[ -n "$vision_jsonl" ]] && ASSERTION_JSONLS+=("Vision (§17)=$vision_jsonl")
 
   echo ""
 
@@ -336,7 +413,28 @@ if [[ "$BENCHMARK_ONLY" != "true" ]]; then
   fi
   speech_jsonl=$(newest_assertion_jsonl)
   if [[ -n "$speech_jsonl" && "$speech_jsonl" != "$vision_jsonl" ]]; then
-    ASSERTION_JSONLS+=("$speech_jsonl")
+    ASSERTION_JSONLS+=("Speech (§18)=$speech_jsonl")
+  fi
+  prev_jsonl="$speech_jsonl"
+
+  # ─── MLX Sections (0–16) against MLX-backed server ──────────────────────────
+  if [[ -n "$MLX_URL" ]]; then
+    echo ""
+    info "Running MLX assertion suite (tier $MLX_TIER) against $MLX_URL ..."
+    # No --section filter → test-assertions.sh runs every section that matches
+    # the tier, excluding Sections 17/18 (handled above by Vision/Speech).
+    if "$SCRIPT_DIR/test-assertions.sh" --tier "$MLX_TIER" --port "$MLX_PORT" --model "$MLX_MODEL" --skip-section 17 --skip-section 18; then
+      ok "MLX suite complete"
+    else
+      ASSERTION_EXIT=1
+      warn "MLX suite had failures"
+    fi
+    mlx_jsonl=$(newest_assertion_jsonl)
+    if [[ -n "$mlx_jsonl" && "$mlx_jsonl" != "$prev_jsonl" ]]; then
+      # Keep the model short in the label (org/name → name).
+      mlx_label="MLX ($(basename "$MLX_MODEL"), $MLX_TIER)"
+      ASSERTION_JSONLS+=("${mlx_label}=$mlx_jsonl")
+    fi
   fi
 fi
 

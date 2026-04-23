@@ -26,6 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 REPORT_DIR="$PROJECT_ROOT/test-reports"
 
+declare -a SKIP_SECTIONS=()
 while [[ $# -gt 0 ]]; do
   case $1 in
     --tier) TIER="$2"; shift 2 ;;
@@ -33,6 +34,7 @@ while [[ $# -gt 0 ]]; do
     --model) MODEL="$2"; shift 2 ;;
     --bin) BIN="$2"; shift 2 ;;
     --section) SECTION="$2"; shift 2 ;;
+    --skip-section) SKIP_SECTIONS+=("$2"); shift 2 ;;
     --grammar-constraints) GRAMMAR_CONSTRAINTS=true; shift ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
@@ -175,6 +177,12 @@ min_tier() {
 # When --section is empty, all sections run. Otherwise only the matching one.
 should_run_section() {
   local num="$1"
+  # Explicit skip list wins (used by combined suites to exclude subsections
+  # already covered by a different server / phase).
+  local skip
+  for skip in "${SKIP_SECTIONS[@]}"; do
+    [[ "$skip" == "$num" ]] && return 1
+  done
   [[ -z "$SECTION" || "$SECTION" == "$num" ]]
 }
 
