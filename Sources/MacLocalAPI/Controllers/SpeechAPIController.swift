@@ -76,24 +76,29 @@ struct SpeechAPIController: RouteCollection {
 
     // MARK: - Chat completions integration
 
-    static func extractTranscriptionFromMessages(_ messages: [Message], options: SpeechRequestOptions) async throws -> (messages: [Message], transcriptionTexts: [String], cleanupURLs: [URL]) {
+    /// Run Apple Speech transcription on every `input_audio` part in the request messages
+    /// and return the transcribed text in order, along with any temp files that
+    /// need to be cleaned up by the caller.
+    ///
+    /// Mirrors `VisionAPIController.extractOCRTextFromMessages`: the sole caller
+    /// (the audio-only bypass in `ChatCompletionsController`) streams the
+    /// transcriptions directly instead of routing them back through a Foundation
+    /// Model prompt, so message reconstruction would be dead code.
+    static func extractTranscriptionFromMessages(_ messages: [Message], options: SpeechRequestOptions) async throws -> (transcriptionTexts: [String], cleanupURLs: [URL]) {
         guard #available(macOS 13.0, *) else {
-            return (messages, [], [])
+            return ([], [])
         }
 
         let service = SpeechService()
-        var updatedMessages: [Message] = []
         var transcriptionTexts: [String] = []
         var cleanupURLs: [URL] = []
         var audioIndex = 0
 
         for message in messages {
             guard let content = message.content, case .parts(let parts) = content else {
-                updatedMessages.append(message)
                 continue
             }
 
-            var textChunks = parts.compactMap(\.text)
             for part in parts where part.type == "input_audio" {
                 guard let inputAudio = part.input_audio else { continue }
                 let ext = try validatedExtension(inputAudio.format.isEmpty ? "wav" : inputAudio.format)
@@ -102,14 +107,11 @@ struct SpeechAPIController: RouteCollection {
                 let transcription = try await service.transcribe(from: tempURL.path, options: options)
                 audioIndex += 1
                 let labeled = "[Apple Speech transcription \(audioIndex)]\n\(transcription)"
-                textChunks.append(labeled)
                 transcriptionTexts.append(labeled)
             }
-
-            updatedMessages.append(Message(role: message.role, content: textChunks.joined(separator: "\n\n")))
         }
 
-        return (updatedMessages, transcriptionTexts, cleanupURLs)
+        return (transcriptionTexts, cleanupURLs)
     }
 
     // MARK: - Helpers

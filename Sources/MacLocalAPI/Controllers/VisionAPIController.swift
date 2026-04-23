@@ -339,6 +339,11 @@ struct VisionAPIController: RouteCollection {
         if parsed.request.autoCrop ?? false {
             effectiveInputs = try effectiveInputs.map { input in
                 let fileURL = URL(fileURLWithPath: input.path)
+                // VNImageRequestHandler / CGImageSource cannot handle PDFs; leave non-image inputs untouched.
+                let ext = fileURL.pathExtension.lowercased()
+                guard VisionService.imageOnlyExtensions.contains(ext) else {
+                    return input
+                }
                 let attrs = try FileManager.default.attributesOfItem(atPath: fileURL.path)
                 if let fileSize = attrs[.size] as? Int, fileSize > VisionRequestOptions.defaultMaxFileBytes {
                     throw VisionError.fileTooLarge(bytes: fileSize, maxBytes: VisionRequestOptions.defaultMaxFileBytes)
@@ -487,12 +492,32 @@ struct VisionAPIController: RouteCollection {
                 var classifyLabels: [VisionClassifyLabel]?
                 var textResponse: VisionOCRResponse?
 
-                // Barcode and classify are synchronous Vision framework calls
-                let barcodes = try imageInputs.flatMap { input in
-                    try visionService.detectBarcodes(from: input.path, options: options)
+                // Barcode and classify are synchronous Vision framework calls; only run on image inputs.
+                let barcodes: [BarcodeResult]
+                let classified: [ClassifyResult]
+                if !imageInputs.isEmpty {
+                    barcodes = try imageInputs.flatMap { input in
+                        try visionService.detectBarcodes(from: input.path, options: options)
+                    }
+                    modesRun.append("barcode")
+                    classified = try imageInputs.map { input in
+                        try visionService.classifyImage(from: input.path, maxLabels: maxLabels)
+                    }
+                    modesRun.append("classify")
+                } else {
+                    barcodes = []
+                    classified = []
                 }
-                let classified = try imageInputs.map { input in
-                    try visionService.classifyImage(from: input.path, maxLabels: maxLabels)
+
+                if !barcodes.isEmpty {
+                    barcodeItems = barcodes.map {
+                        VisionBarcodeItem(type: $0.type, payload: $0.payload, boundingBox: VisionOCRBoundingBox($0.boundingBox), confidence: $0.confidence)
+                    }
+                }
+
+                let labels = classified.flatMap(\.labels)
+                if !labels.isEmpty {
+                    classifyLabels = labels.map { VisionClassifyLabel(label: $0.label, confidence: $0.confidence) }
                 }
 
                 if #available(macOS 26.0, *) {
@@ -512,19 +537,6 @@ struct VisionAPIController: RouteCollection {
                         documentHints: hints,
                         debugOutput: nil
                     )
-                }
-
-                modesRun.append("barcode")
-                if !barcodes.isEmpty {
-                    barcodeItems = barcodes.map {
-                        VisionBarcodeItem(type: $0.type, payload: $0.payload, boundingBox: VisionOCRBoundingBox($0.boundingBox), confidence: $0.confidence)
-                    }
-                }
-
-                let labels = classified.flatMap(\.labels)
-                modesRun.append("classify")
-                if !labels.isEmpty {
-                    classifyLabels = labels.map { VisionClassifyLabel(label: $0.label, confidence: $0.confidence) }
                 }
 
                 return try await createJSONResponse(VisionAutoResponse(
@@ -803,6 +815,9 @@ struct VisionAPIController: RouteCollection {
     }
 
     static func writeTempFile(data: Data, filename: String, mediaType: String?) throws -> URL {
+        if data.count > VisionRequestOptions.defaultMaxFileBytes {
+            throw VisionError.fileTooLarge(bytes: data.count, maxBytes: VisionRequestOptions.defaultMaxFileBytes)
+        }
         let ext = inferExtension(filename: filename, mediaType: mediaType)
         let tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("afm_vision_\(UUID().uuidString).\(ext)")

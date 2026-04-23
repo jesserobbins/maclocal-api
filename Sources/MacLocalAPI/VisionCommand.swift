@@ -153,16 +153,21 @@ struct VisionCommand: ParsableCommand {
             var processPath = resolvedPath
             var tempCropURL: URL?
             if autoCrop {
-                let imageData = try Data(contentsOf: URL(fileURLWithPath: resolvedPath))
-                if imageData.count > VisionRequestOptions.defaultMaxFileBytes {
-                    throw VisionError.fileTooLarge(bytes: imageData.count, maxBytes: VisionRequestOptions.defaultMaxFileBytes)
+                // VNImageRequestHandler / CGImageSource cannot handle PDFs; silently skip autoCrop for non-image inputs.
+                let resolvedExt = URL(fileURLWithPath: resolvedPath).pathExtension.lowercased()
+                if VisionService.imageOnlyExtensions.contains(resolvedExt) {
+                    let attrs = try FileManager.default.attributesOfItem(atPath: resolvedPath)
+                    if let fileSize = attrs[.size] as? Int, fileSize > VisionRequestOptions.defaultMaxFileBytes {
+                        throw VisionError.fileTooLarge(bytes: fileSize, maxBytes: VisionRequestOptions.defaultMaxFileBytes)
+                    }
+                    let imageData = try Data(contentsOf: URL(fileURLWithPath: resolvedPath))
+                    let croppedData = try visionService.autoCrop(imageData: imageData)
+                    let tempURL = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("afm_vision_crop_\(UUID().uuidString).png")
+                    try croppedData.write(to: tempURL)
+                    processPath = tempURL.path
+                    tempCropURL = tempURL
                 }
-                let croppedData = try visionService.autoCrop(imageData: imageData)
-                let tempURL = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("afm_vision_crop_\(UUID().uuidString).png")
-                try croppedData.write(to: tempURL)
-                processPath = tempURL.path
-                tempCropURL = tempURL
             }
             defer { if let url = tempCropURL { try? FileManager.default.removeItem(at: url) } }
 
@@ -223,14 +228,21 @@ struct VisionCommand: ParsableCommand {
             case "auto":
                 var sections: [String] = []
 
-                let barcodes = try visionService.detectBarcodes(from: processPath, options: options)
-                if !barcodes.isEmpty {
-                    sections.append("=== Barcodes ===\n" + barcodes.map { "\($0.type): \($0.payload)" }.joined(separator: "\n"))
-                }
+                // Barcode and classify require image inputs (they reject PDFs via imageOnlyExtensions).
+                // Skip them for non-image inputs so --mode auto still runs text extraction on PDFs.
+                let processExt = URL(fileURLWithPath: processPath).pathExtension.lowercased()
+                let processIsImage = VisionService.imageOnlyExtensions.contains(processExt)
 
-                let classified = try visionService.classifyImage(from: processPath, maxLabels: maxLabels)
-                if !classified.labels.isEmpty {
-                    sections.append("=== Classifications ===\n" + classified.labels.map { "\($0.label): \(String(format: "%.4f", $0.confidence))" }.joined(separator: "\n"))
+                if processIsImage {
+                    let barcodes = try visionService.detectBarcodes(from: processPath, options: options)
+                    if !barcodes.isEmpty {
+                        sections.append("=== Barcodes ===\n" + barcodes.map { "\($0.type): \($0.payload)" }.joined(separator: "\n"))
+                    }
+
+                    let classified = try visionService.classifyImage(from: processPath, maxLabels: maxLabels)
+                    if !classified.labels.isEmpty {
+                        sections.append("=== Classifications ===\n" + classified.labels.map { "\($0.label): \(String(format: "%.4f", $0.confidence))" }.joined(separator: "\n"))
+                    }
                 }
 
                 if #available(macOS 26.0, *) {

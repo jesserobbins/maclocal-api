@@ -111,9 +111,13 @@ struct ChatCompletionsController: RouteCollection {
                 }
 
                 if hasImages || hasAudio {
-                    // Run on-device extraction and return results directly —
-                    // Foundation Models has a 4096 token context limit that
-                    // extracted text easily exceeds.  Bypass the LLM entirely.
+                    // This bypass is nested inside `if #available(macOS 26.0, *)` because the entire
+                    // Foundation-model path requires macOS 26. Vision OCR and Speech have their own
+                    // independent availability gates (26.0 and 13.0 respectively); on older OSes the
+                    // surrounding block is skipped entirely, so media inputs never reach here.
+                    //
+                    // Run on-device extraction and return results directly — Foundation Models has
+                    // a 4096 token context limit that extracted text easily exceeds. Bypass the LLM entirely.
                     var extractedTexts: [String] = []
                     var allCleanupURLs: [URL] = []
 

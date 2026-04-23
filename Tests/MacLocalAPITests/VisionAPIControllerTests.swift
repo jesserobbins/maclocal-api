@@ -118,6 +118,185 @@ final class VisionAPIControllerTests: XCTestCase {
         }
     }
 
+    func testBarcodeModeReturnsResults() async throws {
+        let service = FakeVisionService()
+        service.barcodeResults = [
+            BarcodeResult(type: "QR", payload: "https://example.com", boundingBox: CGRect(x: 0.1, y: 0.2, width: 0.3, height: 0.4), confidence: 0.95)
+        ]
+        try VisionAPIController(makeVisionService: { service }).boot(routes: app)
+
+        let payload = Data("fake image".utf8).base64EncodedString()
+        let body = ByteBuffer(string: #"{"data":"\#(payload)","filename":"barcode.png","mode":"barcode"}"#)
+        var headers = HTTPHeaders()
+        headers.contentType = .json
+
+        try await app.testable(method: .running(port: 0)).test(.POST, "/v1/vision/ocr", headers: headers, body: body) { res async in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertEqual(res.headers.first(name: .accessControlAllowOrigin), "*")
+            XCTAssertContains(res.body.string, #""mode":"barcode""#)
+            XCTAssertContains(res.body.string, #""type":"QR""#)
+            XCTAssertContains(res.body.string, #""payload":"https:\/\/example.com""#)
+            XCTAssertContains(res.body.string, #""bounding_box""#)
+        }
+    }
+
+    func testClassifyModePassesMaxLabels() async throws {
+        let service = FakeVisionService()
+        service.classifyResult = ClassifyResult(
+            labels: [ClassificationLabel(label: "cat", confidence: 0.9)],
+            salientRegions: [CGRect(x: 0, y: 0, width: 0.5, height: 0.5)]
+        )
+        try VisionAPIController(makeVisionService: { service }).boot(routes: app)
+
+        let payload = Data("fake image".utf8).base64EncodedString()
+        let body = ByteBuffer(string: #"{"data":"\#(payload)","filename":"pic.png","mode":"classify","max_labels":3}"#)
+        var headers = HTTPHeaders()
+        headers.contentType = .json
+
+        try await app.testable(method: .running(port: 0)).test(.POST, "/v1/vision/ocr", headers: headers, body: body) { res async in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertContains(res.body.string, #""mode":"classify""#)
+            XCTAssertContains(res.body.string, #""label":"cat""#)
+            XCTAssertContains(res.body.string, #""salient_regions""#)
+            XCTAssertEqual(service.lastClassifyMaxLabels, 3)
+        }
+    }
+
+    func testDetailLowMapsToFastRecognitionLevelInTextMode() async throws {
+        let service = FakeVisionService()
+        service.verboseResult = makeVisionResult(filePath: "/tmp/doc.png")
+        try VisionAPIController(makeVisionService: { service }).boot(routes: app)
+
+        let payload = Data("fake image".utf8).base64EncodedString()
+        let body = ByteBuffer(string: #"{"data":"\#(payload)","filename":"doc.png","mode":"text","detail":"low"}"#)
+        var headers = HTTPHeaders()
+        headers.contentType = .json
+
+        try await app.testable(method: .running(port: 0)).test(.POST, "/v1/vision/ocr", headers: headers, body: body) { res async in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertEqual(service.lastOptions?.recognitionLevel, .fast)
+        }
+    }
+
+    func testSaliencyModeEchoesSaliencyTypeAndHeatMap() async throws {
+        let service = FakeVisionService()
+        let heatMap = Data("pngbytes".utf8)
+        service.saliencyResult = SaliencyResult(
+            regions: [SaliencyRegion(type: "attention", boundingBox: CGRect(x: 0.1, y: 0.1, width: 0.8, height: 0.8))],
+            heatMapPNG: heatMap
+        )
+        try VisionAPIController(makeVisionService: { service }).boot(routes: app)
+
+        let payload = Data("fake image".utf8).base64EncodedString()
+        let body = ByteBuffer(string: #"{"data":"\#(payload)","filename":"pic.png","mode":"saliency","saliency_type":"objectness","include_heat_map":true}"#)
+        var headers = HTTPHeaders()
+        headers.contentType = .json
+
+        try await app.testable(method: .running(port: 0)).test(.POST, "/v1/vision/ocr", headers: headers, body: body) { res async in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertContains(res.body.string, #""mode":"saliency""#)
+            XCTAssertContains(res.body.string, #""heat_map""#)
+            XCTAssertContains(res.body.string, heatMap.base64EncodedString())
+            XCTAssertEqual(service.lastSaliencyType, "objectness")
+            XCTAssertEqual(service.lastSaliencyIncludeHeatMap, true)
+        }
+    }
+
+    func testAutoModeRunsBarcodeClassifyAndTextOnImageInput() async throws {
+        let service = FakeVisionService()
+        service.verboseResult = makeVisionResult(filePath: "/tmp/pic.png")
+        service.barcodeResults = [
+            BarcodeResult(type: "QR", payload: "abc", boundingBox: .zero, confidence: 0.9)
+        ]
+        service.classifyResult = ClassifyResult(
+            labels: [ClassificationLabel(label: "dog", confidence: 0.8)],
+            salientRegions: []
+        )
+        try VisionAPIController(makeVisionService: { service }).boot(routes: app)
+
+        let payload = Data("fake image".utf8).base64EncodedString()
+        let body = ByteBuffer(string: #"{"data":"\#(payload)","filename":"pic.png","mode":"auto"}"#)
+        var headers = HTTPHeaders()
+        headers.contentType = .json
+
+        try await app.testable(method: .running(port: 0)).test(.POST, "/v1/vision/ocr", headers: headers, body: body) { res async in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertContains(res.body.string, #""mode":"auto""#)
+            // modes_run should list modes in actual execution order: barcode, classify, then text
+            XCTAssertContains(res.body.string, #""modes_run":["barcode","classify","text"]"#)
+            XCTAssertContains(res.body.string, #""barcodes""#)
+            XCTAssertContains(res.body.string, #""labels""#)
+            XCTAssertContains(res.body.string, #""text""#)
+        }
+    }
+
+    func testAutoModeOnPDFSkipsBarcodeAndClassify() async throws {
+        let service = FakeVisionService()
+        service.verboseResult = makeVisionResult(filePath: "/tmp/doc.pdf")
+        try VisionAPIController(makeVisionService: { service }).boot(routes: app)
+
+        let payload = Data("fake pdf".utf8).base64EncodedString()
+        let body = ByteBuffer(string: #"{"data":"\#(payload)","filename":"doc.pdf","mode":"auto"}"#)
+        var headers = HTTPHeaders()
+        headers.contentType = .json
+
+        try await app.testable(method: .running(port: 0)).test(.POST, "/v1/vision/ocr", headers: headers, body: body) { res async in
+            XCTAssertEqual(res.status, .ok)
+            // Only text should run for PDFs — barcode/classify are image-only.
+            XCTAssertContains(res.body.string, #""modes_run":["text"]"#)
+        }
+    }
+
+    func testTextModeWithResponseFormatTextReturnsPlainText() async throws {
+        let service = FakeVisionService()
+        service.verboseResult = makeVisionResult(filePath: "/tmp/doc.png")
+        try VisionAPIController(makeVisionService: { service }).boot(routes: app)
+
+        let payload = Data("fake image".utf8).base64EncodedString()
+        let body = ByteBuffer(string: #"{"data":"\#(payload)","filename":"doc.png","mode":"text","response_format":"text"}"#)
+        var headers = HTTPHeaders()
+        headers.contentType = .json
+
+        try await app.testable(method: .running(port: 0)).test(.POST, "/v1/vision/ocr", headers: headers, body: body) { res async in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertEqual(res.headers.first(name: .contentType), "text/plain")
+            XCTAssertContains(res.body.string, "Page 1")
+            XCTAssertContains(res.body.string, "Page 2")
+            // No JSON envelope
+            XCTAssertFalse(res.body.string.contains(#""object":"vision.ocr""#))
+        }
+    }
+
+    func testUnknownModeReturnsBadRequest() async throws {
+        try VisionAPIController(makeVisionService: { FakeVisionService() }).boot(routes: app)
+
+        let payload = Data("fake image".utf8).base64EncodedString()
+        let body = ByteBuffer(string: #"{"data":"\#(payload)","filename":"pic.png","mode":"nonexistent"}"#)
+        var headers = HTTPHeaders()
+        headers.contentType = .json
+
+        try await app.testable(method: .running(port: 0)).test(.POST, "/v1/vision/ocr", headers: headers, body: body) { res async in
+            XCTAssertEqual(res.status, .badRequest)
+            XCTAssertContains(res.body.string, "Unknown mode")
+        }
+    }
+
+    func testBarcodeModePropagatesServiceError() async throws {
+        let service = FakeVisionService()
+        service.barcodeError = VisionError.unsupportedFormat
+        try VisionAPIController(makeVisionService: { service }).boot(routes: app)
+
+        let payload = Data("fake image".utf8).base64EncodedString()
+        let body = ByteBuffer(string: #"{"data":"\#(payload)","filename":"pic.png","mode":"barcode"}"#)
+        var headers = HTTPHeaders()
+        headers.contentType = .json
+
+        try await app.testable(method: .running(port: 0)).test(.POST, "/v1/vision/ocr", headers: headers, body: body) { res async in
+            XCTAssertEqual(res.status, .badRequest)
+            XCTAssertContains(res.body.string, "Unsupported")
+        }
+    }
+
     func testVisionOCRAutoToolDetection() {
         let tool = RequestTool(
             type: "function",
@@ -229,20 +408,36 @@ private final class FakeVisionService: VisionServing {
         return debugResult
     }
 
+    var barcodeResults: [BarcodeResult] = []
+    var classifyResult = ClassifyResult(labels: [], salientRegions: [])
+    var saliencyResult = SaliencyResult(regions: [], heatMapPNG: nil)
+    var lastClassifyMaxLabels: Int?
+    var lastSaliencyType: String?
+    var lastSaliencyIncludeHeatMap: Bool?
+    var barcodeError: Error?
+    var classifyError: Error?
+    var saliencyError: Error?
+
     func detectBarcodes(from filePath: String, options: VisionRequestOptions) throws -> [BarcodeResult] {
         lastPath = filePath
         lastOptions = options
-        return []
+        if let barcodeError { throw barcodeError }
+        return barcodeResults
     }
 
     func classifyImage(from filePath: String, maxLabels: Int) throws -> ClassifyResult {
         lastPath = filePath
-        return ClassifyResult(labels: [], salientRegions: [])
+        lastClassifyMaxLabels = maxLabels
+        if let classifyError { throw classifyError }
+        return classifyResult
     }
 
     func detectSaliency(from filePath: String, type: String, includeHeatMap: Bool) throws -> SaliencyResult {
         lastPath = filePath
-        return SaliencyResult(regions: [], heatMapPNG: nil)
+        lastSaliencyType = type
+        lastSaliencyIncludeHeatMap = includeHeatMap
+        if let saliencyError { throw saliencyError }
+        return saliencyResult
     }
 
     func autoCrop(imageData: Data) throws -> Data {

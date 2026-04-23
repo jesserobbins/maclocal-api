@@ -270,8 +270,11 @@ final class VisionService {
 
     // MARK: - Image classification (macOS 13+)
 
+    static let classifyMaxLabelsCeiling = 100
+
     func classifyImage(from filePath: String, maxLabels: Int = 5) throws -> ClassifyResult {
-        let clampedMaxLabels = max(maxLabels, 0)
+        // A request for 0 labels silently returns nothing; clamp to [1, 100] so callers always get a result and cannot blow up memory.
+        let clampedMaxLabels = min(max(maxLabels, 1), Self.classifyMaxLabelsCeiling)
         let (url, _) = try validateFile(at: filePath, allowedExtensions: Self.imageOnlyExtensions)
         guard let imageData = try? Data(contentsOf: url) else {
             throw VisionError.imageLoadingFailed
