@@ -14,23 +14,23 @@ import Foundation
 ///
 /// The bundled/env/project sources are loaded once at construction time and
 /// held in memory; per-request resolution is a cheap in-memory union.
-public final class ContextualVocabResolver: Sendable {
+final class ContextualVocabResolver: Sendable {
     /// Maximum entries emitted per resolve call. Apple's `contextualStrings`
     /// dictionary has no documented hard cap; we pick a pragmatic upper bound
     /// that keeps payloads small enough for the analyzer to consume in a
     /// single setContext call without measurable overhead.
-    public static let maxResolvedEntries: Int = 4096
+    static let maxResolvedEntries: Int = 4096
 
     /// Maximum tokens we extract from a per-request `prompt` field. OpenAI's
     /// `prompt` is a free-text hint; we split on whitespace and keep the
     /// first N non-trivial tokens.
-    public static let maxPromptTokens: Int = 256
+    static let maxPromptTokens: Int = 256
 
     private let bundledEntries: [String]
     private let envEntries: [String]
     private let projectEntries: [String]
 
-    public init(
+    init(
         bundle: Bundle = .module,
         envFilePath: String? = ProcessInfo.processInfo.environment["MACAFM_SPEECH_VOCAB_FILE"],
         projectFilePath: String? = ContextualVocabResolver.defaultProjectFilePath()
@@ -41,7 +41,7 @@ public final class ContextualVocabResolver: Sendable {
     }
 
     /// Resolve the merged contextual-strings list for a single request.
-    public func resolve(prompt: String?, locale: String) -> [String] {
+    func resolve(prompt: String?, locale: String) -> [String] {
         let promptTokens = ContextualVocabResolver.tokenize(prompt: prompt)
 
         // Merge high-to-low, dedup on a case-folded key but keep the first
@@ -93,7 +93,7 @@ public final class ContextualVocabResolver: Sendable {
         return parse(text: text)
     }
 
-    private static func defaultProjectFilePath() -> String? {
+    static func defaultProjectFilePath() -> String? {
         // Conventional project-level location, resolved relative to the
         // server's working directory — matching how other AFM config reads
         // (.afm/... style paths) work in this repo.
@@ -142,10 +142,10 @@ public final class ContextualVocabResolver: Sendable {
     }
 }
 
-public enum VocabResolverError: Error, LocalizedError {
+enum VocabResolverError: Error, LocalizedError {
     case bundledVocabMissing
 
-    public var errorDescription: String? {
+    var errorDescription: String? {
         switch self {
         case .bundledVocabMissing:
             return "Bundled speech vocabulary (Resources/speech-vocab/en.txt) not found in module bundle. Run Scripts/build-from-scratch.sh to stage it."
