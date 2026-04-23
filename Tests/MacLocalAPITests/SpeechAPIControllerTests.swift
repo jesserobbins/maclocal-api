@@ -51,7 +51,7 @@ final class SpeechAPIControllerTests: XCTestCase {
         }
     }
 
-    func testTranscribeRejectsUnsupportedFormat() async throws {
+    func testTranscribeRejectsUnsupportedFormatWith400() async throws {
         try SpeechAPIController(makeSpeechService: { FakeSpeechService() }).boot(routes: app)
 
         let payload = Data("fake".utf8).base64EncodedString()
@@ -60,8 +60,25 @@ final class SpeechAPIControllerTests: XCTestCase {
         headers.contentType = .json
 
         try await app.testable(method: .running(port: 0)).test(.POST, "/v1/audio/transcriptions", headers: headers, body: body) { res async in
-            XCTAssertTrue(res.status.code >= 400, "expected an error status, got \(res.status)")
-            XCTAssertContains(res.body.string, "unsupportedFormat")
+            XCTAssertEqual(res.status, .badRequest)
+            XCTAssertContains(res.body.string, "Unsupported audio format")
+        }
+    }
+
+    func testTranscribeMapsSpeechServiceErrorsToExpectedStatuses() async throws {
+        // recognitionFailed → 422
+        let service422 = FakeSpeechService()
+        service422.transcribeError = SpeechError.recognitionFailed("boom")
+        try SpeechAPIController(makeSpeechService: { service422 }).boot(routes: app)
+
+        let payload = Data("fake wav".utf8).base64EncodedString()
+        let body = ByteBuffer(string: #"{"data":"\#(payload)","format":"wav"}"#)
+        var headers = HTTPHeaders()
+        headers.contentType = .json
+
+        try await app.testable(method: .running(port: 0)).test(.POST, "/v1/audio/transcriptions", headers: headers, body: body) { res async in
+            XCTAssertEqual(res.status, .unprocessableEntity)
+            XCTAssertContains(res.body.string, "Speech recognition failed")
         }
     }
 

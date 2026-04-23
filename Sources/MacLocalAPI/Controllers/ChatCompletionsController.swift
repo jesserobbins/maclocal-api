@@ -111,10 +111,12 @@ struct ChatCompletionsController: RouteCollection {
                 }
 
                 if hasImages || hasAudio {
-                    // This bypass is nested inside `if #available(macOS 26.0, *)` because the entire
-                    // Foundation-model path requires macOS 26. Vision OCR and Speech have their own
-                    // independent availability gates (26.0 and 13.0 respectively); on older OSes the
-                    // surrounding block is skipped entirely, so media inputs never reach here.
+                    // This bypass is nested inside `if #available(macOS 26.0, *)` because the
+                    // entire Foundation-model path requires macOS 26. Vision OCR similarly
+                    // requires macOS 26, but Speech transcription works on macOS 13+. Audio-only
+                    // chat requests on macOS 13–25 therefore currently fall through to whatever
+                    // the non-Foundation path does; wiring Speech extraction outside this gate is
+                    // a follow-up if audio support without Foundation becomes a requirement.
                     //
                     // Run on-device extraction and return results directly — Foundation Models has
                     // a 4096 token context limit that extracted text easily exceeds. Bypass the LLM entirely.

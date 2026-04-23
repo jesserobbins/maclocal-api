@@ -318,7 +318,10 @@ struct VisionAPIController: RouteCollection {
             )
         }
 
-        defer { cleanup(parsed.cleanupURLs) }
+        // Single mutable list shared by parse-phase temp files and autoCrop-phase temp files,
+        // so there is one cleanup path that cannot be silently dropped by a future refactor.
+        var allCleanupURLs: [URL] = parsed.cleanupURLs
+        defer { cleanup(allCleanupURLs) }
 
         // Resolve mode: explicit mode > legacy flags > default "text"
         let wantsDebug = parsed.request.debug ?? false
@@ -336,7 +339,6 @@ struct VisionAPIController: RouteCollection {
 
         // Apply auto_crop preprocessing if requested
         var effectiveInputs = parsed.inputs
-        var cropCleanupURLs: [URL] = []
         if parsed.request.autoCrop ?? false {
             effectiveInputs = try effectiveInputs.map { input in
                 let fileURL = URL(fileURLWithPath: input.path)
@@ -359,11 +361,10 @@ struct VisionAPIController: RouteCollection {
                 let tempURL = FileManager.default.temporaryDirectory
                     .appendingPathComponent("afm_vision_crop_\(UUID().uuidString).png")
                 try croppedData.write(to: tempURL)
-                cropCleanupURLs.append(tempURL)
+                allCleanupURLs.append(tempURL)
                 return VisionResolvedInput(path: tempURL.path, sourceType: input.sourceType, cleanupURLs: input.cleanupURLs)
             }
         }
-        defer { cleanup(cropCleanupURLs) }
 
         do {
             switch resolvedMode {

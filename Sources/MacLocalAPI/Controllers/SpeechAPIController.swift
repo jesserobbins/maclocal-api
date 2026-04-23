@@ -59,30 +59,51 @@ struct SpeechAPIController: RouteCollection {
             }
         }
 
-        let filePath: String
-        if let file = body.file, !file.isEmpty {
-            filePath = try Self.sanitizeAudioPath(file)
-        } else if let data = body.data, !data.isEmpty {
-            let ext = try Self.validatedExtension(body.format ?? "wav")
-            let tempURL = try Self.writeTempAudio(base64: data, ext: ext)
-            cleanupURLs.append(tempURL)
-            filePath = tempURL.path
-        } else {
-            throw Abort(.badRequest, reason: "Either 'file' path or 'data' (base64) is required")
+        do {
+            let filePath: String
+            if let file = body.file, !file.isEmpty {
+                filePath = try Self.sanitizeAudioPath(file)
+            } else if let data = body.data, !data.isEmpty {
+                let ext = try Self.validatedExtension(body.format ?? "wav")
+                let tempURL = try Self.writeTempAudio(base64: data, ext: ext)
+                cleanupURLs.append(tempURL)
+                filePath = tempURL.path
+            } else {
+                throw Abort(.badRequest, reason: "Either 'file' path or 'data' (base64) is required")
+            }
+
+            let text = try await service.transcribe(from: filePath, options: options)
+
+            let response = SpeechTranscriptionResponse(
+                object: "speech.transcription",
+                text: text,
+                locale: locale
+            )
+            let httpResponse = Response(status: .ok)
+            httpResponse.headers.add(name: .contentType, value: "application/json")
+            httpResponse.headers.add(name: .accessControlAllowOrigin, value: "*")
+            try httpResponse.content.encode(response)
+            return httpResponse
+        } catch let speechError as SpeechError {
+            throw Abort(Self.httpStatus(for: speechError), reason: speechError.localizedDescription)
         }
+    }
 
-        let text = try await service.transcribe(from: filePath, options: options)
-
-        let response = SpeechTranscriptionResponse(
-            object: "speech.transcription",
-            text: text,
-            locale: locale
-        )
-        let httpResponse = Response(status: .ok)
-        httpResponse.headers.add(name: .contentType, value: "application/json")
-        httpResponse.headers.add(name: .accessControlAllowOrigin, value: "*")
-        try httpResponse.content.encode(response)
-        return httpResponse
+    static func httpStatus(for error: SpeechError) -> HTTPStatus {
+        switch error {
+        case .fileNotFound:
+            return .notFound
+        case .unsupportedFormat:
+            return .badRequest
+        case .requestTooLarge:
+            return .payloadTooLarge
+        case .authorizationDenied:
+            return .forbidden
+        case .onDeviceNotAvailable, .platformUnavailable:
+            return .serviceUnavailable
+        case .noSpeechFound, .recognitionFailed:
+            return .unprocessableEntity
+        }
     }
 
     // MARK: - Chat completions integration

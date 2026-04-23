@@ -330,7 +330,10 @@ class Server {
                     total_slots: 1,
                     model_path: mlxModelID,
                     role: "mlx",
-                    modalities: Modalities(vision: true, audio: true),
+                    // MLX chat-completions do not currently run through the Vision OCR / Speech
+                    // transcription preamble; advertising vision/audio here would cause clients
+                    // to send image_url / input_audio parts the MLX path can't process.
+                    modalities: Modalities(vision: false, audio: false),
                     chat_template: "",
                     bos_token: "",
                     eos_token: "",

@@ -43,7 +43,8 @@ struct SpeechCommand: ParsableCommand {
         do {
             if #available(macOS 13.0, *) {
                 let service = SpeechService()
-                let options = SpeechRequestOptions(locale: locale)
+                // CLI caller: allow the system TCC prompt on first run so interactive users can grant access.
+                let options = SpeechRequestOptions(locale: locale, promptForAuthorization: true)
                 let text = try await service.transcribe(from: resolvedPath, options: options)
                 print(text)
             } else {

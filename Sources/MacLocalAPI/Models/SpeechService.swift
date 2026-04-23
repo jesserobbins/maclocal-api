@@ -15,7 +15,7 @@ enum SpeechError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .platformUnavailable:
-            return "Apple Speech framework requires macOS 10.15 or later"
+            return "Apple Speech framework requires macOS 13.0 or later"
         case .fileNotFound:
             return "The specified audio file was not found"
         case .unsupportedFormat:
@@ -41,13 +41,20 @@ struct SpeechRequestOptions: Sendable {
 
     let locale: String
     let maxFileBytes: Int
+    /// When true, `.notDetermined` triggers the system TCC prompt. When false
+    /// (HTTP callers, chat bypass), `.notDetermined` is treated as denied so a
+    /// headless/SSH session can return an immediate error instead of hanging
+    /// until the recognition timeout waiting for a dialog no-one will dismiss.
+    let promptForAuthorization: Bool
 
     init(
         locale: String = "en-US",
-        maxFileBytes: Int = SpeechRequestOptions.defaultMaxFileBytes
+        maxFileBytes: Int = SpeechRequestOptions.defaultMaxFileBytes,
+        promptForAuthorization: Bool = false
     ) {
         self.locale = locale
         self.maxFileBytes = maxFileBytes
+        self.promptForAuthorization = promptForAuthorization
     }
 }
 
@@ -84,6 +91,10 @@ final class SpeechService {
             throw SpeechError.authorizationDenied
         }
         if status == .notDetermined {
+            guard options.promptForAuthorization else {
+                // Headless/HTTP caller: refuse rather than block on a TCC dialog nobody will see.
+                throw SpeechError.authorizationDenied
+            }
             let granted = await withCheckedContinuation { continuation in
                 SFSpeechRecognizer.requestAuthorization { newStatus in
                     continuation.resume(returning: newStatus == .authorized)
