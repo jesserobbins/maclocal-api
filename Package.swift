@@ -78,7 +78,8 @@ let package = Package(
                 "Info.plist"
             ],
             resources: [
-                .copy("Resources/default.metallib")
+                .copy("Resources/default.metallib"),
+                .copy("Resources/speech-vocab")
             ],
             swiftSettings: [
                 // Enable optimizations for release builds

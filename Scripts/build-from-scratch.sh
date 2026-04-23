@@ -23,6 +23,7 @@ DO_CLEAN=true
 DO_SUBMODULES=true
 DO_PATCHES=true
 DO_WEBUI=true
+DO_SPEECH_VOCAB=true
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -45,10 +46,11 @@ Options:
   --skip-submodules    Skip git submodule init/update
   --skip-patches       Skip Scripts/apply-mlx-patches.sh
   --skip-webui         Skip llama.cpp webui build
+  --skip-speech-vocab  Skip copying speech vocabulary resources
   -h, --help           Show help
 
 Default behavior:
-  submodules + patches + webui + clean + release build
+  submodules + patches + webui + speech-vocab + clean + release build
 USAGE
 }
 
@@ -66,6 +68,7 @@ for arg in "$@"; do
     --skip-submodules) DO_SUBMODULES=false ;;
     --skip-patches) DO_PATCHES=false ;;
     --skip-webui) DO_WEBUI=false ;;
+    --skip-speech-vocab) DO_SPEECH_VOCAB=false ;;
     -h|--help) usage; exit 0 ;;
     *)
       log_error "Unknown option: $arg"
@@ -132,9 +135,28 @@ else
   log_warn "Skipping webui build"
 fi
 
+if $DO_SPEECH_VOCAB; then
+  log_step "Copying speech vocabulary resources"
+  SRC_VOCAB_DIR="$ROOT_DIR/Resources/speech-vocab"
+  DST_VOCAB_DIR="$ROOT_DIR/Sources/MacLocalAPI/Resources/speech-vocab"
+  if [ ! -f "$SRC_VOCAB_DIR/en.txt" ]; then
+    log_error "Missing speech vocabulary source: $SRC_VOCAB_DIR/en.txt"
+    exit 1
+  fi
+  mkdir -p "$DST_VOCAB_DIR"
+  cp "$SRC_VOCAB_DIR"/*.txt "$DST_VOCAB_DIR/"
+  log_info "Speech vocab resources copied to $DST_VOCAB_DIR"
+else
+  log_warn "Skipping speech vocab copy"
+fi
+
 log_step "Validating required resources"
 if [ ! -f "$ROOT_DIR/Sources/MacLocalAPI/Resources/default.metallib" ]; then
   log_error "Missing metallib: Sources/MacLocalAPI/Resources/default.metallib"
+  exit 1
+fi
+if [ ! -f "$ROOT_DIR/Sources/MacLocalAPI/Resources/speech-vocab/en.txt" ]; then
+  log_error "Missing speech vocab: Sources/MacLocalAPI/Resources/speech-vocab/en.txt"
   exit 1
 fi
 

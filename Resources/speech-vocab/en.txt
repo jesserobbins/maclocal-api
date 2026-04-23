@@ -1,0 +1,317 @@
+# Default contextual vocabulary for English SpeechTranscriber.
+# One phrase per line. Lines beginning with '#' are comments and skipped.
+# Empty lines are skipped.
+#
+# This file is the load-bearing input for Gate B ("zero-config beats whisper
+# on technical English"). Seeded from observed benchmark errors plus a curated
+# tech / product / place-name / units baseline. Edit freely; recompilation is
+# not needed — the file is read at server startup.
+
+# ---------- Cloud / infrastructure ----------
+Kubernetes
+Docker
+containerized
+container
+microservices
+orchestrate
+orchestration
+orchestrates
+pod
+Helm
+Istio
+service mesh
+sidecar
+load balancer
+ingress
+namespace
+etcd
+CoreDNS
+Prometheus
+Grafana
+OpenTelemetry
+Jaeger
+ArgoCD
+GitOps
+Terraform
+Ansible
+Pulumi
+CloudFormation
+serverless
+Lambda
+EKS
+ECS
+Fargate
+GKE
+AKS
+Cloud Run
+Cloud Functions
+
+# ---------- Languages / frameworks ----------
+Swift
+SwiftUI
+Objective-C
+TypeScript
+JavaScript
+Python
+Go
+Golang
+Rust
+Kotlin
+Ruby on Rails
+React
+Vue
+Svelte
+Angular
+Next.js
+Nuxt
+Remix
+Astro
+Vite
+Webpack
+esbuild
+Rollup
+Tailwind
+PostgreSQL
+MySQL
+MariaDB
+SQLite
+MongoDB
+Redis
+Cassandra
+DynamoDB
+Elasticsearch
+OpenSearch
+ClickHouse
+Snowflake
+BigQuery
+Databricks
+
+# ---------- AI / ML / local inference ----------
+Anthropic
+Claude
+Claude Sonnet
+Claude Opus
+Claude Haiku
+OpenAI
+ChatGPT
+GPT-4
+GPT-5
+Gemini
+LLaMA
+Mistral
+Mixtral
+Qwen
+DeepSeek
+Hugging Face
+transformers
+tokenizer
+embedding
+embeddings
+vector database
+RAG
+retrieval augmented generation
+fine-tuning
+LoRA
+quantization
+inference
+prompt engineering
+MLX
+mlx-swift
+PyTorch
+TensorFlow
+JAX
+ONNX
+CoreML
+Apple Silicon
+Apple Foundation Models
+Apple Intelligence
+SpeechAnalyzer
+SpeechTranscriber
+Vision framework
+Vision OCR
+Neural Engine
+ANE
+GPU kernel
+Metal
+Metal Performance Shaders
+MPSGraph
+
+# ---------- Apple platforms + tooling ----------
+macOS
+iOS
+iPadOS
+watchOS
+visionOS
+tvOS
+Xcode
+TestFlight
+App Store
+App Store Connect
+SwiftPM
+Swift Package Manager
+SPM
+Combine
+async/await
+actor
+Sendable
+GCD
+Grand Central Dispatch
+AVFoundation
+CoreImage
+CoreAudio
+CoreData
+CloudKit
+
+# ---------- Web / protocols ----------
+HTTPS
+HTTP/2
+HTTP/3
+QUIC
+WebSocket
+WebRTC
+gRPC
+GraphQL
+OAuth
+OAuth2
+OpenID Connect
+JWT
+CORS
+WebAssembly
+Wasm
+WASI
+REST API
+JSON Schema
+OpenAPI
+server-sent events
+SSE
+
+# ---------- Developer tools ----------
+GitHub
+GitLab
+Bitbucket
+pull request
+merge request
+code review
+continuous integration
+continuous deployment
+CI/CD
+pre-commit
+semantic versioning
+linting
+ESLint
+Prettier
+SwiftLint
+swift-format
+Homebrew
+uv
+pip
+cargo
+npm
+pnpm
+yarn
+Bun
+
+# ---------- Companies / products commonly misheard ----------
+Anthropic
+Figma
+Notion
+Linear
+Vercel
+Netlify
+Cloudflare
+Fastly
+Stripe
+Square
+Datadog
+PagerDuty
+Sentry
+Segment
+Fivetran
+Airbyte
+dbt
+Retool
+Shopify
+Atlassian
+Jira
+Confluence
+Slack
+Zoom
+Okta
+Snowflake
+
+# ---------- Currencies / units ----------
+dollars
+euros
+pounds sterling
+yen
+yuan
+rupees
+kilograms
+kilometers
+milliseconds
+microseconds
+nanoseconds
+megabytes
+gigabytes
+terabytes
+petabytes
+ARM64
+x86_64
+aarch64
+64-bit
+32-bit
+
+# ---------- Place / proper-name regulars ----------
+San Francisco
+Palo Alto
+Cupertino
+Mountain View
+Seattle
+Redmond
+New York
+San Jose
+Austin
+Amsterdam
+Dublin
+Stockholm
+Tokyo
+Osaka
+Bangalore
+Bengaluru
+Shenzhen
+Singapore
+
+# ---------- Common tech acronyms ----------
+API
+SDK
+CLI
+GUI
+UUID
+SSL/TLS
+RSA
+ECDSA
+SHA-256
+Base64
+UTF-8
+URL
+URI
+DNS
+TCP
+UDP
+IPv4
+IPv6
+VPN
+SSH
+SFTP
+
+# ---------- Phone / support phrases (from phone-call.wav class) ----------
+customer support
+account balance
+billing address
+payment method
+due date
+confirmation number
+reference number
+two-factor authentication
+one-time passcode
+verification code
