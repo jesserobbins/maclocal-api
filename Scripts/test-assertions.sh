@@ -178,11 +178,15 @@ min_tier() {
 should_run_section() {
   local num="$1"
   # Explicit skip list wins (used by combined suites to exclude subsections
-  # already covered by a different server / phase).
-  local skip
-  for skip in "${SKIP_SECTIONS[@]}"; do
-    [[ "$skip" == "$num" ]] && return 1
-  done
+  # already covered by a different server / phase). The length guard is
+  # required because `set -u` errors on "${arr[@]}" for empty arrays in
+  # bash 3.2 (the default on macOS).
+  if [[ ${#SKIP_SECTIONS[@]} -gt 0 ]]; then
+    local skip
+    for skip in "${SKIP_SECTIONS[@]}"; do
+      [[ "$skip" == "$num" ]] && return 1
+    done
+  fi
   [[ -z "$SECTION" || "$SECTION" == "$num" ]]
 }
 
