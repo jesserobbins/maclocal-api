@@ -1,5 +1,6 @@
 import Foundation
 import NaturalLanguage
+import Accelerate
 
 actor NLContextualEmbeddingBackend: EmbeddingBackend {
     private static let multilingualScript = NLScript.latin
@@ -137,30 +138,42 @@ actor NLContextualEmbeddingBackend: EmbeddingBackend {
     }
 
     private func poolMeanNormalized(result: NLContextualEmbeddingResult) throws -> [Float] {
-        var sum = Array(repeating: Float.zero, count: nativeDimension)
+        // Sum per-token vectors in Double to match NLContextualEmbedding's
+        // native [Double] output (no per-token Float conversion), then convert
+        // and divide once at the end. vDSP_vaddD is a SIMD accumulation,
+        // replacing the scalar `sum[index] += Float(value)` loop that ran
+        // dim*tokens times per input.
+        let dim = nativeDimension
+        let n = vDSP_Length(dim)
+        var doubleSum = [Double](repeating: 0, count: dim)
         var tokenCount = 0
         let fullRange = result.string.startIndex..<result.string.endIndex
 
-        result.enumerateTokenVectors(in: fullRange) { tokenVector, _ in
-            guard tokenVector.count == self.nativeDimension else {
+        doubleSum.withUnsafeMutableBufferPointer { sumPtr in
+            guard let sumBase = sumPtr.baseAddress else { return }
+            result.enumerateTokenVectors(in: fullRange) { tokenVector, _ in
+                guard tokenVector.count == dim else {
+                    return true
+                }
+                tokenVector.withUnsafeBufferPointer { tokPtr in
+                    guard let tokBase = tokPtr.baseAddress else { return }
+                    vDSP_vaddD(sumBase, 1, tokBase, 1, sumBase, 1, n)
+                }
+                tokenCount += 1
                 return true
             }
-
-            for (index, value) in tokenVector.enumerated() {
-                sum[index] += Float(value)
-            }
-
-            tokenCount += 1
-            return true
         }
 
         guard tokenCount > 0 else {
             throw EmbeddingError.internalFailure
         }
 
-        let scale = Float(tokenCount)
-        let mean = sum.map { $0 / scale }
-        return EmbeddingMath.l2Normalize(mean)
+        var scaleD = Double(tokenCount)
+        var meanD = [Double](repeating: 0, count: dim)
+        vDSP_vsdivD(doubleSum, 1, &scaleD, &meanD, 1, n)
+        var meanF = [Float](repeating: 0, count: dim)
+        vDSP_vdpsp(meanD, 1, &meanF, 1, n)
+        return EmbeddingMath.l2Normalize(meanF)
     }
 
     private static func selection(for modelID: String) -> (embedding: NLContextualEmbedding, language: NLLanguage?)? {

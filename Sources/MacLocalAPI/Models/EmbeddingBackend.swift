@@ -1,4 +1,5 @@
 import Foundation
+import Accelerate
 
 /// A local embedding backend.
 ///
@@ -7,6 +8,12 @@ import Foundation
 /// loading required to know the dimension has already run during setup).
 /// The controller relies on this when validating the `dimensions` request
 /// parameter before calling `embed` / `embedTokenIDs`.
+///
+/// Conformers must also guarantee that vectors in the returned `EmbedResult`
+/// are L2-normalized at native dimension. The controller skips a redundant
+/// renormalize on the non-truncated path; on the truncated path it slices
+/// then renormalizes (Matryoshka-style). Returning unnormalized vectors will
+/// produce wrong outputs to the client without raising any error.
 protocol EmbeddingBackend: Actor {
     var modelID: String { get }
     var nativeDimension: Int { get }
@@ -92,16 +99,25 @@ enum EmbeddingMath {
     static let zeroThreshold: Float = 1e-12
 
     static func l2Normalize(_ vector: [Float]) -> [Float] {
-        let sumSquares = vector.reduce(Float.zero) { partialResult, value in
-            partialResult + (value * value)
+        guard !vector.isEmpty else {
+            return vector
         }
+
+        let count = vDSP_Length(vector.count)
+        var sumSquares: Float = 0
+        vDSP_svesq(vector, 1, &sumSquares, count)
 
         guard sumSquares > zeroThreshold else {
             return vector
         }
 
-        let norm = Foundation.sqrt(sumSquares)
-        return vector.map { $0 / norm }
+        var norm = Foundation.sqrt(sumSquares)
+        var result = [Float](repeating: 0, count: vector.count)
+        // vDSP_vsdiv divides each element of the input by the scalar pointed to
+        // by &norm. Single SIMD pass replaces the per-element `vector.map` we
+        // had before; on a 768-dim NL embedding this is the bulk of pooling.
+        vDSP_vsdiv(vector, 1, &norm, &result, 1, count)
+        return result
     }
 
     static func truncateAndNormalize(_ vector: [Float], dimensions: Int) -> [Float] {

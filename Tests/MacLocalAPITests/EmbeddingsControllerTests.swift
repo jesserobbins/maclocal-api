@@ -506,7 +506,15 @@ private actor FakeEmbeddingBackend: EmbeddingBackend {
         self.modelID = modelID
         self.nativeDimension = nativeDimension
         self.maxInputTokens = maxInputTokens
-        self.result = result
+        // Backends are required to return L2-normalized vectors. Normalize
+        // here so test cases can write readable raw vectors (e.g. [1, 2, 3])
+        // while still honoring the protocol contract.
+        let normalizedVectors = result.vectors.map { EmbeddingMath.l2Normalize($0) }
+        self.result = EmbedResult(
+            vectors: normalizedVectors,
+            tokenCounts: result.tokenCounts,
+            truncatedInputCount: result.truncatedInputCount
+        )
     }
 
     func embed(_ inputs: [String]) async throws -> EmbedResult {

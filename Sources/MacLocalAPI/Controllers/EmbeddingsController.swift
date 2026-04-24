@@ -81,9 +81,12 @@ struct EmbeddingsController: RouteCollection {
             }
 
             let data = embedResult.vectors.enumerated().map { index, vector in
+                // Backends are required to return L2-normalized vectors at
+                // native dimension (see EmbeddingBackend protocol contract),
+                // so we only renormalize when slicing to a smaller dimension.
                 let outputVector = targetDimensions < vector.count
                     ? EmbeddingMath.truncateAndNormalize(vector, dimensions: targetDimensions)
-                    : EmbeddingMath.l2Normalize(vector)
+                    : vector
                 let payload: EmbeddingVectorPayload
                 switch encodingFormat {
                 case .float:
