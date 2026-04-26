@@ -50,6 +50,15 @@ actor SpeechTranscriberEngine {
         // collects timings either way at negligible cost.
         _ = wantWordTimings
 
+        // Ensure the locale's recognition model is installed before we
+        // hand the transcriber to the analyzer. Apple ships a small set
+        // of locales by default (en-US most reliably); requesting any
+        // other locale on a machine that hasn't installed it yields the
+        // opaque "Audio format is not supported" NSError on the analyzer
+        // side. Install on demand so the first non-English request just
+        // takes a few extra seconds instead of failing outright.
+        try await Self.ensureLocaleInstalled(for: transcriber, locale: locale)
+
         // Bias via AnalysisContext.contextualStrings under the general tag.
         let context = AnalysisContext()
         context.contextualStrings = [.general: contextualStrings]
@@ -177,5 +186,90 @@ actor SpeechTranscriberEngine {
     static func cmTimeMs(_ time: CMTime) -> Int {
         guard time.isValid else { return 0 }
         return Int((CMTimeGetSeconds(time) * 1000.0).rounded())
+    }
+
+    // MARK: - Locale model install
+
+    /// Soft cap on how long we'll block a request waiting for an asset
+    /// install. Locale recognition models are typically tens of MB so
+    /// they install in a few seconds on a working network, but we don't
+    /// want a misconfigured machine to hang an HTTP request for minutes.
+    static let assetInstallTimeoutNs: UInt64 = 60_000_000_000 // 60 s
+
+    /// Apple's Speech APIs return locale identifiers in NSLocale component
+    /// form (`en_US`, `es_MX`); HTTP callers pass BCP-47 form (`en-US`,
+    /// `es-MX`); and our own constants are mixed. Normalize to lowercase +
+    /// hyphen separator so equality checks work across all three.
+    static func canonicalizeLocaleID(_ id: String) -> String {
+        return id.lowercased().replacingOccurrences(of: "_", with: "-")
+    }
+
+    /// If the requested locale's recognition model isn't currently
+    /// installed, ask Speech to download and install it before the
+    /// analyzer starts. Returns when the model is ready (or no install
+    /// was needed). Throws a SpeechError that the controller maps to a
+    /// usable HTTP status when the locale isn't supported, the install
+    /// errors out, or the download exceeds the soft cap above.
+    private static func ensureLocaleInstalled(
+        for transcriber: SpeechTranscriber,
+        locale: Locale
+    ) async throws {
+        // Apple's installedLocales / supportedLocales return identifiers
+        // in component form ("en_US") while callers pass BCP-47 form
+        // ("en-US"). Normalize both sides to a common shape before
+        // comparing so en-US doesn't get flagged as missing on a machine
+        // that has it installed.
+        let want = Self.canonicalizeLocaleID(locale.identifier)
+
+        let installed = await SpeechTranscriber.installedLocales
+        if installed.contains(where: { Self.canonicalizeLocaleID($0.identifier) == want }) {
+            return
+        }
+
+        let supported = await SpeechTranscriber.supportedLocales
+        guard supported.contains(where: { Self.canonicalizeLocaleID($0.identifier) == want }) else {
+            let supportedList = supported.map { $0.identifier }.sorted().joined(separator: ", ")
+            throw SpeechError.recognitionFailed(
+                "Locale \(locale.identifier) is not supported by SpeechTranscriber on this device. Supported locales: \(supportedList)"
+            )
+        }
+
+        let request: AssetInstallationRequest?
+        do {
+            request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber])
+        } catch {
+            throw SpeechError.recognitionFailed(
+                "Could not query locale install status for \(locale.identifier): \(error.localizedDescription)"
+            )
+        }
+
+        guard let request else {
+            // The framework reported no install needed even though the
+            // locale wasn't in installedLocales — proceed and let the
+            // analyzer surface anything still wrong.
+            return
+        }
+
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    try await request.downloadAndInstall()
+                }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: assetInstallTimeoutNs)
+                    throw SpeechError.recognitionFailed(
+                        "Locale \(locale.identifier) model install timed out after \(assetInstallTimeoutNs / 1_000_000_000) s — retry the request once the download completes."
+                    )
+                }
+                try await group.next()
+                group.cancelAll()
+            }
+        } catch let speechError as SpeechError {
+            throw speechError
+        } catch {
+            throw SpeechError.recognitionFailed(
+                "Locale \(locale.identifier) model install failed: \(error.localizedDescription)"
+            )
+        }
     }
 }

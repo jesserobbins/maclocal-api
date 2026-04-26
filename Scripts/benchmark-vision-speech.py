@@ -465,6 +465,31 @@ async def benchmark_speech(session: aiohttp.ClientSession, base_url: str,
     # Multipart form uploads end up with the filename (not a resolvable path) in
     # the decoded model, producing spurious 404s. Send JSON with an absolute path.
     payload = {"file": str(file_path.resolve())}
+    # Filename-based language hint so non-English fixtures route through the
+    # right SpeechTranscriber locale instead of being graded as misheard
+    # English. SpeechTranscriberEngine auto-installs the locale model on
+    # first request (one-time download, ~5-15 s); subsequent requests use
+    # the cached model.
+    stem = file_path.stem.lower()
+    language_hint = None
+    if stem.startswith(("spanish",)):
+        language_hint = "es-MX"
+    elif stem.startswith(("french", "francais", "français")):
+        language_hint = "fr-FR"
+    elif stem.startswith(("german", "deutsch")):
+        language_hint = "de-DE"
+    elif stem.startswith(("italian", "italiano")):
+        language_hint = "it-IT"
+    elif stem.startswith(("japanese", "nihongo")):
+        language_hint = "ja-JP"
+    elif stem.startswith(("korean", "hangul")):
+        language_hint = "ko-KR"
+    elif stem.startswith(("portuguese", "portugues", "português")):
+        language_hint = "pt-BR"
+    elif stem.startswith(("chinese", "mandarin")):
+        language_hint = "zh-CN"
+    if language_hint:
+        payload["language"] = language_hint
 
     for i in range(total_runs):
         t0 = time.perf_counter()
