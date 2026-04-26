@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import Foundation
 
@@ -149,7 +150,15 @@ public actor AudioPreprocessor {
         // AVAudioFile.processingFormat which is almost always float.
         if let ptrs = buffer.int16ChannelData {
             let raw = UnsafeBufferPointer(start: ptrs[0], count: frames)
-            return raw.map { Float($0) / Float(Int16.max) }
+            var output = [Float](repeating: 0, count: frames)
+            let n = vDSP_Length(frames)
+            // vDSP_vflt16: int16 → float (cast, not scaled). Then a single
+            // vDSP_vsmul scales into [-1, 1] in one SIMD pass, replacing the
+            // per-element `Float($0) / Float(Int16.max)` map.
+            vDSP_vflt16(raw.baseAddress!, 1, &output, 1, n)
+            var scale = 1.0 / Float(Int16.max)
+            vDSP_vsmul(output, 1, &scale, &output, 1, n)
+            return output
         }
         return []
     }
@@ -166,18 +175,28 @@ public actor AudioPreprocessor {
             return (samples, false)
         }
         let gainDB = loudnessTargetDBFS - rms
-        let gainLinear = Float(pow(10.0, gainDB / 20.0))
-        let out = samples.map { min(max($0 * gainLinear, -1.0), 1.0) }
+        var gainLinear = Float(pow(10.0, gainDB / 20.0))
+        var lowerBound: Float = -1.0
+        var upperBound: Float = 1.0
+        var out = [Float](repeating: 0, count: samples.count)
+        let n = vDSP_Length(samples.count)
+        // vDSP_vsmul: out = samples * gain (single SIMD pass).
+        // vDSP_vclip: in-place clip to [-1, 1]. Replaces the `samples.map
+        // { min(max(s * gain, -1), 1) }` per-element loop.
+        vDSP_vsmul(samples, 1, &gainLinear, &out, 1, n)
+        vDSP_vclip(out, 1, &lowerBound, &upperBound, &out, 1, n)
         return (out, true)
     }
 
     private static func rmsDBFS(_ samples: [Float]) -> Double {
-        var sumSquares: Double = 0
-        for s in samples {
-            let ss = Double(s)
-            sumSquares += ss * ss
-        }
-        let meanSquare = sumSquares / Double(samples.count)
+        // vDSP_svesq computes sum-of-squares in a single SIMD pass, replacing
+        // the per-element `for s in samples { sumSquares += s² }` loop. Keeps
+        // the Float accumulator — for normalized [-1, 1] PCM, even multi-minute
+        // clips stay well within Float precision for the dBFS values we read
+        // back here (we only care about ~1 dB resolution against a 12 dB band).
+        var sumSquares: Float = 0
+        vDSP_svesq(samples, 1, &sumSquares, vDSP_Length(samples.count))
+        let meanSquare = Double(sumSquares) / Double(samples.count)
         guard meanSquare > 0 else { return -.infinity }
         let rms = sqrt(meanSquare)
         return 20.0 * log10(rms)
