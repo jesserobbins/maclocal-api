@@ -121,11 +121,18 @@ public struct TranscriptionResult: Sendable {
 }
 
 /// Output of `AudioPreprocessor.prepare(...)`. The consumer drives the
-/// `SpeechAnalyzer` from `stream`; metadata fields report what the
-/// preprocessor did for observability and test assertions.
+/// `SpeechAnalyzer` from `samples` (in-memory) or `stream` (chunked async),
+/// depending on whether streaming or buffered consumption is preferred.
+/// Metadata fields report what the preprocessor did for observability and
+/// test assertions.
 public struct PreparedAudio: Sendable {
+    /// All preprocessed PCM samples in 16 kHz mono float32. The pipeline
+    /// uses these directly to build the AnalyzerInput sequence so VAD-
+    /// trimmed silence never reaches inference.
+    public let samples: [Float]
     /// Async stream of PCM buffers at 16 kHz mono float32. Completes when the
-    /// source audio is fully emitted.
+    /// source audio is fully emitted. Convenience derivative of `samples`
+    /// for callers that prefer streaming consumption.
     public let stream: AsyncStream<PCMBufferChunk>
     public let durationMs: Int
     public let sampleRate: Double
@@ -140,6 +147,7 @@ public struct PreparedAudio: Sendable {
     public let leadingTrimMs: Int
 
     public init(
+        samples: [Float] = [],
         stream: AsyncStream<PCMBufferChunk>,
         durationMs: Int,
         sampleRate: Double,
@@ -149,6 +157,7 @@ public struct PreparedAudio: Sendable {
         silenceTrimmedMs: Int = 0,
         leadingTrimMs: Int = 0
     ) {
+        self.samples = samples
         self.stream = stream
         self.durationMs = durationMs
         self.sampleRate = sampleRate

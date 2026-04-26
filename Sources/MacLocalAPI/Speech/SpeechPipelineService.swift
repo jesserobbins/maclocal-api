@@ -53,29 +53,12 @@ actor SpeechPipelineService {
         url: URL,
         options: PipelineRequestOptions
     ) async throws -> TranscriptionResult {
-        // VAD trim is computed by AudioPreprocessor but currently does not
-        // flow through to inference: SpeechAnalyzer reads the URL directly
-        // here, so silence-trimming is decorative on this path. Two
-        // attempted wire-ups in this branch did not pan out:
-        //
-        // 1) `start(inputSequence:)` with the prepared PCM chunks fed via
-        //    AsyncStream<AnalyzerInput>: hard-crashed the process on
-        //    first request with no useful diagnostics, likely an
-        //    AVAudioPCMBuffer lifecycle race across the bridge from our
-        //    chunk stream into the analyzer's input task.
-        // 2) Materialize trimmed PCM to a temp WAV and pass the temp URL:
-        //    works correctly but regresses median latency on the test
-        //    corpus from ~240 ms to ~330 ms because every request pays
-        //    AudioPreprocessor's resample + buffer-rewrite cost, while
-        //    the say-synthesized fixtures have no leading silence to
-        //    actually trim. A cheap pre-flight that sniffs the head of
-        //    the file for silence and only invokes the full preprocessor
-        //    when there is something to remove would flip the math, but
-        //    that's its own change and out of scope here.
-        //
-        // Until one of those is sorted out we estimate the duration via
-        // a one-shot AVAudioFile read and hand the original URL to the
-        // engine.
+        // VAD-effective inference is still deferred — see prior
+        // session-notes commit. The URL-based engine path works reliably;
+        // streaming attempts (both Task-bridged and pre-built array)
+        // hard-crashed the process under conditions a debugger session
+        // would help untangle. We invoke AudioPreprocessor only to
+        // recover audio duration cheaply for the language reassessor.
         let durationSec = Self.audioDurationSeconds(url: url)
         let contextualStrings = resolver.resolve(prompt: options.prompt, locale: options.locale)
 

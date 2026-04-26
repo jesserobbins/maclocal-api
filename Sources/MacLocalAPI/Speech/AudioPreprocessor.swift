@@ -61,6 +61,7 @@ public actor AudioPreprocessor {
         let stream = AudioPreprocessor.chunkedStream(samples: outSamples)
 
         return PreparedAudio(
+            samples: outSamples,
             stream: stream,
             durationMs: durationMs,
             sampleRate: AudioPreprocessor.targetSampleRate,
