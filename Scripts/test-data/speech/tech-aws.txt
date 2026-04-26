@@ -1,0 +1,1 @@
+We use SageMaker for training, DynamoDB for the session store, Lambda functions behind API Gateway, Kinesis for the event pipeline, and CloudFront with Route fifty three for the edge. ElastiCache fronts the recommendation service and Cognito handles authentication.

@@ -1,0 +1,1 @@
+PostgreSQL stores rows in heap pages and uses B-tree indexes for primary key lookups. ACID transactions guarantee atomicity through write ahead logging. The query planner picks between sequential scans, index scans, and bitmap heap scans based on selectivity estimates from the statistics collector.

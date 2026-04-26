@@ -783,6 +783,175 @@ generate_speech_corpus() {
   else
     skip "fast-speech.wav"
   fi
+
+  # Helper: synth a 16 kHz mono WAV from a text file under $SPEECH_DIR.
+  # Usage: synth_say <basename> [voice] [rate]
+  synth_say() {
+    local base="$1"
+    local voice="${2:-}"
+    local rate="${3:-180}"
+    local text_file="$SPEECH_DIR/$base.txt"
+    local aiff="$SPEECH_DIR/$base.aiff"
+    local wav="$SPEECH_DIR/$base.wav"
+    if [[ ! -f "$text_file" ]]; then
+      warn "Missing ground-truth text for $base — skipping"
+      return 1
+    fi
+    if [[ -n "$voice" ]] && say -v "$voice" "" 2>/dev/null; then
+      say -v "$voice" -r "$rate" -f "$text_file" -o "$aiff"
+    else
+      say -r "$rate" -f "$text_file" -o "$aiff"
+    fi
+    if has_cmd afconvert; then
+      afconvert "$aiff" "$wav" -d LEI16@16000 -f WAVE -c 1
+      rm -f "$aiff"
+    else
+      mv "$aiff" "$wav"
+    fi
+  }
+
+  # ─── tech-aws.wav ─────────────────────────────────────────────────────────
+  # Domain English: AWS service names. Target for the strict-win Gate B
+  # subset (SageMaker, DynamoDB, Lambda etc — exactly the kind of vocab the
+  # bundled contextualStrings list is supposed to recover).
+  if should_generate "$SPEECH_DIR/tech-aws.wav"; then
+    info "Generating tech-aws.wav (macOS say, AWS service names)"
+    synth_say "tech-aws" "Samantha" 180 && ok "tech-aws.wav" || warn "tech-aws.wav skipped"
+  else
+    skip "tech-aws.wav"
+  fi
+
+  # ─── tech-rust.wav ────────────────────────────────────────────────────────
+  if should_generate "$SPEECH_DIR/tech-rust.wav"; then
+    info "Generating tech-rust.wav (macOS say, Rust language terms)"
+    synth_say "tech-rust" "Samantha" 180 && ok "tech-rust.wav" || warn "tech-rust.wav skipped"
+  else
+    skip "tech-rust.wav"
+  fi
+
+  # ─── tech-database.wav ────────────────────────────────────────────────────
+  if should_generate "$SPEECH_DIR/tech-database.wav"; then
+    info "Generating tech-database.wav (macOS say, PostgreSQL/SQL terms)"
+    synth_say "tech-database" "Samantha" 180 && ok "tech-database.wav" || warn "tech-database.wav skipped"
+  else
+    skip "tech-database.wav"
+  fi
+
+  # ─── tech-frontend.wav ────────────────────────────────────────────────────
+  if should_generate "$SPEECH_DIR/tech-frontend.wav"; then
+    info "Generating tech-frontend.wav (macOS say, React/JS/CSS terms)"
+    synth_say "tech-frontend" "Samantha" 180 && ok "tech-frontend.wav" || warn "tech-frontend.wav skipped"
+  else
+    skip "tech-frontend.wav"
+  fi
+
+  # ─── meeting-multi.wav ────────────────────────────────────────────────────
+  # Two voices stitched together to simulate a meeting handoff. Not a true
+  # diarization test (we have one ground-truth string), but exercises the
+  # transcriber's speaker-change resilience.
+  if should_generate "$SPEECH_DIR/meeting-multi.wav"; then
+    info "Generating meeting-multi.wav (two voices stitched)"
+    local part_a="$SPEECH_DIR/_meeting-a.aiff"
+    local part_b="$SPEECH_DIR/_meeting-b.aiff"
+    say -v "Samantha" -r 175 -o "$part_a" \
+      "Good morning everyone. Let us start with the engineering update. The platform team finished the migration last week and we are seeing a thirty percent reduction in tail latency."
+    if say -v "Daniel" "" 2>/dev/null; then
+      say -v "Daniel" -r 175 -o "$part_b" \
+        "The product side has three new features rolling out this sprint and we want to align on prioritization for the next planning cycle."
+    else
+      say -r 175 -o "$part_b" \
+        "The product side has three new features rolling out this sprint and we want to align on prioritization for the next planning cycle."
+    fi
+    if has_cmd afconvert && has_cmd ffmpeg; then
+      local part_a_wav="$SPEECH_DIR/_meeting-a.wav"
+      local part_b_wav="$SPEECH_DIR/_meeting-b.wav"
+      afconvert "$part_a" "$part_a_wav" -d LEI16@16000 -f WAVE -c 1 >/dev/null 2>&1
+      afconvert "$part_b" "$part_b_wav" -d LEI16@16000 -f WAVE -c 1 >/dev/null 2>&1
+      # ffmpeg's `concat:` protocol naively appends bytes — for WAV that
+      # leaves the first file's header in place and ffprobe only reports the
+      # duration of the leading chunk. Use the concat filter (re-encode) so
+      # both parts land in a single stream with a correct header.
+      ffmpeg -y -i "$part_a_wav" -i "$part_b_wav" \
+        -filter_complex "[0:0][1:0]concat=n=2:v=0:a=1[out]" \
+        -map "[out]" -ac 1 -ar 16000 -c:a pcm_s16le \
+        "$SPEECH_DIR/meeting-multi.wav" >/dev/null 2>&1
+      rm -f "$part_a" "$part_b" "$part_a_wav" "$part_b_wav"
+      ok "meeting-multi.wav"
+    else
+      warn "meeting-multi.wav requires afconvert + ffmpeg — skipping"
+      rm -f "$part_a" "$part_b"
+    fi
+  else
+    skip "meeting-multi.wav"
+  fi
+
+  # ─── noisy-cafe.wav ───────────────────────────────────────────────────────
+  # Speech mixed with synthesized babble (multiple sine bands) to simulate a
+  # cafe ambient. Not a perfect babble model — it's a deterministic, no-
+  # network-required approximation that the benchmark can replay anywhere.
+  if should_generate "$SPEECH_DIR/noisy-cafe.wav"; then
+    if has_cmd ffmpeg; then
+      info "Generating noisy-cafe.wav (clean speech + synthetic babble)"
+      local clean="$SPEECH_DIR/_noisy-cafe-clean.wav"
+      synth_say "noisy-cafe" "Samantha" 180
+      mv "$SPEECH_DIR/noisy-cafe.wav" "$clean" 2>/dev/null || true
+      ffmpeg -y -i "$clean" \
+        -f lavfi -i "anoisesrc=color=brown:duration=15:sample_rate=16000:amplitude=0.05" \
+        -filter_complex "[0:a]volume=1.0[a0];[1:a]volume=0.4[a1];[a0][a1]amix=inputs=2:duration=first[out]" \
+        -map "[out]" -ac 1 -ar 16000 -c:a pcm_s16le "$SPEECH_DIR/noisy-cafe.wav" >/dev/null 2>&1
+      rm -f "$clean"
+      ok "noisy-cafe.wav"
+    else
+      warn "noisy-cafe.wav requires ffmpeg — skipping"
+    fi
+  else
+    skip "noisy-cafe.wav"
+  fi
+
+  # ─── speech-over-music.wav ────────────────────────────────────────────────
+  # Speech mixed with a tonal background (sine sweep) to approximate music
+  # interference. Lower-amplitude than noisy-cafe so this is more "podcast
+  # intro music under a host" than "trying to talk over a band".
+  if should_generate "$SPEECH_DIR/speech-over-music.wav"; then
+    if has_cmd ffmpeg; then
+      info "Generating speech-over-music.wav (clean speech + sine sweep)"
+      local clean="$SPEECH_DIR/_speech-music-clean.wav"
+      synth_say "speech-over-music" "Samantha" 180
+      mv "$SPEECH_DIR/speech-over-music.wav" "$clean" 2>/dev/null || true
+      ffmpeg -y -i "$clean" \
+        -f lavfi -i "sine=frequency=220:duration=15:sample_rate=16000" \
+        -f lavfi -i "sine=frequency=330:duration=15:sample_rate=16000" \
+        -filter_complex "[1:a][2:a]amix=inputs=2[bg];[bg]volume=0.15[bg2];[0:a][bg2]amix=inputs=2:duration=first[out]" \
+        -map "[out]" -ac 1 -ar 16000 -c:a pcm_s16le "$SPEECH_DIR/speech-over-music.wav" >/dev/null 2>&1
+      rm -f "$clean"
+      ok "speech-over-music.wav"
+    else
+      warn "speech-over-music.wav requires ffmpeg — skipping"
+    fi
+  else
+    skip "speech-over-music.wav"
+  fi
+
+  # ─── quiet-whisper.wav ────────────────────────────────────────────────────
+  # Speech attenuated to ~-40 dBFS — well below the AudioPreprocessor's
+  # acceptable loudness band, so this case exercises both the recognizer and
+  # the loudness-normalize path. Ground truth stays the same.
+  if should_generate "$SPEECH_DIR/quiet-whisper.wav"; then
+    if has_cmd ffmpeg; then
+      info "Generating quiet-whisper.wav (low-amplitude speech)"
+      local clean="$SPEECH_DIR/_quiet-clean.wav"
+      synth_say "quiet-whisper" "Samantha" 180
+      mv "$SPEECH_DIR/quiet-whisper.wav" "$clean" 2>/dev/null || true
+      ffmpeg -y -i "$clean" -af "volume=0.08" -ac 1 -ar 16000 \
+        -c:a pcm_s16le "$SPEECH_DIR/quiet-whisper.wav" >/dev/null 2>&1
+      rm -f "$clean"
+      ok "quiet-whisper.wav"
+    else
+      warn "quiet-whisper.wav requires ffmpeg — skipping"
+    fi
+  else
+    skip "quiet-whisper.wav"
+  fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -822,6 +991,14 @@ verify_corpus() {
     "accented-british.wav"
     "phone-call.wav"
     "fast-speech.wav"
+    "tech-aws.wav"
+    "tech-rust.wav"
+    "tech-database.wav"
+    "tech-frontend.wav"
+    "meeting-multi.wav"
+    "noisy-cafe.wav"
+    "speech-over-music.wav"
+    "quiet-whisper.wav"
   )
 
   local vision_present=0

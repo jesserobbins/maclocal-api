@@ -1,0 +1,1 @@
+The borrow checker enforces ownership rules at compile time so you avoid use after free and data races without a garbage collector. Lifetimes annotate references, the trait system handles polymorphism, and async functions return futures that the tokio runtime drives to completion.

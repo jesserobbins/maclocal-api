@@ -61,6 +61,14 @@ CLEAN_SPEECH_FILES = {"short-5s", "numbers-dates", "technical-terms",
 ACCENTED_SPEECH_FILES = {"accented-british", "accented-indian"}
 NOISY_SPEECH_FILES = {"noisy-cafe", "phone-call", "speech-over-music",
                       "quiet-whisper", "meeting-multi"}
+# Domain/technical English — Gate B (strict-win) subset. Cases where the
+# bundled contextualStrings vocab is expected to recover terms whisper
+# transcribes phonetically (e.g., "Huber needs orchestrates" → "Kubernetes
+# orchestrates"). technical-terms is also in CLEAN_SPEECH_FILES because it
+# cleanly represents both "clean recording" and "domain vocabulary"; the
+# overlap is intentional so per-category aggregations stay straightforward.
+TECHNICAL_SPEECH_FILES = {"technical-terms", "tech-aws", "tech-rust",
+                          "tech-database", "tech-frontend"}
 
 SCRIPT_DIR = Path(__file__).parent
 VISION_DIR = SCRIPT_DIR / "test-data" / "vision"

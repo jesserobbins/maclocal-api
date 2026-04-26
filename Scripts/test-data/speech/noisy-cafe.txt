@@ -1,0 +1,1 @@
+I think we should ship the v two release before the end of the quarter. The remaining work is mostly testing and the migration scripts.

@@ -1,0 +1,1 @@
+Good morning everyone. Let us start with the engineering update. The platform team finished the migration last week and we are seeing a thirty percent reduction in tail latency. The product side has three new features rolling out this sprint and we want to align on prioritization for the next planning cycle.

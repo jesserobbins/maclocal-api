@@ -1,0 +1,1 @@
+React renders components into a virtual DOM and reconciles changes against the real DOM on each update. Hooks like useState and useEffect manage state and side effects in functional components. Tailwind utility classes replace traditional CSS, and code splitting with dynamic imports keeps the initial bundle small.

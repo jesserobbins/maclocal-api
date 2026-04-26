@@ -1,0 +1,1 @@
+Welcome back to the show. Today we are going to talk about how distributed systems handle clock skew between nodes and why it matters for consensus.
