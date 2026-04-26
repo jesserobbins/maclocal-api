@@ -16,20 +16,29 @@ extension SpeechService: SpeechServing {}
 struct SpeechAPIController: RouteCollection {
     private let makeSpeechService: () -> any SpeechServing
 
-    init(makeSpeechService: @escaping () -> any SpeechServing = {
-        // Attach the bundled ContextualVocabResolver so the legacy
-        // SFSpeechRecognizer path picks up bundled/env/project vocab on every
-        // HTTP transcription request. try? fallback → nil resolver if the
-        // bundled file is missing (misconfigured build); preserves legacy
-        // behavior instead of failing the request per-call.
-        if #available(macOS 13.0, *) {
-            let resolver = try? ContextualVocabResolver()
-            return SpeechService(contextualVocabResolver: resolver)
-        } else {
-            return SpeechService()
-        }
-    }) {
+    init(makeSpeechService: @escaping () -> any SpeechServing = SpeechAPIController.defaultMakeSpeechService) {
         self.makeSpeechService = makeSpeechService
+    }
+
+    /// Default factory: route HTTP transcription through the macOS 26
+    /// `SpeechAnalyzer` pipeline via `PipelineSpeechService`. The pipeline's
+    /// `AnalysisContext.contextualStrings` honors the bundled vocab list more
+    /// strongly than `SFSpeechURLRecognitionRequest.contextualStrings` did
+    /// on the legacy path — that's the change that's expected to close the
+    /// Gate B (technical-English) WER gap against whisper-cpp.
+    ///
+    /// A single `PipelineSpeechService` instance is shared across requests
+    /// so the underlying transcriber pool stays warm between calls. The
+    /// service constructs its pipeline lazily on first use.
+    private static let sharedPipelineService: any SpeechServing = {
+        if #available(macOS 13.0, *) {
+            return PipelineSpeechService()
+        }
+        return SpeechService()
+    }()
+
+    private static func defaultMakeSpeechService() -> any SpeechServing {
+        return sharedPipelineService
     }
 
     func boot(routes: RoutesBuilder) throws {

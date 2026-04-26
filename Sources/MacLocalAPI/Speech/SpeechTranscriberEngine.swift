@@ -45,10 +45,15 @@ actor SpeechTranscriberEngine {
 
         // Consumer runs concurrently with start(). When the analyzer reaches
         // end-of-file with finishAfterFile:true, the results sequence
-        // terminates naturally.
+        // terminates naturally. The progressive presets emit volatile
+        // partial results before each segment finalizes — we drop those
+        // here and keep only `isFinal == true`. Without the filter the
+        // assembled output concatenates every prefix-snapshot of the
+        // running transcription ("H Hub Hubern Hubernates orchestrates...")
+        // because each partial is appended as its own segment.
         let resultsTask = Task<[SpeechTranscriber.Result], Error> {
             var collected: [SpeechTranscriber.Result] = []
-            for try await r in transcriber.results {
+            for try await r in transcriber.results where r.isFinal {
                 collected.append(r)
             }
             return collected
