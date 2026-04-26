@@ -30,11 +30,25 @@ actor SpeechTranscriberEngine {
         let sampleRate = audioFile.processingFormat.sampleRate
         let durationSec = sampleRate > 0 ? Double(audioFile.length) / sampleRate : 0.0
 
-        // Choose a preset that exposes time + confidence attributes.
-        let preset: SpeechTranscriber.Preset = wantWordTimings
-            ? .timeIndexedProgressiveTranscription
-            : .progressiveTranscription
-        let transcriber = SpeechTranscriber(locale: locale, preset: preset)
+        // Construct the transcriber with explicit options instead of the
+        // built-in presets. The presets that include time-indexing also
+        // bundle `volatileResults` (streaming partials) and don't include
+        // `transcriptionConfidence`. We want the opposite — finalized
+        // results only, with both per-run audioTimeRange and confidence
+        // attributes populated so verbose_json word entries report real
+        // confidence numbers instead of constant 0.0. `audioTimeRange` is
+        // requested unconditionally so segment-level timings always work
+        // even when callers didn't ask for word-granularity output.
+        let transcriber = SpeechTranscriber(
+            locale: locale,
+            transcriptionOptions: [],
+            reportingOptions: [],
+            attributeOptions: [.audioTimeRange, .transcriptionConfidence]
+        )
+        // wantWordTimings is now a controller-level concern (whether to
+        // surface words[] in verbose_json); the underlying transcriber
+        // collects timings either way at negligible cost.
+        _ = wantWordTimings
 
         // Bias via AnalysisContext.contextualStrings under the general tag.
         let context = AnalysisContext()

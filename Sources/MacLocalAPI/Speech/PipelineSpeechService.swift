@@ -64,10 +64,28 @@ final class PipelineSpeechService: SpeechServing, RichSpeechServing, @unchecked 
             // on requests that explicitly asked for, say, es-ES.
             callerSuppliedLocale: options.locale != "en-US"
         )
-        return try await pipeline.transcribe(
-            url: URL(fileURLWithPath: filePath),
-            options: pipelineOptions
-        )
+        do {
+            return try await pipeline.transcribe(
+                url: URL(fileURLWithPath: filePath),
+                options: pipelineOptions
+            )
+        } catch let speechError as SpeechError {
+            // Errors that already match our taxonomy pass through unchanged.
+            throw speechError
+        } catch let nsError as NSError {
+            // SpeechAnalyzer / SpeechTranscriber surface a couple of
+            // non-Swift errors as plain NSError on the SFSpeechErrorDomain
+            // (e.g. "Audio format is not supported" when the configured
+            // locale's recognition model isn't installed, even though the
+            // PCM format itself is valid). Without translation those land
+            // in Vapor's default error middleware as a generic 500
+            // "Something went wrong"; map them into SpeechError so the
+            // controller's status mapping returns 422 with a usable
+            // message instead.
+            throw SpeechError.recognitionFailed(
+                "\(nsError.localizedDescription) (locale: \(options.locale))"
+            )
+        }
     }
 
     // MARK: - Pipeline cache
