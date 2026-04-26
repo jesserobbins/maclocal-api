@@ -20,6 +20,11 @@ actor SpeechTranscriberEngine {
 
     init() {}
 
+    /// Transcribe directly from an audio file URL. The analyzer reads the
+    /// file itself, so anything `AudioPreprocessor.prepare()` did (loudness
+    /// normalize, VAD trim) is bypassed on this path. Kept for callers
+    /// that don't go through the pipeline (tests, CLI), and as the
+    /// fallback when the streaming path can't represent the input.
     func transcribe(
         url: URL,
         locale: Locale,

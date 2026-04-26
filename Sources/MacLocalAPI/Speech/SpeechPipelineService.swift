@@ -53,26 +53,38 @@ actor SpeechPipelineService {
         url: URL,
         options: PipelineRequestOptions
     ) async throws -> TranscriptionResult {
-        // 1. Preprocess (we currently don't forward the streamed buffer into
-        //    the engine; the engine opens the file directly and handles its
-        //    own format matching. Preprocessing here is currently a no-op
-        //    shape-preserving step until the engine learns to consume the
-        //    streamed PCM buffer path in a follow-up. Duration is still
-        //    useful for the reassessor.).
-        let prepared = try await preprocessor.prepare(url: url)
-        let durationSec = Double(prepared.durationMs) / 1000.0
-
-        // 2. Resolve contextual strings.
+        // VAD trim is computed by AudioPreprocessor but currently does not
+        // flow through to inference: SpeechAnalyzer reads the URL directly
+        // here, so silence-trimming is decorative on this path. Two
+        // attempted wire-ups in this branch did not pan out:
+        //
+        // 1) `start(inputSequence:)` with the prepared PCM chunks fed via
+        //    AsyncStream<AnalyzerInput>: hard-crashed the process on
+        //    first request with no useful diagnostics, likely an
+        //    AVAudioPCMBuffer lifecycle race across the bridge from our
+        //    chunk stream into the analyzer's input task.
+        // 2) Materialize trimmed PCM to a temp WAV and pass the temp URL:
+        //    works correctly but regresses median latency on the test
+        //    corpus from ~240 ms to ~330 ms because every request pays
+        //    AudioPreprocessor's resample + buffer-rewrite cost, while
+        //    the say-synthesized fixtures have no leading silence to
+        //    actually trim. A cheap pre-flight that sniffs the head of
+        //    the file for silence and only invokes the full preprocessor
+        //    when there is something to remove would flip the math, but
+        //    that's its own change and out of scope here.
+        //
+        // Until one of those is sorted out we estimate the duration via
+        // a one-shot AVAudioFile read and hand the original URL to the
+        // engine.
+        let durationSec = Self.audioDurationSeconds(url: url)
         let contextualStrings = resolver.resolve(prompt: options.prompt, locale: options.locale)
 
-        // 3. Check out engine for the primary locale.
         let primaryLocale = Locale(identifier: options.locale)
         let engine = await pool.checkout(
             locale: primaryLocale,
             featureSet: .init(wantWordTimings: options.wantWordTimings)
         )
 
-        // 4. First-pass transcription.
         let firstPass = try await engine.transcribe(
             url: url,
             locale: primaryLocale,
@@ -80,7 +92,6 @@ actor SpeechPipelineService {
             wantWordTimings: options.wantWordTimings
         )
 
-        // 5. Reassess — should we retry under a different locale?
         var finalAttempt = firstPass
         var languageReassessed = false
         var finalLocaleIdentifier = options.locale
@@ -94,10 +105,6 @@ actor SpeechPipelineService {
                 locale: retryLocale,
                 featureSet: .init(wantWordTimings: options.wantWordTimings)
             )
-            // For the retry we re-resolve vocab against the new locale.
-            // Currently the resolver is locale-agnostic, so this just returns
-            // the same strings — but the hook is in place for future
-            // locale-specific vocab bundles.
             let retryVocab = resolver.resolve(prompt: options.prompt, locale: retryLocale.identifier)
             let retryAttempt = try await retryEngine.transcribe(
                 url: url,
@@ -110,7 +117,6 @@ actor SpeechPipelineService {
             finalLocaleIdentifier = retryLocale.identifier
         }
 
-        // 6. Package result for the HTTP response.
         return TranscriptionResult(
             text: finalAttempt.text,
             language: finalLocaleIdentifier,
@@ -119,6 +125,12 @@ actor SpeechPipelineService {
             words: finalAttempt.words.isEmpty ? nil : finalAttempt.words,
             languageReassessed: languageReassessed
         )
+    }
+
+    private static func audioDurationSeconds(url: URL) -> Double {
+        guard let file = try? AVAudioFile(forReading: url) else { return 0 }
+        let rate = file.processingFormat.sampleRate
+        return rate > 0 ? Double(file.length) / rate : 0
     }
 }
 
