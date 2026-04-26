@@ -57,10 +57,17 @@ DEGRADED_FILES = {"low-quality-scan", "rotated-scan", "handwritten-note",
                   "whiteboard-notes"}
 
 CLEAN_SPEECH_FILES = {"short-5s", "numbers-dates", "technical-terms",
-                      "clean-narration", "long-narration"}
+                      "clean-narration", "long-narration",
+                      # whisper.cpp + OpenAI whisper canonical samples
+                      # (clean recordings of public speeches / commercials).
+                      "whisper-jfk", "whisper-mm1",
+                      "whisper-gb0", "whisper-gb1", "whisper-hp0"}
 ACCENTED_SPEECH_FILES = {"accented-british", "accented-indian"}
 NOISY_SPEECH_FILES = {"noisy-cafe", "phone-call", "speech-over-music",
-                      "quiet-whisper", "meeting-multi"}
+                      "quiet-whisper", "meeting-multi",
+                      # NASA radio chatter — band-limited, multi-speaker,
+                      # technical jargon, real-world degradations.
+                      "whisper-a13"}
 # Domain/technical English — Gate B (strict-win) subset. Cases where the
 # bundled contextualStrings vocab is expected to recover terms whisper
 # transcribes phonetically (e.g., "Huber needs orchestrates" → "Kubernetes
