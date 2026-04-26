@@ -65,12 +65,18 @@ struct SpeechAPIController: RouteCollection {
             let file: String?
             let data: String?
             let format: String?
+            // OpenAI-compatible field name is `language`; accept `locale` as
+            // an alias for callers that already speak our older shape.
+            let language: String?
             let locale: String?
+            // OpenAI-compatible per-request vocabulary hint. Merged with the
+            // bundled / env / project contextual vocab by the resolver.
+            let prompt: String?
         }
 
         let body = try req.content.decode(TranscriptionRequest.self)
-        let locale = body.locale ?? "en-US"
-        let options = SpeechRequestOptions(locale: locale)
+        let locale = body.language ?? body.locale ?? "en-US"
+        let options = SpeechRequestOptions(locale: locale, prompt: body.prompt)
         let service = makeSpeechService()
         var cleanupURLs: [URL] = []
 
