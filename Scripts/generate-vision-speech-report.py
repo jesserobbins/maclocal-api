@@ -174,7 +174,14 @@ def _detail_row_speech(r: dict, row_id: str, audio_root: Path) -> str:
     wer = r.get("afm_wer")
     threshold = r.get("wer_threshold")
     passed = r.get("pass")
-    if passed:
+    if wer is None:
+        # No ground-truth file → speed-only case. The benchmark auto-passes
+        # these (pass=True with wer=None); state that plainly so the
+        # detail panel doesn't pretend a WER score exists.
+        verdict = ('<div class="verdict pass">SPEED-ONLY — no ground-truth file shipped for this'
+                   ' fixture. Latency and competitor comparison are still meaningful; WER score'
+                   ' is omitted because we have nothing to grade against.</div>')
+    elif passed:
         verdict = (f'<div class="verdict pass">PASS — WER {wer:.3f} ≤ threshold {threshold:.2f}'
                    f' (computed against normalized text below).</div>')
     else:
