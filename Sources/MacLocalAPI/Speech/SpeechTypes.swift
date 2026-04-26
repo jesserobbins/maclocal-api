@@ -131,19 +131,32 @@ public struct PreparedAudio: Sendable {
     public let sampleRate: Double
     public let wasResampled: Bool
     public let wasLoudnessNormalized: Bool
+    public let wasSilenceTrimmed: Bool
+    /// Total silence (ms) removed from leading + trailing. Zero when no trim
+    /// happened. Used by callers to translate word/segment timings emitted by
+    /// `SpeechAnalyzer` (which sees the trimmed audio) back to the original
+    /// timeline by adding `leadingTrimMs` to every timestamp.
+    public let silenceTrimmedMs: Int
+    public let leadingTrimMs: Int
 
     public init(
         stream: AsyncStream<PCMBufferChunk>,
         durationMs: Int,
         sampleRate: Double,
         wasResampled: Bool,
-        wasLoudnessNormalized: Bool
+        wasLoudnessNormalized: Bool,
+        wasSilenceTrimmed: Bool = false,
+        silenceTrimmedMs: Int = 0,
+        leadingTrimMs: Int = 0
     ) {
         self.stream = stream
         self.durationMs = durationMs
         self.sampleRate = sampleRate
         self.wasResampled = wasResampled
         self.wasLoudnessNormalized = wasLoudnessNormalized
+        self.wasSilenceTrimmed = wasSilenceTrimmed
+        self.silenceTrimmedMs = silenceTrimmedMs
+        self.leadingTrimMs = leadingTrimMs
     }
 }
 

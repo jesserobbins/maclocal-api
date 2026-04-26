@@ -47,17 +47,33 @@ public actor AudioPreprocessor {
         }
 
         let (normalizedSamples, didNormalize) = AudioPreprocessor.loudnessNormalizeIfNeeded(samples)
-        let durationMs = Int((Double(normalizedSamples.count) / AudioPreprocessor.targetSampleRate) * 1000.0)
 
-        let stream = AudioPreprocessor.chunkedStream(samples: normalizedSamples)
+        // VAD runs after loudness normalization so its peak/threshold logic
+        // operates on the same level the transcriber will see. Trim is
+        // leading/trailing only: callers translate word timings back to the
+        // original timeline by adding `leadingTrimMs`.
+        let trim = VoiceActivityTrimmer.trim(normalizedSamples)
+        let outSamples = trim.samples
+        let durationMs = Int((Double(outSamples.count) / AudioPreprocessor.targetSampleRate) * 1000.0)
+        let leadingTrimMs = AudioPreprocessor.samplesToMs(trim.leadingTrimmedSamples)
+        let trailingTrimMs = AudioPreprocessor.samplesToMs(trim.trailingTrimmedSamples)
+
+        let stream = AudioPreprocessor.chunkedStream(samples: outSamples)
 
         return PreparedAudio(
             stream: stream,
             durationMs: durationMs,
             sampleRate: AudioPreprocessor.targetSampleRate,
             wasResampled: needsResample,
-            wasLoudnessNormalized: didNormalize
+            wasLoudnessNormalized: didNormalize,
+            wasSilenceTrimmed: trim.didTrim,
+            silenceTrimmedMs: leadingTrimMs + trailingTrimMs,
+            leadingTrimMs: leadingTrimMs
         )
+    }
+
+    private static func samplesToMs(_ samples: Int) -> Int {
+        return Int((Double(samples) / targetSampleRate) * 1000.0)
     }
 
     // MARK: - Format inspection
