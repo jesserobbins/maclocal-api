@@ -1235,7 +1235,13 @@ struct RootCommand: ParsableCommand {
         GitHub: https://github.com/scouzi1966/maclocal-api
         """,
         version: MacLocalAPI.buildVersion,
-        subcommands: [MlxCommand.self, VisionCommand.self, SpeechCommand.self]
+        subcommands: {
+            var subs: [ParsableCommand.Type] = [MlxCommand.self, VisionCommand.self, SpeechCommand.self]
+            if #available(macOS 26.0, *) {
+                subs.append(SpeechCustomLMTestCommand.self)
+            }
+            return subs
+        }()
     )
 
     @Option(name: [.customShort("s"), .long], help: "Run a single prompt without starting the server")
