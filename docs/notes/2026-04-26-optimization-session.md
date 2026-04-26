@@ -347,6 +347,86 @@ synthetic corpus didn't (250-wpm ad-copy pace, band-limited 8 kHz
 multi-speaker radio comm), giving the next round of accuracy work
 specific real-world targets to attack.
 
+### Streaming engine — second attempt also crashed
+
+Tried again with a simpler structure: pre-build all `AnalyzerInput`
+objects up front into an `[AnalyzerInput]` array and have the
+`AsyncStream` consume that array synchronously, eliminating the
+inner producer Task that was the suspected bridge in the first
+attempt. Same hard-crash symptom on first request — empty reply,
+process gone, no useful diagnostics. Whatever the
+`AVAudioPCMBuffer` lifecycle issue is, it's not just the inner-Task
+bridging. Needs a debugger session to root-cause; reverted to the
+URL-based engine path that works reliably and ships the 21/24 PASS
+state we have.
+
+`PreparedAudio` retains a new `samples: [Float]` field (default
+empty, no current consumer) so the next streaming attempt won't
+need to re-touch the type.
+
+### Custom language model spike — also negative
+
+Stood up `CustomLanguageModelManager` plus an
+`afm speech-custom-lm-test` CLI subcommand to exercise
+`DictationTranscriber + SFCustomLanguageModelData` end-to-end on a
+single file. The training data injects high-count phrase entries for
+the stubborn product names (Kubernetes, PostgreSQL, ElastiCache,
+useState, tokio, B-tree, ...) at count=100 each.
+
+Compile path works on this machine in ~950 ms first run, cached on
+subsequent runs. But the actual transcription on `tech-database.wav`
+came back worse than baseline:
+
+```
+Baseline:    "PostGerSQL stores rose in heat pages and uses
+              BTree indexes for primary kilocops…"
+Dict+CLM:    "Poster SL stores Rosenheath pages and uses
+              B tree indexes for primary kilo cops…"
+```
+
+Apple's `DictationTranscriber` is more aggressively word-splitting on
+this audio (`PostgreSQL` → `Poster SL`, `atomicity` → `that is it`,
+`kilocops` → `kilo cops`) and the CLM-injected phrases are not being
+recovered at count=100. The bundled-vocab saturation we already
+documented isn't just a per-list-size limit — it's a deeper bias
+ceiling on Apple's models for phonetically-distant product names.
+
+Spike code stays in the tree (it took ~250 lines and documents what
+was tried). Real follow-ups for a future session if anyone wants to
+take another swing:
+
+- Much higher phrase counts (1000+, 10000+)
+- Templated context via `TemplatePhraseCountGenerator` so the LM
+  sees grammatical context around target phrases instead of raw
+  phrase counts
+- `CustomPronunciation` entries with explicit phonemes for the
+  worst offenders
+- Different `ContentHint` and `Preset` combinations
+- Or accept the ceiling and route tech-domain audio through a
+  fundamentally different transcriber backend (whisper itself, an
+  on-device fine-tune, etc.)
+
+The honest takeaway: AFM speech accuracy past this point isn't a
+"tune the bias list" problem; it's "Apple's model class has a
+ceiling on technical English that contextualStrings + CLM together
+don't move." Closing that ceiling requires a different model.
+
+### Final state at second close
+
+| | corpus | speech | speedup vs whisper |
+|---|---|---|---|
+| Pre-session baseline | 18 synthetic | 5/18 raw → 12/18 normalized | 1.4× |
+| End of pipeline-wireup | 18 synthetic | 16/18 | 2.2× |
+| + locale auto-install | 18 synthetic | 17/18 | 2.6× |
+| + whisper.cpp's own samples | **24** (18 synth + 6 fetched) | **21/24** | per-case 0.7× – 4.3× |
+
+Three remaining FAILs (`tech-database`, `whisper-mm1`, `whisper-a13`)
+are now bounded: each represents either a real-world stress case the
+synthetic corpus didn't expose (mm1 250-wpm ad copy, a13 8 kHz
+band-limited multi-speaker radio chatter) or the documented Apple-
+model ceiling on technical English (tech-database, where neither
+contextualStrings nor SFCustomLanguageModelData moved the needle).
+
 ---
 
 ## Insights worth remembering
