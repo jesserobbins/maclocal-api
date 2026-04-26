@@ -166,10 +166,113 @@ upstream-speech-tts
 
 ---
 
+---
+
+## Follow-up session — controller polish + verbose_json + vocab ceiling
+
+After the initial pipeline wire-up landed, a follow-up branch
+(`perf/speech-controller-followups`) stacked seven smaller commits to
+close out the controller-side work and pin down where the next bigger
+levers sit.
+
+### What landed
+
+| commit | what it did | observable change |
+|---|---|---|
+| `518fbc6` | Accept OpenAI `prompt` + `language` body fields | Per-request vocab works; `language` aliases `locale` for OpenAI clients |
+| `61bd1a5` | `response_format` dispatch (`text` / `json` / `verbose_json`) | Word + segment timings + `language_reassessed` exposed in HTTP responses |
+| `259f044` | Server-warmup the SpeechAnalyzer pool on `Server.configure()` | First request no longer pays pool init + bundled-vocab read inline |
+| `7a35b35` | Real `transcriptionConfidence` in word entries + map opaque NSErrors to 422 | Word `confidence` now ranges 0.79–0.99 instead of constant 0.0; `spanish-speech` returns a usable 422 instead of a generic 500 |
+| `c9d72ce` | Per-test click-through detail rows in benchmark HTML report | Each row in the speech and vision tables expands to show audio player, ground truth, AFM/Whisper raw + normalized text, per-word diff (sub/ins/del coloring), and a verdict box explaining the WER vs threshold relationship |
+| `024c54a` | +90 Gate B vocab entries (AWS / React / Rust / SQL) | **No measurable WER change** — confirms the bias-saturation ceiling on `contextualStrings` |
+
+### Engine-level fix worth calling out
+
+`SpeechTranscriberEngine` was previously instantiated with the
+`progressiveTranscription` / `timeIndexedProgressiveTranscription`
+presets. Two problems with that:
+
+1. The progressive presets bundle `volatileResults` (streaming
+   partials), so the result stream emits prefix-snapshots before each
+   segment finalizes. We were already filtering `r.isFinal` to drop
+   them, but that's wasted compute on a path that never reaches the
+   client.
+2. Neither preset includes `transcriptionConfidence` in its
+   attribute set, so every word entry's `confidence` came back as
+   the default 0.0.
+
+Replaced the preset constructor with the explicit-options form:
+`reportingOptions: []`, `attributeOptions: [.audioTimeRange,
+.transcriptionConfidence]`. Now the transcriber returns finalized
+results only with both timing and confidence attributes populated.
+
+### Bias-saturation finding
+
+Adding 90 specifically-misheard terms to the bundled vocab
+(`SageMaker`, `ElastiCache`, `Cognito`, `useState`, `tokio`, `B-tree`,
+... — all observed in benchmark transcripts) produced **byte-identical
+output** to the prior run on every Gate B case. ElastiCache stays
+misheard as "Elasti cash"; Cognito stays "incognito"; PostgreSQL stays
+"PostGerSQL". The `AnalysisContext.contextualStrings` bias is real
+(it's the reason "SageMaker" landed correctly, vs the legacy
+`SFSpeechRecognizer` path's "Sage maker") but it has a ceiling:
+beyond a few hundred entries, adding more dilutes per-entry weight,
+and there are specific phonetic gaps it can't bridge regardless of
+list size.
+
+This was the bound the design spec named upfront — closing it
+requires `SFCustomLanguageModelData.customizedLanguage`, which on
+macOS 26 is bound to `DictationTranscriber` (not `SpeechTranscriber`).
+That path is a separate engine implementation ("~1 day" per spec) and
+deferred from this session.
+
+### Click-through report
+
+Every test row in the HTML report at
+`Scripts/benchmark-results/vision-speech-*-report.html` is now
+expandable. For a passing case the panel shows that the WER score
+came from formatting differences the normalizer already absorbed
+(`12%` ↔ `twelve percent`, `year-over-year` ↔ `year over year`); for
+a failing case it surfaces the actual misheard tokens with inline
+substitution markers. `tech-database` becomes obvious at a glance:
+
+```
+GT:        PostgreSQL stores rows in heap pages and uses B-tree…
+AFM:       PostGerSQL stores rose in heat pages and uses BTree…
+Diff:      postgersql(postgresql) stores rose(rows) in heat(heap) …
+           kilocops(lookups) … atomisited(atomicity)
+Verdict:   FAIL — WER 0.250 > threshold 0.20
+```
+
+Required two benchmark-side changes to feed the panel:
+- `benchmark_whisper` and `benchmark_tesseract` now return their
+  transcribed/extracted text alongside the latency/score (was
+  numbers-only).
+- The JSONL-write filter that strips `_*` fields as "internal" now
+  keeps `_full_*` so ground truth, AFM transcript, and competitor
+  output persist for the report.
+
+### Final corpus state at session close
+
+|  | speech | latency | speedup vs whisper |
+|---|---|---|---|
+| Pre-session baseline | 5/18 (raw WER) → 12/18 (normalized) | 412 ms AVG | 1.4× |
+| End of pipeline-wireup branch | 16/18 | 262 ms AVG | 2.2× |
+| **End of controller-followups branch** | **16/18** | **221 ms median** | **~2.6×** |
+
+Two cases remain FAIL:
+- `tech-database` — `SFCustomLanguageModelData` work
+- `spanish-speech` — needs locale-model install handling (or callers passing `language=`)
+
+---
+
 ## Insights worth remembering
 
 - **vDSP wins are amplified in debug builds.** Swift `-Onone` is brutal on tight numeric loops (bounds checks, COW, generic dispatch). vDSP runs at the same speed regardless of build config. The same change that looked like ~10 ms/msg on a debug build dropped to a smaller absolute delta in release — though release also brought the absolute baseline down dramatically. Future micro-benchmarks of similar work should report release numbers, not debug.
 - **Look at the metric before tuning the model.** Half the apparent whisper-vs-AFM accuracy gap was text-formatting style, not recognition quality. WER normalization went 5/18 → 12/18 with zero changes to AFM. Worth budgeting an hour to inspect actual transcripts before any vocab-tuning sprint.
 - **`contextualStrings` biases are weak in both Speech APIs, but stronger in `SpeechAnalyzer` than `SFSpeechRecognizer`.** Concrete recoveries on tech-aws after switching: `"Sage maker"`→`"SageMaker"`, `"lamb of"`→`"Lambda"`, `"cloud front"`→`"cloudfront"`. Stubborn cases (`Kubernetes`→`"Hubernet's"`) survive both — those need `SFCustomLanguageModelData`.
 - **VAD trim is best deferred until the engine consumes streamed PCM.** Writing trimmed audio to a temp WAV and re-passing the URL works but adds I/O for a path that's slated to become streaming. The trim code is in place; flipping it on is a one-line change once the engine takes a stream.
-- **The biggest "compete with whisper" lever wasn't latency — AFM was already 1.4× faster baseline.** It was accuracy on technical English, and the macOS-26 SpeechAnalyzer pipeline + bundled vocab closed most of that gap. Final score on the 18-case corpus: 16/18 PASS at WER ≤ 0.20, 2.2× average speedup.
+- **The biggest "compete with whisper" lever wasn't latency — AFM was already 1.4× faster baseline.** It was accuracy on technical English, and the macOS-26 SpeechAnalyzer pipeline + bundled vocab closed most of that gap. Final score on the 18-case corpus: 16/18 PASS at WER ≤ 0.20, ~2.6× average speedup at session close.
+- **`contextualStrings` saturates around the existing list size.** Adding 90 more specifically-misheard terms changed exactly zero transcripts. The bias is real and load-bearing for the cases it does work on (SageMaker, Lambda, microservices, namespaces); it's just not the path to recover the cases it misses (Kubernetes, PostgreSQL, ElastiCache, Cognito). Don't waste cycles growing the list past where it's at — `SFCustomLanguageModelData` is the next lever and it's a different engine (`DictationTranscriber`).
+- **Click-through detail panels in benchmark reports change the conversation.** With raw aggregate scores you debate "AFM is worse on technical English" in the abstract; with the per-test diff visible (`postgersql (postgresql) stores rose (rows) in heat (heap) …`) the conversation is "we need to recover these specific words". One opens design space; the other narrows it. Investing in measurement UI paid off after about an hour of work and re-pays itself every benchmark run.
+- **Wrong preset choice is a silent feature loss.** The original engine used `progressiveTranscription` presets that emitted volatile partial results we then dropped via `isFinal` — paying for streaming we didn't use, AND missing the `transcriptionConfidence` attribute the verbose_json response wanted. Building the transcriber with explicit options instead of presets is more verbose but exposes which features you're paying for.
