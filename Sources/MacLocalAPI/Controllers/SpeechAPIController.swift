@@ -94,6 +94,16 @@ struct SpeechAPIController: RouteCollection {
         return sharedPipelineService
     }
 
+    /// Trigger lazy initialization of the shared speech pipeline so the
+    /// transcriber pool is warm before the first HTTP request lands. Safe
+    /// to call repeatedly. Server.configure() invokes this after the route
+    /// is registered.
+    static func warmupSharedService() {
+        if #available(macOS 13.0, *), let pipeline = sharedPipelineService as? PipelineSpeechService {
+            pipeline.warmup()
+        }
+    }
+
     func boot(routes: RoutesBuilder) throws {
         let v1 = routes.grouped("v1")
         let speech = v1.grouped("audio")

@@ -25,6 +25,18 @@ final class PipelineSpeechService: SpeechServing, RichSpeechServing, @unchecked 
 
     init() {}
 
+    /// Fire-and-forget pool warmup. Server.configure() calls this after
+    /// registering the speech route so the first real request doesn't pay
+    /// `SpeechPipelineService.makeDefault()`'s pool init + bundled-vocab
+    /// read inline. Failures are silently dropped here — they'll surface
+    /// on the first actual transcription with the right SpeechError shape
+    /// for HTTP mapping.
+    func warmup() {
+        Task.detached(priority: .userInitiated) { [weak self] in
+            _ = try? await self?.getOrCreate()
+        }
+    }
+
     func transcribe(from filePath: String, options: SpeechRequestOptions) async throws -> String {
         let result = try await transcribeRich(
             from: filePath,

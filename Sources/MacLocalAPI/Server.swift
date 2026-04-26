@@ -242,6 +242,10 @@ class Server {
 
         try app.register(collection: VisionAPIController())
         try app.register(collection: SpeechAPIController())
+        // Warm the shared SpeechAnalyzer pool so the first transcription
+        // request doesn't pay pool init + bundled-vocab read inline.
+        // Fire-and-forget; server boot doesn't block on it.
+        SpeechAPIController.warmupSharedService()
 
         if let mlxModelID = mlxModelID, let mlxModelService = mlxModelService {
             let mlxController = MLXChatCompletionsController(
