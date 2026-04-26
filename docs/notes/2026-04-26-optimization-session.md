@@ -254,15 +254,98 @@ Required two benchmark-side changes to feed the panel:
 
 ### Final corpus state at session close
 
-|  | speech | latency | speedup vs whisper |
+|  | corpus | speech | speedup vs whisper |
 |---|---|---|---|
-| Pre-session baseline | 5/18 (raw WER) → 12/18 (normalized) | 412 ms AVG | 1.4× |
-| End of pipeline-wireup branch | 16/18 | 262 ms AVG | 2.2× |
-| **End of controller-followups branch** | **16/18** | **221 ms median** | **~2.6×** |
+| Pre-session baseline | 18 synthetic | 5/18 (raw WER) → 12/18 (normalized) | 1.4× |
+| End of pipeline-wireup branch | 18 synthetic | 16/18 | 2.2× |
+| End of first followups pass | 18 synthetic | 16/18 | ~2.6× |
+| + locale auto-install + benchmark routing | 18 synthetic | 17/18 (spanish-speech 1.000 → 0.000 WER) | ~2.6× |
+| **+ whisper.cpp's own test samples** | **24 (18 synth + 6 fetched)** | **21/24** | per-case 0.7×–4.3× |
 
-Two cases remain FAIL:
-- `tech-database` — `SFCustomLanguageModelData` work
-- `spanish-speech` — needs locale-model install handling (or callers passing `language=`)
+Three cases remain FAIL:
+- `tech-database` — `SFCustomLanguageModelData` work (DictationTranscriber path)
+- `whisper-a13` (NASA radio chatter, band-limited 8 kHz, multi-speaker, 250 wpm) — real-world degradation that exposes a genuine accuracy gap
+- `whisper-mm1` (Micro Machines fast-talker, ~250 wpm advertising copy) — pace-stress case
+
+### Locale auto-install
+
+`SpeechTranscriberEngine.ensureLocaleInstalled` checks
+`SpeechTranscriber.installedLocales` before handing the transcriber to
+the analyzer; if the requested locale isn't on disk it calls
+`AssetInventory.assetInstallationRequest(supporting:).downloadAndInstall()`
+with a 60-second soft cap and only proceeds when the model is ready.
+First es-MX request takes ~10 s for the one-time download, then
+subsequent requests use the cached model. Locale-identifier comparison
+is normalized (lowercase + map `_` → `-`) because Apple's Speech APIs
+return component-form ids while HTTP callers pass BCP-47.
+
+Before this change the missing-model failure mode came back as
+`SFSpeechErrorDomain code 3 "Audio format is not supported"` — the
+previous commit's `recognitionFailed` translation routed it through
+422 instead of 500, but with a misleading message that pointed at the
+audio rather than the model. Combined with a benchmark-side language-
+hint (filename → locale: `spanish-*` → `es-MX`, `french-*` → `fr-FR`,
+etc.), the spanish-speech.wav fixture flips
+FAIL → PASS at WER 0.000 — perfect transcription, 4.3× faster than
+whisper-cpp which outputs `(speaking in foreign language)` and scores
+WER 1.000 on the same audio.
+
+### VAD-on-inference deferred (both attempts pulled back)
+
+The earlier branch added a `VoiceActivityTrimmer` pass to
+`AudioPreprocessor`, but trimmed audio never reaches inference because
+the engine reads URLs directly. Two attempts to close that gap were
+made and both reverted:
+
+1. **Streaming engine** via `SpeechAnalyzer.start(inputSequence:)`
+   feeding `AsyncStream<AnalyzerInput>` from the prepared PCM chunks.
+   Hard-crashed the process on the first request with no useful
+   diagnostics — likely an `AVAudioPCMBuffer` lifecycle race across
+   the bridge between our chunk stream and the analyzer's input task.
+2. **Temp-file materialization** of the trimmed PCM, passed as URL
+   to the existing engine path. Worked correctly but regressed
+   median latency from ~240 ms to ~330 ms because the corpus is
+   `say`-synthesized audio with no leading/trailing silence to trim,
+   so the resample + buffer-rewrite cost was paid on every request
+   with zero VAD payoff.
+
+The right next move is a cheap pre-flight that sniffs the head of the
+file for silence and only invokes the full preprocessor when there's
+something to remove — flips the math from "always pay cost, sometimes
+save more" to "pay cost only when it'll save more". That pre-flight
+is its own change; for now the inference path remains URL-based and
+the VAD code is decorative on this layer.
+
+### Whisper's own test samples
+
+`Scripts/fetch-whisper-test-samples.sh` downloads the six audio
+fixtures whisper.cpp ships in `make samples` (gb0, gb1, hp0, mm1, a13)
+plus the JFK inaugural-address clip both whisper.cpp (samples/jfk.wav)
+and OpenAI whisper (tests/jfk.flac) use as their canonical test asset.
+Each file is the same source whisper authors test against; ffmpeg
+re-encodes to 16 kHz mono s16le on download.
+
+Headline numbers on this set:
+
+```
+whisper-jfk            434 ms  WER 0.000  2.7x  PASS  ← perfect match
+whisper-mm1           3162 ms  WER 0.142  0.9x  FAIL  ← 250-wpm commercial
+whisper-a13           3109 ms  WER 0.763  1.5x  FAIL  ← NASA radio chatter
+whisper-gb0/gb1/hp0   speed-only (no ground truth — multi-minute speeches)
+```
+
+Ground truth committed for the three short well-known clips against
+the canonical historical transcripts (not whisper's own output) so
+the WER score reflects recognizer quality rather than inter-recognizer
+agreement. The longer Bush speeches and the Phillips narration ship
+without ground truth — the benchmark treats absent .txt as speed-only
+(WER becomes None, the case auto-passes) so those serve as wall-clock
+comparisons against whisper-cpp without manual transcription work.
+
+The mm1 / a13 failures are useful — they expose failure modes the
+synthetic corpus didn't (250-wpm ad-copy pace, band-limited 8 kHz
+multi-speaker radio comm), giving the next round of accuracy work
+specific real-world targets to attack.
 
 ---
 
