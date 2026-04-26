@@ -450,6 +450,7 @@ async def benchmark_vision_ocr(session: aiohttp.ClientSession, base_url: str,
         "runs": runs,
         "extracted_preview": extracted[:200] if extracted else "",
         "_full_extracted": extracted,
+        "_full_ground_truth": ground_truth,
     }
 
 
@@ -513,6 +514,7 @@ async def benchmark_speech(session: aiohttp.ClientSession, base_url: str,
         "runs": runs,
         "transcribed_preview": transcribed[:200] if transcribed else "",
         "_full_transcribed": transcribed,
+        "_full_ground_truth": ground_truth,
     }
 
 
@@ -632,6 +634,7 @@ def benchmark_tesseract(file_path: Path) -> dict | None:
         "latency_ms": round(elapsed_ms, 1),
         "cer": round(cer, 4) if cer is not None else None,
         "memory_mb": mem_mb,
+        "extracted": extracted,
     }
 
 
@@ -689,6 +692,7 @@ def benchmark_whisper(file_path: Path, model: str = "base.en") -> dict | None:
         "tool": f"whisper-{model}",
         "latency_ms": round(elapsed_ms, 1),
         "wer": round(wer, 4) if wer is not None else None,
+        "transcribed": transcribed,
     }
 
 
@@ -907,6 +911,8 @@ async def main():
                             result["tesseract_latency_ms"] = tess["latency_ms"]
                             result["tesseract_cer"] = tess["cer"]
                             result["tesseract_memory_mb"] = tess.get("memory_mb")
+                            if tess.get("extracted"):
+                                result["_full_tesseract_extracted"] = tess["extracted"]
 
                     # Competitor: MLX VLM
                     if args.vlm_url and args.vlm_model and fp.suffix.lower() != ".pdf":
@@ -1004,6 +1010,8 @@ async def main():
                                 if whisp and "error" not in whisp:
                                     result["whisper_latency_ms"] = whisp["latency_ms"]
                                     result["whisper_wer"] = whisp["wer"]
+                                    if whisp.get("transcribed"):
+                                        result["_full_whisper_transcribed"] = whisp["transcribed"]
 
                             status = "PASS" if result["pass"] else "FAIL"
                             wer_str = f"WER={result['afm_wer']:.3f}" if result.get("afm_wer") is not None else "N/A"
@@ -1035,8 +1043,13 @@ async def main():
         }
         f.write(json.dumps(meta) + "\n")
         for r in results:
-            # Strip internal fields (prefixed with _) from JSONL output
-            clean = {k: v for k, v in r.items() if not k.startswith("_")}
+            # Strip internal fields prefixed with _ from JSONL output. The
+            # `_full_*` fields are an exception — they hold the original
+            # transcribed / extracted / ground-truth strings that the report
+            # generator needs to render per-test detail panels (click-through
+            # rows showing GT vs hypothesis vs whisper).
+            clean = {k: v for k, v in r.items()
+                     if not k.startswith("_") or k.startswith("_full_")}
             f.write(json.dumps(clean) + "\n")
 
     # ─── Summary ─────────────────────────────────────────────────────────────

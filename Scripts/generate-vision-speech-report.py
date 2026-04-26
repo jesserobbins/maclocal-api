@@ -14,8 +14,107 @@ import json
 import sys
 import os
 import html as html_module
+import re
 from pathlib import Path
 from datetime import datetime
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Text normalization for WER (mirrors benchmark-vision-speech.py)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+_NUMBER_ONES = {0: "zero", 1: "one", 2: "two", 3: "three", 4: "four", 5: "five",
+                6: "six", 7: "seven", 8: "eight", 9: "nine", 10: "ten",
+                11: "eleven", 12: "twelve", 13: "thirteen", 14: "fourteen",
+                15: "fifteen", 16: "sixteen", 17: "seventeen", 18: "eighteen",
+                19: "nineteen"}
+_NUMBER_TENS = {20: "twenty", 30: "thirty", 40: "forty", 50: "fifty",
+                60: "sixty", 70: "seventy", 80: "eighty", 90: "ninety"}
+
+
+def _number_to_words(n: int) -> str:
+    if n < 20:
+        return _NUMBER_ONES[n]
+    if n < 100:
+        tens = (n // 10) * 10
+        ones = n % 10
+        if ones == 0:
+            return _NUMBER_TENS[tens]
+        return f"{_NUMBER_TENS[tens]} {_NUMBER_ONES[ones]}"
+    if n < 1000:
+        h = n // 100
+        rest = n % 100
+        if rest == 0:
+            return f"{_NUMBER_ONES[h]} hundred"
+        return f"{_NUMBER_ONES[h]} hundred {_number_to_words(rest)}"
+    return str(n)
+
+
+def normalize_for_wer(text: str) -> str:
+    """Same canonicalization the benchmark applies before WER scoring,
+    duplicated here so the detail panel can show 'this is what was
+    actually compared'."""
+    s = (text or "").lower()
+    s = re.sub(r"[-–—_/]", " ", s)
+    s = re.sub(r"\s*%", " percent ", s)
+    s = re.sub(r"[.,;:!?\"'\(\)\[\]]", " ", s)
+    s = re.sub(r"\d+",
+               lambda m: _number_to_words(int(m.group())) if int(m.group()) < 1000 else m.group(),
+               s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def word_diff_html(reference: str, hypothesis: str) -> str:
+    """Inline diff: each token from `hypothesis` rendered green if it matches
+    the reference at that position (after normalization), red otherwise.
+    Tokens missing from the hypothesis (but present in ref) appear as red
+    strikethrough markers. Useful as a per-test 'why did this fail' view."""
+    ref = normalize_for_wer(reference).split()
+    hyp = normalize_for_wer(hypothesis).split()
+    # Word-level Levenshtein backtrack to surface op classes.
+    n, m = len(ref), len(hyp)
+    if n == 0 and m == 0:
+        return ""
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        dp[i][0] = i
+    for j in range(m + 1):
+        dp[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost = 0 if ref[i - 1] == hyp[j - 1] else 1
+            dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
+    # Backtrack
+    out = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and ref[i - 1] == hyp[j - 1]:
+            out.append(("ok", hyp[j - 1]))
+            i -= 1; j -= 1
+        elif i > 0 and j > 0 and dp[i][j] == dp[i - 1][j - 1] + 1:
+            out.append(("sub", f"{hyp[j-1]}  ({ref[i-1]})"))
+            i -= 1; j -= 1
+        elif j > 0 and dp[i][j] == dp[i][j - 1] + 1:
+            out.append(("ins", hyp[j - 1]))
+            j -= 1
+        elif i > 0 and dp[i][j] == dp[i - 1][j] + 1:
+            out.append(("del", ref[i - 1]))
+            i -= 1
+        else:
+            break
+    out.reverse()
+    spans = []
+    for kind, tok in out:
+        esc = html_module.escape(tok)
+        if kind == "ok":
+            spans.append(f'<span class="diff-ok">{esc}</span>')
+        elif kind == "sub":
+            spans.append(f'<span class="diff-sub" title="substitution">{esc}</span>')
+        elif kind == "ins":
+            spans.append(f'<span class="diff-ins" title="extra word AFM emitted">{esc}</span>')
+        elif kind == "del":
+            spans.append(f'<span class="diff-del" title="missed word">{esc}</span>')
+    return " ".join(spans)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Style Constants (matching kruks.ai/macafm dark theme)
@@ -51,10 +150,108 @@ def load_results(jsonl_path: str) -> tuple[dict, list]:
     return meta, results
 
 
+def _detail_row_speech(r: dict, row_id: str, audio_root: Path) -> str:
+    """Build the hidden detail row for a single speech test."""
+    file_name = r.get("file", "")
+    audio_path = audio_root / file_name if file_name else None
+    audio_src = ""
+    if audio_path and audio_path.exists():
+        # Browser plays the WAV via a relative file:// URL — works when the
+        # report is opened from the same directory tree it was written to.
+        try:
+            rel = os.path.relpath(audio_path, Path(os.path.dirname(audio_root)))
+        except ValueError:
+            rel = str(audio_path)
+        audio_src = f'<audio controls src="{html_module.escape(str(rel))}"></audio>'
+
+    gt = r.get("_full_ground_truth", "") or ""
+    afm = r.get("_full_transcribed", "") or r.get("transcribed_preview", "") or ""
+    whisp = r.get("_full_whisper_transcribed", "") or ""
+
+    afm_norm = normalize_for_wer(afm)
+    gt_norm = normalize_for_wer(gt)
+
+    wer = r.get("afm_wer")
+    threshold = r.get("wer_threshold")
+    passed = r.get("pass")
+    if passed:
+        verdict = (f'<div class="verdict pass">PASS — WER {wer:.3f} ≤ threshold {threshold:.2f}'
+                   f' (computed against normalized text below).</div>')
+    else:
+        verdict = (f'<div class="verdict fail">FAIL — WER {wer:.3f} &gt; threshold {threshold:.2f}.'
+                   f' The diff column below highlights substitutions (orange), insertions (red),'
+                   f' and missed words (struck-through grey).</div>')
+
+    diff_html = word_diff_html(gt, afm) if gt else "—"
+
+    rows = []
+    rows.append(f'<tr class="detail-row" id="{row_id}"><td colspan="11">')
+    rows.append('  <div class="detail-grid">')
+    if audio_src:
+        rows.append(f'    <div class="label">Audio</div><div class="value">{audio_src}<br><span style="color:{MUTED_COLOR};font-size:0.75rem;">{html_module.escape(str(audio_path))}</span></div>')
+    rows.append(f'    <div class="label">Ground truth</div><div class="value text">{html_module.escape(gt) or "—"}</div>')
+    rows.append(f'    <div class="label">AFM (raw)</div><div class="value text">{html_module.escape(afm) or "—"}</div>')
+    if whisp:
+        rows.append(f'    <div class="label">Whisper (raw)</div><div class="value text" style="color:{MUTED_COLOR};">{html_module.escape(whisp)}</div>')
+    rows.append(f'    <div class="label">GT (normalized)</div><div class="value">{html_module.escape(gt_norm) or "—"}</div>')
+    rows.append(f'    <div class="label">AFM (normalized)</div><div class="value">{html_module.escape(afm_norm) or "—"}</div>')
+    rows.append(f'    <div class="label">Per-word diff</div><div class="value diff">{diff_html or "—"}</div>')
+    rows.append(f'    <div class="label">Verdict</div><div class="value">{verdict}</div>')
+    rows.append('  </div>')
+    rows.append('</td></tr>')
+    return "\n".join(rows)
+
+
+def _detail_row_vision(r: dict, row_id: str, vision_root: Path) -> str:
+    """Build the hidden detail row for a single vision test."""
+    file_name = r.get("file", "")
+    img_path = vision_root / file_name if file_name else None
+    image_html = ""
+    if img_path and img_path.exists() and img_path.suffix.lower() in (".jpg", ".jpeg", ".png"):
+        try:
+            rel = os.path.relpath(img_path, Path(os.path.dirname(vision_root)))
+        except ValueError:
+            rel = str(img_path)
+        image_html = f'<img src="{html_module.escape(str(rel))}" style="max-width:400px;max-height:300px;border:1px solid {BORDER_COLOR};border-radius:4px;">'
+
+    gt = r.get("_full_ground_truth", "") or ""
+    afm = r.get("_full_extracted", "") or r.get("extracted_preview", "") or ""
+    tess = r.get("_full_tesseract_extracted", "") or ""
+
+    cer = r.get("afm_cer")
+    threshold = r.get("cer_threshold")
+    passed = r.get("pass")
+    if passed:
+        verdict = f'<div class="verdict pass">PASS — CER {cer:.3f} ≤ threshold {threshold:.2f}.</div>' if cer is not None else '<div class="verdict pass">PASS</div>'
+    else:
+        verdict = f'<div class="verdict fail">FAIL — CER {cer:.3f} &gt; threshold {threshold:.2f}.</div>' if cer is not None else '<div class="verdict fail">FAIL</div>'
+
+    rows = []
+    rows.append(f'<tr class="detail-row" id="{row_id}"><td colspan="9">')
+    rows.append('  <div class="detail-grid">')
+    if image_html:
+        rows.append(f'    <div class="label">Document</div><div class="value">{image_html}<br><span style="color:{MUTED_COLOR};font-size:0.75rem;">{html_module.escape(str(img_path))}</span></div>')
+    rows.append(f'    <div class="label">Ground truth</div><div class="value text">{html_module.escape(gt) or "—"}</div>')
+    rows.append(f'    <div class="label">AFM Vision</div><div class="value text">{html_module.escape(afm) or "—"}</div>')
+    if tess:
+        rows.append(f'    <div class="label">Tesseract</div><div class="value text" style="color:{MUTED_COLOR};">{html_module.escape(tess)}</div>')
+    rows.append(f'    <div class="label">Verdict</div><div class="value">{verdict}</div>')
+    rows.append('  </div>')
+    rows.append('</td></tr>')
+    return "\n".join(rows)
+
+
 def generate_html(meta: dict, results: list, output_path: str):
     """Generate HTML report."""
     vision_results = [r for r in results if r.get("category") == "vision"]
     speech_results = [r for r in results if r.get("category") == "speech"]
+
+    # Corpus directories — used by the detail rows to embed audio players
+    # and image previews. Convention: Scripts/test-data/{speech,vision}
+    # alongside Scripts/benchmark-results/ (where the report is written).
+    output_dir = Path(output_path).resolve().parent
+    speech_root = (output_dir.parent / "test-data" / "speech").resolve()
+    vision_root = (output_dir.parent / "test-data" / "vision").resolve()
 
     total_tests = len(results)
     total_pass = sum(1 for r in results if r.get("pass") is True)
@@ -112,9 +309,38 @@ def generate_html(meta: dict, results: list, output_path: str):
   .bar-label {{ font-size: 0.75rem; color: {MUTED_COLOR}; min-width: 80px; }}
   .footer {{ text-align: center; margin-top: 2rem; color: #484f58; font-size: 0.8rem; }}
   @media (max-width: 768px) {{ .comparison {{ grid-template-columns: 1fr; }} }}
+  /* Click-through detail rows */
+  tr.summary-row {{ cursor: pointer; }}
+  tr.summary-row td:first-child::before {{ content: "▸"; color: {MUTED_COLOR}; margin-right: 0.5rem; font-size: 0.7rem; transition: transform 0.15s; display: inline-block; }}
+  tr.summary-row.open td:first-child::before {{ content: "▾"; }}
+  tr.detail-row {{ display: none; }}
+  tr.detail-row.open {{ display: table-row; }}
+  tr.detail-row > td {{ background: #0a0d12; padding: 1rem 1.5rem 1.5rem; border-bottom: 2px solid {BORDER_COLOR}; }}
+  .detail-grid {{ display: grid; grid-template-columns: 140px 1fr; gap: 0.5rem 1rem; align-items: start; }}
+  .detail-grid > .label {{ color: {MUTED_COLOR}; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; padding-top: 0.2rem; }}
+  .detail-grid > .value {{ font-family: 'SF Mono', Menlo, monospace; font-size: 0.85rem; line-height: 1.5; word-break: break-word; }}
+  .detail-grid > .value.text {{ font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; font-size: 0.9rem; }}
+  audio {{ width: 100%; max-width: 480px; }}
+  .diff {{ font-family: 'SF Mono', Menlo, monospace; font-size: 0.85rem; line-height: 1.7; }}
+  .diff-ok {{ color: {PASS_TEXT}; }}
+  .diff-sub {{ color: #f0883e; background: #2d1d10; padding: 0 0.2rem; border-radius: 3px; text-decoration: underline dotted; }}
+  .diff-ins {{ color: {FAIL_TEXT}; background: #2d1215; padding: 0 0.2rem; border-radius: 3px; }}
+  .diff-del {{ color: {MUTED_COLOR}; text-decoration: line-through; }}
+  .verdict {{ padding: 0.5rem 0.75rem; border-radius: 6px; font-size: 0.85rem; line-height: 1.4; }}
+  .verdict.pass {{ background: #0d2818; color: {PASS_TEXT}; border: 1px solid {PASS_COLOR}; }}
+  .verdict.fail {{ background: #2d1215; color: {FAIL_TEXT}; border: 1px solid {FAIL_COLOR}; }}
 </style>
 </head>
 <body>
+<script>
+  function toggleRow(rowId) {{
+    var detail = document.getElementById(rowId);
+    var summary = document.getElementById(rowId + '-summary');
+    if (!detail) return;
+    var open = detail.classList.toggle('open');
+    if (summary) summary.classList.toggle('open', open);
+  }}
+</script>
 """)
 
     # ─── Header ──────────────────────────────────────────────────────────────
@@ -186,7 +412,7 @@ def generate_html(meta: dict, results: list, output_path: str):
     </thead>
     <tbody>
 """)
-        for r in vision_results:
+        for idx, r in enumerate(vision_results):
             latency = r.get("afm_latency_ms", 0)
             tess_latency = r.get("tesseract_latency_ms")
             cpu_time = r.get("afm_cpu_time_ms")
@@ -212,7 +438,8 @@ def generate_html(meta: dict, results: list, output_path: str):
             ane_ms = max(0, latency - (cpu_time or 0) - (gpu_time or 0)) if cpu_time is not None else None
             ane_str = f"{ane_ms:.0f}" if ane_ms is not None else "—"
 
-            html_parts.append(f"""      <tr>
+            row_id = f"row-vision-{idx}"
+            html_parts.append(f"""      <tr id="{row_id}-summary" class="summary-row" onclick="toggleRow('{row_id}')">
         <td>{html_module.escape(r['file'])}</td>
         <td class="metric">{latency:.0f}</td>
         <td class="metric">{cpu_str}</td>
@@ -223,6 +450,7 @@ def generate_html(meta: dict, results: list, output_path: str):
         <td class="metric {cer_class}">{cer_str}</td>
         <td><span class="badge {badge_class}">{'PASS' if passed else 'FAIL'}</span></td>
       </tr>
+{_detail_row_vision(r, row_id, vision_root)}
 """)
         html_parts.append(f'    </tbody>\n  </table>\n  <p style="color:{MUTED_COLOR}; font-size:0.75rem; margin-top:0.5rem;">* ANE = Wall − CPU − GPU (inferred accelerator time)</p>\n</div>\n')
 
@@ -237,7 +465,7 @@ def generate_html(meta: dict, results: list, output_path: str):
     </thead>
     <tbody>
 """)
-        for r in speech_results:
+        for idx, r in enumerate(speech_results):
             if r.get("error"):
                 html_parts.append(f"""      <tr>
         <td>{html_module.escape(r['file'])}</td>
@@ -275,7 +503,8 @@ def generate_html(meta: dict, results: list, output_path: str):
             ane_ms = max(0, latency - (cpu_time or 0) - (gpu_time or 0)) if cpu_time is not None else None
             ane_str = f"{ane_ms:.0f}" if ane_ms is not None else "—"
 
-            html_parts.append(f"""      <tr>
+            row_id = f"row-speech-{idx}"
+            html_parts.append(f"""      <tr id="{row_id}-summary" class="summary-row" onclick="toggleRow('{row_id}')">
         <td>{html_module.escape(r['file'])}</td>
         <td class="metric">{duration:.1f}s</td>
         <td class="metric">{latency:.0f}</td>
@@ -288,6 +517,7 @@ def generate_html(meta: dict, results: list, output_path: str):
         <td class="metric {rtf_class}">{rtf:.2f}x</td>
         <td><span class="badge {badge_class}">{'PASS' if passed else 'FAIL'}</span></td>
       </tr>
+{_detail_row_speech(r, row_id, speech_root)}
 """)
         html_parts.append("    </tbody>\n  </table>\n</div>\n")
 
