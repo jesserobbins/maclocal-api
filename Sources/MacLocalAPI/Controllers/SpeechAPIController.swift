@@ -7,8 +7,61 @@ struct SpeechTranscriptionResponse: Content {
     let locale: String
 }
 
+/// OpenAI-compatible verbose_json shape. Fields beyond `text` are present
+/// when the underlying transcriber produced them (i.e. the new
+/// SpeechAnalyzer pipeline path); on the legacy SFSpeechRecognizer fallback
+/// the segments / words arrays are nil and `language_reassessed` is false.
+struct VerboseTranscriptionResponse: Content {
+    let task: String
+    let language: String
+    let duration: Double
+    let text: String
+    let segments: [VerboseSegment]?
+    let words: [VerboseWord]?
+    let languageReassessed: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case task, language, duration, text, segments, words
+        case languageReassessed = "language_reassessed"
+    }
+}
+
+struct VerboseSegment: Content {
+    let id: Int
+    let start: Double
+    let end: Double
+    let text: String
+    let avgConfidence: Double
+
+    enum CodingKeys: String, CodingKey {
+        case id, start, end, text
+        case avgConfidence = "avg_confidence"
+    }
+}
+
+struct VerboseWord: Content {
+    let word: String
+    let start: Double
+    let end: Double
+    let confidence: Double
+}
+
 protocol SpeechServing {
     func transcribe(from filePath: String, options: SpeechRequestOptions) async throws -> String
+}
+
+/// Extended interface for backends that can return word/segment timings and
+/// other rich transcription metadata. The HTTP controller queries for this
+/// conformance when `response_format=verbose_json`. Legacy
+/// `SFSpeechRecognizer`-backed `SpeechService` does not conform — it would
+/// have to do a second pass to recover word timings and the live HTTP path
+/// has been moved off it anyway.
+protocol RichSpeechServing: SpeechServing {
+    func transcribeRich(
+        from filePath: String,
+        options: SpeechRequestOptions,
+        wantWordTimings: Bool
+    ) async throws -> TranscriptionResult
 }
 
 extension SpeechService: SpeechServing {}
@@ -72,11 +125,21 @@ struct SpeechAPIController: RouteCollection {
             // OpenAI-compatible per-request vocabulary hint. Merged with the
             // bundled / env / project contextual vocab by the resolver.
             let prompt: String?
+            // OpenAI-compatible response format selector: text, json,
+            // verbose_json. srt/vtt deferred — those need timing-formatted
+            // text emission separate from the JSON shape.
+            let response_format: String?
+            // OpenAI-compatible timestamp granularity selector. Array of
+            // "word" / "segment". Only meaningful when response_format is
+            // verbose_json.
+            let timestamp_granularities: [String]?
         }
 
         let body = try req.content.decode(TranscriptionRequest.self)
         let locale = body.language ?? body.locale ?? "en-US"
         let options = SpeechRequestOptions(locale: locale, prompt: body.prompt)
+        let format = (body.response_format ?? "json").lowercased()
+        let wantWordTimings = body.timestamp_granularities?.contains("word") ?? false
         let service = makeSpeechService()
         var cleanupURLs: [URL] = []
 
@@ -99,21 +162,88 @@ struct SpeechAPIController: RouteCollection {
                 throw Abort(.badRequest, reason: "Either 'file' path or 'data' (base64) is required")
             }
 
-            let text = try await service.transcribe(from: filePath, options: options)
+            switch format {
+            case "verbose_json":
+                guard let rich = service as? RichSpeechServing else {
+                    // Fallback path: the active backend doesn't expose
+                    // word/segment timings (legacy SFSpeechRecognizer).
+                    // Emit a verbose_json shape with text/duration/language
+                    // populated and the timing arrays nil so callers know
+                    // the data isn't available rather than silently
+                    // pretending an empty list = no words.
+                    let text = try await service.transcribe(from: filePath, options: options)
+                    let response = VerboseTranscriptionResponse(
+                        task: "transcribe",
+                        language: locale,
+                        duration: 0,
+                        text: text,
+                        segments: nil,
+                        words: nil,
+                        languageReassessed: false
+                    )
+                    return try Self.jsonResponse(response)
+                }
+                let result = try await rich.transcribeRich(
+                    from: filePath,
+                    options: options,
+                    wantWordTimings: wantWordTimings
+                )
+                let response = VerboseTranscriptionResponse(
+                    task: "transcribe",
+                    language: result.language,
+                    duration: Double(result.durationMs) / 1000.0,
+                    text: result.text,
+                    segments: result.segments?.enumerated().map { idx, seg in
+                        VerboseSegment(
+                            id: idx,
+                            start: Double(seg.startMs) / 1000.0,
+                            end: Double(seg.endMs) / 1000.0,
+                            text: seg.text,
+                            avgConfidence: seg.meanConfidence
+                        )
+                    },
+                    words: wantWordTimings
+                        ? result.words?.map { w in
+                            VerboseWord(
+                                word: w.word,
+                                start: Double(w.startMs) / 1000.0,
+                                end: Double(w.endMs) / 1000.0,
+                                confidence: w.confidence
+                            )
+                        }
+                        : nil,
+                    languageReassessed: result.languageReassessed
+                )
+                return try Self.jsonResponse(response)
 
-            let response = SpeechTranscriptionResponse(
-                object: "speech.transcription",
-                text: text,
-                locale: locale
-            )
-            let httpResponse = Response(status: .ok)
-            httpResponse.headers.add(name: .contentType, value: "application/json")
-            httpResponse.headers.add(name: .accessControlAllowOrigin, value: "*")
-            try httpResponse.content.encode(response)
-            return httpResponse
+            case "text":
+                let text = try await service.transcribe(from: filePath, options: options)
+                let httpResponse = Response(status: .ok)
+                httpResponse.headers.add(name: .contentType, value: "text/plain; charset=utf-8")
+                httpResponse.headers.add(name: .accessControlAllowOrigin, value: "*")
+                httpResponse.body = .init(string: text)
+                return httpResponse
+
+            default: // "json" — backwards-compatible default
+                let text = try await service.transcribe(from: filePath, options: options)
+                let response = SpeechTranscriptionResponse(
+                    object: "speech.transcription",
+                    text: text,
+                    locale: locale
+                )
+                return try Self.jsonResponse(response)
+            }
         } catch let speechError as SpeechError {
             throw Abort(Self.httpStatus(for: speechError), reason: speechError.localizedDescription)
         }
+    }
+
+    private static func jsonResponse<T: Content>(_ payload: T) throws -> Response {
+        let httpResponse = Response(status: .ok)
+        httpResponse.headers.add(name: .contentType, value: "application/json")
+        httpResponse.headers.add(name: .accessControlAllowOrigin, value: "*")
+        try httpResponse.content.encode(payload)
+        return httpResponse
     }
 
     static func httpStatus(for error: SpeechError) -> HTTPStatus {

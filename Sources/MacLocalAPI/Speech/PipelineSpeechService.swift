@@ -19,33 +19,43 @@ import Speech
 /// approach avoids blocking server startup. Subsequent requests reuse the
 /// same pipeline (and its warm transcriber pool).
 @available(macOS 13.0, *)
-final class PipelineSpeechService: SpeechServing, @unchecked Sendable {
+final class PipelineSpeechService: SpeechServing, RichSpeechServing, @unchecked Sendable {
     private let lock = NSLock()
     private var cached: SpeechPipelineService?
 
     init() {}
 
     func transcribe(from filePath: String, options: SpeechRequestOptions) async throws -> String {
+        let result = try await transcribeRich(
+            from: filePath,
+            options: options,
+            wantWordTimings: false
+        )
+        return result.text
+    }
+
+    func transcribeRich(
+        from filePath: String,
+        options: SpeechRequestOptions,
+        wantWordTimings: Bool
+    ) async throws -> TranscriptionResult {
         try Self.preflight(filePath: filePath, options: options)
         let pipeline = try await getOrCreate()
 
         let pipelineOptions = PipelineRequestOptions(
             locale: options.locale,
             prompt: options.prompt,
-            // Legacy wire format only emits plain text; word-timing
-            // surfacing is a separate change.
-            wantWordTimings: false,
+            wantWordTimings: wantWordTimings,
             // The legacy struct doesn't carry "did the caller pass a
             // language explicitly"; treat any non-default locale as
             // caller-supplied so the speculative reassessor doesn't fire
             // on requests that explicitly asked for, say, es-ES.
             callerSuppliedLocale: options.locale != "en-US"
         )
-        let result = try await pipeline.transcribe(
+        return try await pipeline.transcribe(
             url: URL(fileURLWithPath: filePath),
             options: pipelineOptions
         )
-        return result.text
     }
 
     // MARK: - Pipeline cache
