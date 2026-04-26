@@ -315,3 +315,116 @@ reference number
 two-factor authentication
 one-time passcode
 verification code
+
+# ---------- AWS service names (added from tech-aws.wav benchmark) ----------
+# Mishearings observed: "Sage maker" -> SageMaker; "lamb of" -> Lambda;
+# "elastic cash" -> ElastiCache; "cloud front" -> CloudFront;
+# "incognito" -> Cognito. The product-name spellings need to land in
+# the bias list so AnalysisContext.contextualStrings can recover them.
+SageMaker
+DynamoDB
+Lambda
+Kinesis
+CloudFront
+Route 53
+ElastiCache
+Cognito
+API Gateway
+S3
+EC2
+EKS
+ECS
+EBS
+RDS
+Aurora
+Redshift
+Athena
+Glue
+SNS
+SQS
+EventBridge
+Step Functions
+CloudWatch
+CloudTrail
+IAM
+KMS
+
+# ---------- React / frontend (from tech-frontend.wav benchmark) ----------
+# Mishearing observed: "you stayed" -> useState. The hooks were the
+# main failure mode; framework names mostly came through.
+useState
+useEffect
+useMemo
+useCallback
+useRef
+useContext
+useReducer
+useLayoutEffect
+JSX
+virtual DOM
+reconciliation
+hydration
+server components
+client components
+Tailwind utility
+code splitting
+dynamic import
+ESLint
+Prettier
+Vite
+Webpack
+Storybook
+
+# ---------- Rust language (from tech-rust.wav benchmark) ----------
+# Mishearing observed: "trade system" -> trait system; tokio sometimes
+# rendered as a city name.
+borrow checker
+ownership rules
+lifetimes
+trait system
+trait bounds
+async functions
+tokio
+tokio runtime
+Cargo
+crate
+rustc
+Send
+Sync
+Box
+Arc
+Mutex
+RwLock
+unsafe block
+
+# ---------- Database / SQL (from tech-database.wav benchmark) ----------
+# Mishearings observed: "Poster SL" / "PostGerSQL" -> PostgreSQL;
+# "kilocops" -> key lookups; "atomisited" -> atomicity.
+B-tree
+B+ tree
+heap pages
+ACID transactions
+atomicity
+write ahead logging
+WAL
+query planner
+sequential scan
+index scan
+bitmap heap scan
+selectivity estimates
+statistics collector
+foreign key
+primary key
+key lookups
+JOIN
+INNER JOIN
+LEFT JOIN
+GROUP BY
+ORDER BY
+LIMIT
+OFFSET
+EXPLAIN
+ANALYZE
+VACUUM
+autovacuum
+MVCC
