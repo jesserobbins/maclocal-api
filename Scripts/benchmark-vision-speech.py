@@ -112,8 +112,91 @@ def compute_cer(hypothesis: str, reference: str) -> float:
     return prev[m] / n
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Text normalization for WER (whisper-style)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# Different ASR systems format the same recognized speech differently —
+# AFM emits "DynamoDB" with a digit/letter style, ground truth says "twelve
+# percent" while AFM emits "12%". A naive WER counts those as recognition
+# errors when they're really just transcription-style choices. Without
+# normalization, the metric measures formatting agreement at least as much
+# as it measures recognition. Whisper benefits from this in its raw WER
+# because its training distribution matches the typical ground-truth
+# style. Normalizing both reference and hypothesis to a canonical word-
+# form before scoring isolates the signal we actually care about — which
+# words the transcriber heard.
+
+_NUMBER_ONES = {
+    0: "zero", 1: "one", 2: "two", 3: "three", 4: "four", 5: "five",
+    6: "six", 7: "seven", 8: "eight", 9: "nine", 10: "ten",
+    11: "eleven", 12: "twelve", 13: "thirteen", 14: "fourteen",
+    15: "fifteen", 16: "sixteen", 17: "seventeen", 18: "eighteen",
+    19: "nineteen",
+}
+_NUMBER_TENS = {
+    20: "twenty", 30: "thirty", 40: "forty", 50: "fifty",
+    60: "sixty", 70: "seventy", 80: "eighty", 90: "ninety",
+}
+
+
+def _number_to_words(n: int) -> str:
+    if n < 20:
+        return _NUMBER_ONES[n]
+    if n < 100:
+        tens = (n // 10) * 10
+        ones = n % 10
+        if ones == 0:
+            return _NUMBER_TENS[tens]
+        return f"{_NUMBER_TENS[tens]} {_NUMBER_ONES[ones]}"
+    if n < 1000:
+        h = n // 100
+        rest = n % 100
+        if rest == 0:
+            return f"{_NUMBER_ONES[h]} hundred"
+        return f"{_NUMBER_ONES[h]} hundred {_number_to_words(rest)}"
+    # >= 1000: leave as digits — rare in this corpus, and word-form gets
+    # ambiguous ("two thousand twenty four" vs "twenty twenty four").
+    return str(n)
+
+
+_PUNCT_RE = re.compile(r"[.,;:!?\"'\(\)\[\]]")
+_HYPHEN_RE = re.compile(r"[-–—_/]")
+_DIGIT_RE = re.compile(r"\d+")
+_PERCENT_RE = re.compile(r"\s*%")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def normalize_for_wer(text: str) -> str:
+    """Canonicalize ASR text for WER scoring.
+
+    Applied to both reference and hypothesis. The goal is to remove
+    formatting-style differences (case, punctuation, hyphens, digit
+    notation) so the resulting WER reflects recognition quality only.
+    """
+    s = text.lower()
+    # Hyphens/dashes/underscores split multi-word compounds into spaces so
+    # "year-over-year" matches "year over year".
+    s = _HYPHEN_RE.sub(" ", s)
+    # "%" becomes " percent " before digit conversion so "12%" reads as
+    # "twelve percent" after the digit pass.
+    s = _PERCENT_RE.sub(" percent ", s)
+    s = _PUNCT_RE.sub(" ", s)
+    # Digit runs → spelled words (canonical form, since digit↔word is
+    # ambiguous when training corpora differ in style).
+    s = _DIGIT_RE.sub(
+        lambda m: _number_to_words(int(m.group())) if int(m.group()) < 1000 else m.group(),
+        s,
+    )
+    s = _WHITESPACE_RE.sub(" ", s).strip()
+    return s
+
+
 def compute_wer(hypothesis: str, reference: str) -> float:
-    """Word Error Rate."""
+    """Word Error Rate after whisper-style text normalization."""
+    hypothesis = normalize_for_wer(hypothesis)
+    reference = normalize_for_wer(reference)
+
     try:
         import jiwer
         return jiwer.wer(reference, hypothesis)
@@ -121,8 +204,8 @@ def compute_wer(hypothesis: str, reference: str) -> float:
         pass
 
     # Fallback: word-level Levenshtein
-    ref_words = reference.lower().split()
-    hyp_words = hypothesis.lower().split()
+    ref_words = reference.split()
+    hyp_words = hypothesis.split()
 
     if not ref_words:
         return 0.0 if not hyp_words else 1.0
