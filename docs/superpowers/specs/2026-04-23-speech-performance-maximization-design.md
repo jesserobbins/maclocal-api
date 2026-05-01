@@ -1,9 +1,19 @@
 # Speech Performance Maximization — Design
 
-**Status:** Draft
-**Date:** 2026-04-23
+**Status:** Implementation in progress; reconciling pass 2026-05-01.
+**Date:** 2026-04-23 (initial); 2026-05-01 (reconciling pass against shipped behavior)
 **Author:** Jesse Robbins (with Claude)
-**Branch target:** `perf/speech-maximize` off a shared parent forked from `add-vision-speech-benchmarks`
+**Branch target:** Single branch `perf/speech-controller-followups` off `main`. (The original draft proposed a `perf/vision-speech-parent` topology with two child worktrees; that topology was abandoned during implementation and the speech work landed on a single branch directly off main. The vision arm has not started.)
+
+## Status snapshot (2026-05-01)
+
+- **Speech pipeline shipped on the HTTP path.** `Sources/MacLocalAPI/Speech/` contains the new components; the controller routes through `PipelineSpeechService`. `Models/SpeechService.swift` is **retained as the legacy/fallback service** (still wired for parity testing and as the pre-macOS-26 fallback shape) — the original "delete the legacy file" task in the plan is superseded.
+- **Bundled `en.txt` vocabulary live.** `freq20k-en.txt` and the n-gram-LID JSON are not bundled.
+- **Gate B is unreachable on the current Apple Speech surface.** Two negative spikes (additional bundled vocab in `024c54a`, `DictationTranscriber + SFCustomLanguageModelData` in `8aba53a`) confirm a bias ceiling on `contextualStrings` for phonetically-distant technical terms (PostgreSQL → "PostGerSQL", Kubernetes → "Hubernet's"). **Gate B is downgraded to report-only** in this revision; see "Primary success criterion" below.
+- **Gate-enforcement shims (`Scripts/speech-gates.sh`, `Scripts/vision-gates.sh`) have not shipped.** Gates A/B/C are evaluated by inspection of the JSONL/HTML reports today; the named shims remain a future task.
+- **Speculative-language-reassessment retry path** ships using URL re-open on the source file, **not** buffer re-feed (see "Speculative language reassessment" below). Two attempts to wire VAD-trimmed PCM through to `SpeechAnalyzer.start(inputSequence:)` were reverted (process-crash on first request, second attempt with same symptom). `PreparedAudio` retains a `samples: [Float]` field as a placeholder for a future streaming attempt.
+- **Calibration script (`Scripts/calibrate-reassessor.sh`) has not shipped.** Reassessor thresholds (0.55 confidence, 0.6 OOV ratio, 3 s evaluation window, 1.5 s minimum duration) are picked by inspection and hardcoded as defaults in `LanguageReassessor.swift`.
+- **Vision arm has not started.** The companion vision spec describes work that is wholly future at this revision.
 
 ## Problem
 
@@ -20,11 +30,13 @@ Make the speech endpoint the most accurate, zero-configuration transcription pat
 Expressed as three gates enforced by the benchmark harness in `Scripts/test-vision-speech.sh`:
 
 - **Gate A (required):** On every English case in the expanded corpus, `afm_wer_zero_config ≤ whisper_wer`. Ties are allowed (whisper hits 0.0 on easy cases — AFM can tie but not strictly beat them). No regressions past equality.
-- **Gate B (required):** On the technical/domain English subset, `afm_wer_zero_config ≤ whisper_wer − 0.05` (strict win by at least 5 absolute WER points). This is the subset where bundled contextual vocabulary is expected to move the needle.
+- **Gate B (report-only as of 2026-05-01):** On the technical/domain English subset, the spec originally required `afm_wer_zero_config ≤ whisper_wer − 0.05`. Two negative spikes (additional bundled vocab in `024c54a`, `DictationTranscriber + SFCustomLanguageModelData` in `8aba53a`) confirm the Apple-model bias ceiling on phonetically-distant terms. Per the "Spike-fail branches" rule below, **Gate B is downgraded to report-only**: the metric is still computed and surfaced in the HTML report, but does not cause a non-zero exit. Closing Gate B requires a different transcriber backend (whisper-cpp itself, an on-device fine-tune, etc.) and is out of scope for this spec.
 - **Gate C (required):** Mean word-timing error ≤ 150 ms on the timing-ground-truthed subset.
 - **Regression alarm (report-only):** Any non-English case where WER worsens vs current baseline by more than 5 absolute points.
 
-"Zero-config" means: no env vars set, no project vocab file present, no `prompt` field in the request. The caller supplies only audio and the default `model` / `response_format`.
+"Zero-config" means no *tuning* env vars or project files are set: no `MACAFM_SPEECH_VOCAB_FILE`, no `MACAFM_SPEECH_LOCALE`, no project `.afm/speech-vocab.txt`, no `prompt` field, no `language` field in the request. The caller supplies only audio and the default `model` / `response_format`. **Infrastructure** env vars (`MACAFM_MLX_MODEL_CACHE`, `PORT`) are explicitly **not** considered "tuning" and are present in the gate harness; they affect where/how the server runs, not what hints reach the recognizer. The Gate-A/B/C JSONL columns reflect zero-tuning runs against a server started with infrastructure defaults only.
+
+Gate-enforcement shims (`Scripts/speech-gates.sh`, `Scripts/vision-gates.sh`) are listed in the implementation plan but have not shipped — gates are evaluated by inspection of the JSONL/HTML output today.
 
 ## Non-goals
 
@@ -90,7 +102,7 @@ Endpoint unchanged: `POST /v1/audio/transcriptions`. OpenAI-compatible wire form
 | `model` | Informational; no model selection behavior in v1 | — |
 | `language` | Locale override; skips speculative retry | `en-US` if absent |
 | `prompt` | Per-request contextual strings | none |
-| `response_format` | `text` / `json` / `verbose_json` / `srt` / `vtt` | `json` |
+| `response_format` | `text` / `json` / `verbose_json` (shipped); `srt` / `vtt` (deferred — fall through to JSON) | `json` |
 | `timestamp_granularities[]` | `word` / `segment` (enables word timings in `verbose_json`) | `segment` |
 | `temperature` | Accepted, no-op (SpeechAnalyzer does not expose it) | — |
 
@@ -104,7 +116,9 @@ When `response_format=verbose_json`, the response includes:
 - `words[]` — word-level timings and confidence (when `word` granularity requested).
 - `language_reassessed` — `true` iff the speculative retry fired and changed locale.
 
-`json` and `text` shapes stay byte-compatible with the current endpoint.
+`json` and `text` shapes stay byte-compatible with the current endpoint. `verbose_json` is a strict superset (additional fields, no removals), but the field *ordering* is not stable across implementations — strict OpenAI SDKs (openai-python ≥ 1.x, langchain) deserialize by name and tolerate this; clients that depend on serial ordering of JSON keys may need to be validated. Validated against `openai-python` chat-completions clients only at this revision.
+
+Caller-supplied `srt`/`vtt` requests do not error today — they fall through to the JSON response. Clients sending `srt`/`vtt` will receive valid JSON, not subtitles. Closing this is tracked as a follow-up.
 
 ### Hint precedence
 
@@ -150,9 +164,15 @@ Thin wrapper over `SpeechAnalyzer` configured with a `SpeechTranscriber` module.
 
 ### ContextualVocabResolver
 
-Loads the four hint sources (bundled / env / project / request), merges with deduplication and case folding, and emits the final `[String]` handed to `AnalysisContext.contextualStrings` (or the spike-determined equivalent). Bundled vocab and env/project files are loaded once at server startup; per-request merging is cheap string-list union with a cap.
+Loads the four hint sources (bundled / env / project / request), merges with deduplication and case folding, and emits the final `[String]` handed to `AnalysisContext.contextualStrings`. Bundled vocab and env/project files are loaded once at server startup; per-request merging is cheap string-list union with a cap.
 
 **Bundled default source:** plaintext at `Resources/speech-vocab/en.txt` (~1–3k phrases, curated from observed transcription errors plus a general tech/product/place-name base). Editable as plaintext; no build-time compilation.
+
+**Resolver caps:** the merged list is capped at **4096 entries**; per-entry length is capped at **100 characters**. Truncation is silent (longest-list-first eviction at the cap); the rationale is twofold: (a) `contextualStrings` saturates around the existing list size — adding more dilutes per-entry weight (see commit `024c54a` finding) — so the cap protects against degraded recognition under pathological inputs; (b) it bounds memory and merge cost regardless of caller behavior. These caps apply to **every** resolver layer (bundled / env / project / request); a pathological project file cannot swamp the bundled defaults.
+
+**Locale-key resolution:** the resolver currently keys all hints under the `.general` `AnalysisContext.ContextualStringsTag`. Locale-specific vocab files (`Resources/speech-vocab/<locale>.txt`) are not yet sourced beyond `en.txt`; when added, locale matching uses a normalized comparison (lowercase, `_`→`-`) and falls back through the BCP-47 hierarchy: exact match (`en-GB`) → language-only (`en`) → `en` baseline. This matches the `SpeechTranscriberEngine.ensureLocaleInstalled` normalization rule.
+
+**PII / data handling:** bundled `en.txt` ships in the binary plaintext and is visible to anyone with `strings`. **Only public-domain or generic terms are permitted in bundled vocab** — no customer names, no observed-from-real-traffic identifiers, no internal product codenames. This rule is project policy, not a runtime check; reviewers enforce on PRs that touch `Resources/speech-vocab/`.
 
 ### LanguageReassessor
 
@@ -183,13 +203,15 @@ All of:
 
 All three required. Requiring all three keeps false positives low: technical English fires (1) but fails (2); accented English fires (2) but fails (3).
 
-### Mechanics
+### Mechanics (as shipped)
 
-1. First pass runs streaming. After 3 s of emitted tokens, reassessor evaluates the trigger.
-2. On fire, cancel the first analyzer, retain the already-buffered preprocessed audio, check out an analyzer for the detected locale, feed the same buffer through.
-3. The detected locale is the top guess of the n-gram identifier constrained to `SpeechAnalyzer`-supported locales. If the guess is unsupported, retry is abandoned; response sets `language_uncertain: true`.
-4. Hard cap: one retry. Worst-case latency = first-pass cutoff (3 s) + one full second pass.
+1. First pass runs against the source URL on `SpeechTranscriber` with an `en-US` analyzer.
+2. After first-pass completion, the reassessor evaluates the trigger inputs from the completed `TranscriptionAttempt`.
+3. On fire, the engine **re-opens the source URL** on a fresh analyzer checked out for the detected locale and re-runs transcription. Hard cap: one retry. Worst-case latency = first pass + one full second pass.
+4. The detected locale is the top guess of the n-gram identifier constrained to `SpeechAnalyzer`-supported locales. If the guess is unsupported, retry is abandoned; response sets `language_uncertain: true`.
 5. Memoized per process by `(source_file_hash → detected_locale)` so repeat benchmark runs skip detection.
+
+**Deferred:** the original spec described cancelling the first analyzer mid-stream and re-feeding an in-memory PCM buffer to a fresh analyzer (avoiding the second URL open). Two attempts to wire VAD-trimmed PCM through `SpeechAnalyzer.start(inputSequence:)` were reverted (process crashes on first request, suspected `AVAudioPCMBuffer` lifecycle issue across the bridge). Re-opening the URL is the shipped mechanic; the in-memory buffer reuse is a future optimization once the streaming path is debugged. `PreparedAudio.samples: [Float]` is retained as a placeholder for that future attempt and has no current consumer.
 
 ### Surfaced state
 
@@ -197,7 +219,7 @@ All three required. Requiring all three keeps false positives low: technical Eng
 
 ### Calibration
 
-Thresholds (0.55 confidence, 0.6 OOV, 3 s cutoff) are starting points. The implementation plan includes a calibration task that sweeps them on the expanded corpus and selects values that maximize retry-correctness on misrouted cases without triggering on clean English. The spec fixes the *shape* of the rule; constants are tuned during implementation.
+Thresholds (mean per-word confidence 0.55, OOV ratio 0.6, 3 s evaluation window, 1.5 s minimum duration) ship as defaults in `LanguageReassessor.swift` and were chosen by inspection on the existing 24-case corpus. The plan's proposed `Scripts/calibrate-reassessor.sh` sweep did not ship — the bias-saturation finding plus the spike-fail outcome reduced the practical value of fine-tuning these constants, and the n-gram language identifier itself is not currently bundled (see `LanguageReassessor.swift`'s placeholder `detectedLanguageGuess` consumer). When the reassessor's third condition (early-frame language estimate) is wired up, a calibration sweep is appropriate; until then the thresholds are calibration-locked at the picked defaults and gate failures escalate (see the implementation plan's escalation rule) rather than triggering re-tuning.
 
 ## Bundled vocab and resource bundling
 
@@ -242,10 +264,10 @@ Additions to the existing schema:
 
 The existing HTML `vision-speech-*-report.html` gains a top-level "Speech Zero-Config vs Whisper" block: red/green per case, with the three gates called out explicitly.
 
-## Migration and replacement
+## Migration and replacement (as shipped)
 
-- `Models/SpeechService.swift` and its `SFSpeechRecognizer`-based body are deleted.
-- `Controllers/SpeechAPIController.swift` is updated to consume the new `Speech/SpeechService.swift` API surface.
+- `Models/SpeechService.swift` (the `SFSpeechRecognizer`-based service) is **retained as the legacy/fallback path** — it stays compiled and is the documented fallback shape for any pre-macOS-26 host that re-enters the build, and continues to receive the resolver via DI. The original "delete the legacy file" plan step is superseded; the new pipeline becomes the macOS-26+ default via `PipelineSpeechService` rather than by deleting the legacy code.
+- `Controllers/SpeechAPIController.swift` is updated to route requests through `PipelineSpeechService` (the new default factory) while keeping `FakeSpeechService` injection for tests.
 - Existing tests under `Tests/MacLocalAPITests/SpeechAPIControllerTests.swift` remain and are updated to new return shapes. Per-component tests added under `Tests/MacLocalAPITests/Speech/`.
 - `SpeechError` cases carried over; new cases added.
 - `SpeechRequestOptions` extended with the new fields (prompt, language, response_format, timestamp_granularities).
@@ -272,8 +294,16 @@ Before any structural change, a 1–2 day spike verifies the three most API-sens
 - `roborev-refine` loop on the `perf/speech-maximize` branch during implementation; `roborev-design-review-branch` at merge time.
 - Parent branch (forked from `add-vision-speech-benchmarks`) merges to `main` once both Speech and Vision sub-branches land.
 
+## Resource size budget
+
+The shipped binary bundles `Resources/speech-vocab/en.txt` (~3 kB at this revision; budgeted to 1–3 k phrases ≈ 30–90 kB), plus `default.metallib` and `Resources/webui/`. A future expansion adds `freq20k-en.txt` (~150 kB) and an n-gram-LID JSON (~20 kB) to support the third reassessor condition. **Total Speech-side bundled-resource budget: ≤ 500 kB** under the current plan; flag any single-file addition over 250 kB or aggregate growth past 500 kB in code review.
+
+## Cross-subsystem concurrency
+
+Speech requests do not currently share or contend with MLX inference (`/v1/chat/completions`, `/v1/batch/completions`) for GPU/ANE: `SpeechAnalyzer` runs on Apple's Speech daemon (out-of-process), MLX runs in-process on Metal. The `SpeechTranscriberPool`'s "one in-flight per `(locale, featureSet)` key, en-US pinned" constraint applies only within the speech subsystem. A speech burst that runs concurrent with a long MLX decode does not slow either path beyond OS-level scheduling. This is observation, not a guarantee — Apple may co-schedule on shared hardware in future macOS releases; revisit if the per-request latency on speech grows under MLX load in the benchmark.
+
 ## Open items intentionally left to implementation
 
-- Exact threshold constants for the reassessor trigger (calibrated against corpus).
-- Initial contents of `Resources/speech-vocab/en.txt` (seeded from observed errors, grown during implementation).
+- Locale-keyed vocab files beyond `en.txt`; the resolver supports the `(locale).txt` shape, but only `en.txt` ships today.
+- Wiring the third reassessor condition (n-gram language identifier) — placeholder consumer only at this revision.
 - Whether to expose a `MACAFM_SPEECH_DOMAIN` preset flag shipping named vocab bundles ("coding", "medical", "legal") — tracked as a follow-up, not in this spec.

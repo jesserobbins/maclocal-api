@@ -2,6 +2,18 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+## Status (2026-05-01)
+
+**Vision arm has not started.** The speech arm shipped on `perf/speech-controller-followups` directly off `main`. The original `perf/vision-speech-parent` shared-parent + worktree topology is abandoned — Task 1's worktree-from-parent prescription is **superseded**. Fresh agents starting this work should branch directly off `main` (`git checkout -b perf/vision-maximize main`).
+
+**Prerequisites for any fresh checkout on this repo:** `git submodule update --init --recursive`, then `./Scripts/apply-mlx-patches.sh` to apply the MLX/xgrammar patches before `swift build`. Skipping these steps produces a confusing patch-related compile error.
+
+Task 12 ("Parent branch to main") is also **superseded** — the merge target is `main` directly, not a parent branch. See Task 12 for the updated instructions.
+
+## Spike outcomes
+
+Not yet run. Vision arm implementation has not started; no spikes have been executed. When work begins, follow the spike protocol in Task 2 and record findings here before proceeding to Task 3.
+
 **Goal:** Layer image preprocessing, bundled `customWords` defaults, PDF DPI control, and a low-confidence second-pass reprocessor around the existing `VisionService`, so zero-config AFM OCR ties-or-beats Tesseract on every corpus case (including `low-quality-scan.jpg` where it currently loses) and strictly wins on the domain-vocabulary subset.
 
 **Architecture:** New components under `Sources/MacLocalAPI/Vision/` injected at existing seams in `Models/VisionService.swift` — no replacement of the core service. `ImagePreprocessor` conditionally deskews / normalizes / binarizes / upscales. `PDFRasterizer` replaces the inline PDFKit render at 300 DPI default. `CustomWordsResolver` mirrors the Speech contextual-vocab merge pattern. `LowConfidenceReprocessor` runs a focused second pass on dense low-confidence regions.
@@ -14,7 +26,9 @@
 
 ## Prerequisites
 
-Task 1 of the Speech plan creates the shared parent branch `perf/vision-speech-parent` and worktree at `../maclocal-api-speech`. This Vision plan assumes that parent exists and starts by creating a second worktree off the same parent. If you are running Vision independently (without Speech), complete only Step 1 of Speech Task 1 (creating the parent) before proceeding here.
+~~Task 1 of the Speech plan creates the shared parent branch `perf/vision-speech-parent` and worktree at `../maclocal-api-speech`. This Vision plan assumes that parent exists and starts by creating a second worktree off the same parent. If you are running Vision independently (without Speech), complete only Step 1 of Speech Task 1 (creating the parent) before proceeding here.~~
+
+**Superseded.** The `perf/vision-speech-parent` topology is abandoned. Branch directly off `main`. See the Status section above and Task 1 below.
 
 ---
 
@@ -59,26 +73,39 @@ Task 1 of the Speech plan creates the shared parent branch `perf/vision-speech-p
 
 ---
 
-## Task 1: Vision worktree setup
+## Task 1: Vision branch setup — SUPERSEDED
+
+> **Status:** This task is **superseded**. The `perf/vision-speech-parent` shared-parent topology is abandoned. Fresh agents starting this work should branch directly off `main`. The steps below are kept as historical record only — do not execute them.
+
+**Replacement steps:**
+
+```bash
+git checkout main && git pull --ff-only
+git checkout -b perf/vision-maximize
+git submodule update --init --recursive
+./Scripts/apply-mlx-patches.sh
+swift build -c debug 2>&1 | tail -10
+```
 
 **Files:** none code.
 
-- [ ] **Step 1: From the main checkout, create the Vision worktree off the shared parent.**
+- [ ] ~~**Step 1: From the main checkout, create the Vision worktree off the shared parent.**~~
 
 ```bash
+# SUPERSEDED — do not run
 cd /Users/jesse/GitHub/maclocal-api
 git fetch origin perf/vision-speech-parent 2>/dev/null || git checkout perf/vision-speech-parent
 git worktree add -b perf/vision-maximize ../maclocal-api-vision perf/vision-speech-parent
 cd ../maclocal-api-vision && pwd
 ```
 
-- [ ] **Step 2: Baseline build.**
+- [ ] ~~**Step 2: Baseline build.**~~
 
 ```bash
 swift build -c debug 2>&1 | tail -10
 ```
 
-- [ ] **Step 3: Confirm branch state clean.**
+- [ ] ~~**Step 3: Confirm branch state clean.**~~
 
 ```bash
 git status
@@ -286,9 +313,15 @@ git commit -m "vision: PDFRasterizer at 300 DPI default fixes scrambled-PDF outp
 
 Mirrors Speech Task 5 exactly.
 
+**Resource constraints (same rules as speech vocab):**
+
+- 4096-entry cap and 100-character-per-entry cap, applied by `CustomWordsResolver` before passing to `VNRecognizeTextRequest.customWords`.
+- Public-domain or generic terms only — no proprietary names, PII, or terms that create legal exposure.
+- Total resource budget across both speech and vision subsystems: ≤ 1 MB combined. Keep entries lean; ship only terms that have a measured CER benefit.
+
 - [ ] **Step 1: Seed `Resources/vision-customwords/en.txt`.**
 
-~500–2000 entries across: medical (drug names, medical abbreviations), legal, technical (language/product/framework names, infrastructure terms), currency, units, common form-field labels, place names. Seed from observed errors on current corpus.
+~500–2000 entries across: medical (drug names, medical abbreviations), legal, technical (language/product/framework names, infrastructure terms), currency, units, common form-field labels, place names. Seed from observed errors on current corpus. Respect the 4096-entry / 100-char / ≤1 MB total budget constraints above.
 
 - [ ] **Step 2: Modify `Scripts/build-from-scratch.sh`.**
 
@@ -578,48 +611,47 @@ git push
 
 ---
 
-## Task 12: Parent branch to main
+## Task 12: Merge to main — SUPERSEDED
 
-**Only run this after BOTH Speech and Vision sub-branches have merged into `perf/vision-speech-parent`.**
+> **Status:** This task is **superseded**. The original plan merged `perf/vision-speech-parent` to `main` after both sub-branches landed. That parent branch was abandoned. The vision arm merges directly to `main` when complete. Steps 1–2 referencing the parent branch are replaced; Steps 3–5 are updated below.
 
-- [ ] **Step 1: Confirm both branches merged.**
+~~**Only run this after BOTH Speech and Vision sub-branches have merged into `perf/vision-speech-parent`.**~~
 
-```bash
-git log --oneline perf/vision-speech-parent | head -20
-# Expect commits from both perf/speech-maximize and perf/vision-maximize
-```
+- [ ] ~~**Step 1: Confirm both branches merged.**~~ **Superseded.** No parent branch exists.
 
-- [ ] **Step 2: Run the full suite one more time from the parent.**
+- [ ] **Step 2: Run the full suite one more time from the vision branch.**
 
 ```bash
 ./Scripts/test-vision-speech.sh --models <default-model> 2>&1 | tail -40
 ```
-Both Speech and Vision gates must pass.
 
-- [ ] **Step 3: Open a PR from `perf/vision-speech-parent` to `main`.**
+Vision Gate A and Gate C must pass. Gate B is report-only.
+
+- [ ] **Step 3: Open a PR from `perf/vision-maximize` to `main`.**
 
 ```bash
-gh pr create --base main --head perf/vision-speech-parent --title "perf: maximize vision and speech endpoint performance" --body "$(cat <<'EOF'
+gh pr create --base main --head perf/vision-maximize --title "perf: maximize vision endpoint performance" --body "$(cat <<'EOF'
+## Motivation
+
+[Add motivation here — the lived problem this solves.]
+
 ## Summary
-- Speech: replaces SFSpeechRecognizer with SpeechAnalyzer-based layered pipeline; bundled contextual vocabulary, analyzer pool, speculative language reassessment. Zero-config ties-or-beats whisper-cpp on English corpus.
+
 - Vision: layers image preprocessing, PDF DPI control, bundled customWords, and low-confidence second-pass reprocessor around existing VisionService. Fixes low-quality-scan.jpg regression and scrambled-PDF output.
 
 Specs:
-- docs/superpowers/specs/2026-04-23-speech-performance-maximization-design.md
 - docs/superpowers/specs/2026-04-23-vision-performance-maximization-design.md
 
 Plans:
-- docs/superpowers/plans/2026-04-23-speech-performance-maximization.md
 - docs/superpowers/plans/2026-04-23-vision-performance-maximization.md
 
 ## Test plan
-- [ ] swift test green
-- [ ] ./Scripts/test-vision-speech.sh --models <default> exits 0
-- [ ] Speech Gate A/B/C pass on expanded corpus
-- [ ] Vision Gate A/B/C pass on expanded corpus
-- [ ] roborev-refine loops clean on both sub-branches
 
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
+- [ ] swift test green
+- [ ] ./Scripts/test-vision-speech.sh exits 0 on Gates A and C (Gate B report-only)
+- [ ] low-quality-scan.jpg CER ≤ Tesseract baseline
+- [ ] invoice-standard.pdf produces non-garbage output
+- [ ] roborev-refine loop clean
 EOF
 )"
 ```

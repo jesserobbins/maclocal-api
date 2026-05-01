@@ -2,6 +2,26 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+## Status (2026-05-01)
+
+- **Branch topology:** Plan originally prescribed a `perf/vision-speech-parent` shared branch with two child worktrees (`perf/speech-maximize`, `perf/vision-maximize`). That topology was abandoned during implementation. The Speech work landed directly on `perf/speech-controller-followups` off `main`; the Vision arm has not started. Task 1 below is **superseded** — read it as historical record, not as a step to execute.
+- **Tasks 2–9 plus 10's pipeline body have shipped** under `Sources/MacLocalAPI/Speech/`. The Speech pipeline is live on the HTTP path; bundled `en.txt` ships; `PipelineSpeechService` is the controller's default factory.
+- **Task 9's `Scripts/calibrate-reassessor.sh` did not ship.** Reassessor thresholds are picked by inspection and hardcoded in `LanguageReassessor.swift`. The bias-saturation finding (commit `024c54a`) plus the `DictationTranscriber + SFCustomLanguageModelData` negative spike (`8aba53a`) reduced the value of fine-tuning these constants; per the spec's revised "Calibration" subsection, the thresholds are calibration-locked and gate failures escalate rather than re-tune.
+- **Task 10's "delete `Models/SpeechService.swift`" step is superseded.** The legacy `SFSpeechRecognizer`-based service is **retained** as the documented fallback shape; the new pipeline becomes the macOS-26+ default via `PipelineSpeechService` rather than by deleting the legacy code.
+- **Task 11 (corpus expansion) shipped a `say`-synthesized + whisper.cpp-fixtures corpus (24 cases total).** Common Voice and LibriVox sourcing did **not** ship — those require external downloads and licensing work and are descoped from this plan revision. Gate A's "every English case" scope is the 24-case corpus on disk under `Scripts/test-data/speech/`, not the originally proposed Common-Voice-augmented corpus.
+- **Task 12's gate-enforcement shim (`Scripts/speech-gates.sh`) did not ship.** Gates A/B/C are evaluated by inspection of the JSONL/HTML output today; the shim is a future task.
+- **Gate B is downgraded to report-only.** See the design spec's revised "Primary success criterion".
+
+## Spike outcomes
+
+This section is the durable trail for the spike "STOP if findings diverge" gate (Task 2 Step 7). Spikes that ran and what they produced:
+
+- **`AnalysisContext.contextualStrings` API check (Task 2 Step 1–2):** PASS. See `docs/superpowers/specs/2026-04-23-speech-spike-findings.md`. Proceeded with spec as written for the API surface.
+- **Per-analyzer memory + cancel-and-restart (Task 2 Steps 3–4):** Deferred to Task 8/9 integration tests per the spike findings. Two attempts to wire streaming PCM through `SpeechAnalyzer.start(inputSequence:)` for cancel-and-restart were **reverted** (process crash on first request, suspected `AVAudioPCMBuffer` lifecycle issue). The shipped retry path uses URL re-open on the source file; the in-memory buffer reuse is deferred. The spec's "Speculative language reassessment → Mechanics" section is updated to match.
+- **Bundled-vocab expansion (commit `024c54a`):** NEGATIVE. +90 specifically-misheard terms produced byte-identical output. `contextualStrings` saturates beyond the existing list size; further growth is not the path to recover Gate B cases.
+- **`DictationTranscriber + SFCustomLanguageModelData` (commit `8aba53a`):** NEGATIVE. CLM compile path works but transcription on `tech-database.wav` came back worse than the `SpeechTranscriber` baseline (DictationTranscriber word-splits `PostgreSQL` → `Poster SL` etc.). Spike code retained in tree as documentation; see `Sources/MacLocalAPI/Speech/CustomLanguageModelManager.swift` and `docs/notes/2026-04-26-optimization-session.md` for follow-up directions if anyone takes another swing.
+- **Decision per spike-fail branch:** "If no vocab-biasing mechanism is workable on either engine in the current macOS 26 surface: Gate B is unreachable. Notify; scope the spec down to Gates A and C; drop bundled-vocab work" — this branch fires partially. Bundled vocab still helps the cases where it does work (SageMaker, Lambda) so it stays shipped; Gate B is downgraded to report-only.
+
 **Goal:** Replace the `SFSpeechRecognizer`-based `Models/SpeechService.swift` with a layered `SpeechAnalyzer`/`SpeechTranscriber` pipeline whose zero-config defaults beat `whisper-cpp` WER on the expanded English benchmark corpus.
 
 **Architecture:** Components under `Sources/MacLocalAPI/Speech/` — `AudioPreprocessor`, `SpeechTranscriberPool`, `SpeechTranscriberEngine`, `ContextualVocabResolver`, `LanguageReassessor`, `SpeechService` (orchestrator). Bundled plaintext contextual vocabulary shipped via SPM resources mirrors the existing `Resources/webui/` pattern. Benchmark gates enforced in `Scripts/test-vision-speech.sh`.
@@ -58,7 +78,11 @@
 
 ---
 
-## Task 1: Parent branch + worktree setup (shared with Vision plan)
+## Task 1: Parent branch + worktree setup (shared with Vision plan) — SUPERSEDED
+
+> **Status:** This task is **superseded**. The shipped topology is a single branch (`perf/speech-controller-followups`) off `main`, with no `perf/vision-speech-parent` shared branch and no separate worktrees per arm. Future agents starting fresh from `main` should skip Task 1 entirely and create a single feature branch off `main` (`git checkout -b <topic> main`). The steps below are kept as historical record only — do not execute them.
+
+**Prerequisites for any fresh worktree on this repo:** `git submodule update --init --recursive`, then `./Scripts/apply-mlx-patches.sh` to apply the MLX/xgrammar patches before `swift build`. Skipping these steps produces a confusing patch-related compile error. (Per project memory.)
 
 **Files:** none code; only branch state.
 
@@ -537,11 +561,13 @@ git commit -m "speech: SpeechTranscriberPool with warm en-US and LRU eviction"
 
 ## Task 9: `LanguageReassessor` + threshold calibration
 
+> **Status (2026-05-01):** Reassessor implementation shipped. **`Scripts/calibrate-reassessor.sh` did not ship and is descoped from this plan.** Thresholds (0.55 confidence, 0.6 OOV ratio, 3 s evaluation window, 1.5 s minimum duration) are picked by inspection and hardcoded in `LanguageReassessor.swift`. Per the design spec's revised "Calibration" subsection, thresholds are calibration-locked; gate failures escalate (open a follow-up spec) rather than re-tune. The `freq20k-en.txt` and the n-gram-LID JSON also did not ship — the third reassessor condition (early-frame language estimate) has a placeholder consumer only. Step 8 (calibration script) and Step 9 (calibration log) below are skipped.
+
 **Files:**
-- Create: `Sources/MacLocalAPI/Speech/LanguageReassessor.swift`
-- Create: `Tests/MacLocalAPITests/Speech/LanguageReassessorTests.swift`
-- Create: `Resources/speech-vocab/freq20k-en.txt` (top-20k English frequency list from a public source; CC-BY attribution in `LICENSES.md`).
-- Create: `Scripts/calibrate-reassessor.sh` (runs the trigger rule across the corpus with a sweep of thresholds).
+- Create: `Sources/MacLocalAPI/Speech/LanguageReassessor.swift` ✅ shipped
+- Create: `Tests/MacLocalAPITests/Speech/LanguageReassessorTests.swift` ✅ shipped
+- Create: `Resources/speech-vocab/freq20k-en.txt` (top-20k English frequency list from a public source; CC-BY attribution in `LICENSES.md`). ❌ deferred
+- Create: `Scripts/calibrate-reassessor.sh` (runs the trigger rule across the corpus with a sweep of thresholds). ❌ descoped
 
 - [ ] **Step 1: Write failing test — all three conditions required.**
 
@@ -598,14 +624,16 @@ git commit -m "speech: LanguageReassessor with calibrated retry thresholds"
 
 ---
 
-## Task 10: `SpeechService` orchestrator + controller wiring + delete old service
+## Task 10: `SpeechService` orchestrator + controller wiring (legacy retained as fallback)
+
+> **Status (2026-05-01):** Pipeline orchestrator shipped as `PipelineSpeechService` (the controller's default factory) plus the underlying `SpeechPipelineService`. **The legacy `Models/SpeechService.swift` is retained**, not deleted — it stays as the documented pre-macOS-26 fallback shape and continues to receive the `ContextualVocabResolver` via DI. The original "delete the legacy file" step (Step 10 below) is **superseded**. Step 11's grep should now find references in fallback wiring; that's expected, not a regression.
 
 **Files:**
-- Create: `Sources/MacLocalAPI/Speech/SpeechService.swift`
-- Modify: `Sources/MacLocalAPI/Controllers/SpeechAPIController.swift`
-- Modify: `Sources/MacLocalAPI/Server.swift`
-- Delete: `Sources/MacLocalAPI/Models/SpeechService.swift`
-- Create: `Tests/MacLocalAPITests/Speech/SpeechServiceIntegrationTests.swift`
+- Create: `Sources/MacLocalAPI/Speech/SpeechService.swift` ✅ (shipped as `SpeechPipelineService.swift` + `PipelineSpeechService.swift` adapter)
+- Modify: `Sources/MacLocalAPI/Controllers/SpeechAPIController.swift` ✅
+- Modify: `Sources/MacLocalAPI/Server.swift` ✅
+- ~~Delete: `Sources/MacLocalAPI/Models/SpeechService.swift`~~ **Superseded — retained as fallback.**
+- Create: `Tests/MacLocalAPITests/Speech/SpeechServiceIntegrationTests.swift` ✅
 
 - [ ] **Step 1: Write failing integration test — end-to-end transcription via `SpeechService`.**
 
@@ -653,14 +681,9 @@ Replace all references to the old `Models.SpeechService`. Parse new HTTP fields:
 
 Wire them into the controller via DI (constructor injection).
 
-- [ ] **Step 10: Delete `Sources/MacLocalAPI/Models/SpeechService.swift`.**
+- [x] **Step 10: ~~Delete `Sources/MacLocalAPI/Models/SpeechService.swift`.~~** **Superseded.** The legacy SFSpeechRecognizer-based service is retained as the documented pre-macOS-26 fallback and continues to receive the `ContextualVocabResolver` via DI. The new pipeline becomes the macOS-26+ default via `PipelineSpeechService`.
 
-- [ ] **Step 11: Delete any remaining imports/references.**
-
-```bash
-grep -r "Models.SpeechService\|import.*Models.*SpeechService" Sources Tests
-```
-Expected: no matches.
+- [x] **Step 11: ~~Delete any remaining imports/references.~~** **Superseded.** Legacy references in fallback wiring are expected.
 
 - [ ] **Step 12: Run full test suite.**
 
@@ -680,6 +703,8 @@ git commit -m "speech: replace SFSpeechRecognizer SpeechService with SpeechAnaly
 
 ## Task 11: Corpus expansion
 
+> **Status (2026-05-01):** Corpus shipped. The actual corpus is **24 cases**: 18 `say`-synthesized clips plus 6 whisper.cpp fixtures fetched via `Scripts/fetch-whisper-test-samples.sh`. **Common Voice and LibriVox sourcing did not ship** — those require external downloads and licensing work and are descoped from this plan. Steps 2 and 4 below are descoped. Gate A's "every English case" scope is the 24-case corpus under `Scripts/test-data/speech/`, not the originally proposed Common-Voice-augmented corpus.
+
 **Files:**
 - Create: `Scripts/test-data/speech/*.wav` (~15–20 new clips)
 - Create: `Scripts/test-data/speech/*.txt` (matching ground truth)
@@ -690,9 +715,9 @@ git commit -m "speech: replace SFSpeechRecognizer SpeechService with SpeechAnaly
 
 Write scripts under `Scripts/test-data/speech/generators/tech-*.txt`; use `say -v Samantha -o output.aiff --file-format=WAVE --data-format=LEF32@16000` to synthesize.
 
-- [ ] **Step 2: Add Common Voice accented-English cases (× 4).**
+- [ ] ~~**Step 2: Add Common Voice accented-English cases (× 4).**~~ **Descoped.** External download + licensing work required; not shipped.
 
-Download from `https://commonvoice.mozilla.org/en/datasets` filtered to accent tags. Save as 16k mono WAV. Add attribution to `LICENSES.md`.
+~~Download from `https://commonvoice.mozilla.org/en/datasets` filtered to accent tags. Save as 16k mono WAV. Add attribution to `LICENSES.md`.~~
 
 - [ ] **Step 3: Generate phone-band / noisy degradations (× 3).**
 
@@ -702,9 +727,9 @@ ffmpeg -i clean.wav -ar 8000 -ac 1 -c:a pcm_mulaw phone-band.wav
 ffmpeg -i phone-band.wav -f lavfi -i anoisesrc=d=60:c=pink:r=16000:a=0.05 -filter_complex amix=inputs=2 noisy-phone.wav
 ```
 
-- [ ] **Step 4: Add long-form public-domain excerpts (× 2).**
+- [ ] ~~**Step 4: Add long-form public-domain excerpts (× 2).**~~ **Descoped.** LibriVox sourcing requires external downloads and licensing work; not shipped.
 
-LibriVox `.mp3` → 16k mono WAV; 5+ min each. Ground truth from LibriVox text source.
+~~LibriVox `.mp3` → 16k mono WAV; 5+ min each. Ground truth from LibriVox text source.~~
 
 - [ ] **Step 5: Add multilingual regression cases (× 3) and meetings (× 2).**
 
@@ -721,10 +746,12 @@ git commit -m "speech: expand benchmark corpus with accents, domain, long-form, 
 
 ## Task 12: Benchmark metrics + Gate A/B/C enforcement + end-to-end validation
 
+> **Status (2026-05-01):** **`Scripts/speech-gates.sh` did not ship and is descoped.** Gates A, B, and C are evaluated by inspection of the JSONL/HTML output from `Scripts/test-vision-speech.sh`; the enforcement shim is a future task. Step 3 (write the shim) and Step 4 (wire it) below are descoped. Additionally, **Gate B is downgraded to report-only** per the design spec revision — see the spec's "Primary success criterion" subsection and the Spike outcomes section above for the rationale.
+
 **Files:**
 - Modify: `Scripts/test-vision-speech.sh`
 - Modify: `Scripts/benchmark-results/` report templates (HTML renderer inside the script).
-- Create: `Scripts/speech-gates.sh` (invoked by suite; returns non-zero on Gate A/B/C failure).
+- ~~Create: `Scripts/speech-gates.sh` (invoked by suite; returns non-zero on Gate A/B/C failure).~~ **Descoped.**
 
 - [ ] **Step 1: Extend JSONL schema in `test-vision-speech.sh` per-case output.**
 
@@ -751,9 +778,9 @@ Reads the latest `vision-speech-*.jsonl`, enforces:
 tail -40 /tmp/speech-e2e.log
 ```
 
-- [ ] **Step 7: If gates fail, iterate on bundled vocab / preprocessing / thresholds until gates pass.**
+- [ ] **Step 7: If gates fail, iterate by adding bundled vocab entries or preprocessing tuning.**
 
-This may require adding entries to `Resources/speech-vocab/en.txt` driven by observed errors. Commit each iteration separately with a message naming the gate that was fixed.
+Add entries to `Resources/speech-vocab/en.txt` driven by observed errors; commit each iteration separately with a message naming the gate that was fixed. **Thresholds are calibration-locked** (see implementer notes and the design spec's "Calibration" subsection) — do not weaken them to make a gate pass. A Gate B failure that vocab/preprocessing cannot fix is an escalation: open a follow-up spec, do not weaken thresholds. Note that Gate B is currently report-only, so a Gate B failure does not block progress.
 
 - [ ] **Step 8: When all gates pass, commit the final state.**
 
@@ -778,11 +805,10 @@ git push
 
 ## Success Criteria
 
-- All 12 tasks' checkboxes ticked.
+- All non-superseded, non-descoped task steps complete (see Status section at top of plan for the descope list).
 - `swift test` green.
-- `./Scripts/test-vision-speech.sh` exits 0 with all three gates passing.
-- No references to `SFSpeechRecognizer` remain in `Sources/` (verify via grep).
-- `perf/speech-maximize` merged into `perf/vision-speech-parent`.
+- `Scripts/test-vision-speech.sh` exits 0 on Gates A and C (Gate B is report-only per spec revision — a Gate B failure is recorded in the report and triggers a follow-up spec, but does not block completion).
+- No `SFSpeechRecognizer` usage on the macOS-26+ default path (legacy `Models/SpeechService.swift` retained as fallback — that usage is expected and allowed).
 
 ## Notes for Implementers
 

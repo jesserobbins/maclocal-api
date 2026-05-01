@@ -1,9 +1,9 @@
 # Vision Performance Maximization — Design
 
-**Status:** Draft
-**Date:** 2026-04-23
+**Status:** Not started as of 2026-05-01. Speech arm has shipped on `perf/speech-controller-followups`; the Vision arm has not begun. The implementation plan and this spec describe future work.
+**Date:** 2026-04-23 (initial); 2026-05-01 (status update)
 **Author:** Jesse Robbins (with Claude)
-**Branch target:** `perf/vision-maximize` off the shared parent forked from `add-vision-speech-benchmarks`
+**Branch target:** Single new branch off `main` (the original `perf/vision-maximize` worktree off a shared `perf/vision-speech-parent` topology was abandoned during the Speech arm and is not the current shape).
 **Companion spec:** `2026-04-23-speech-performance-maximization-design.md`
 
 ## Problem
@@ -30,10 +30,10 @@ Three gates enforced by `Scripts/test-vision-speech.sh`:
 
 - **Gate A (required):** On every case in the current + expanded corpus, `afm_cer_zero_config ≤ tesseract_cer` (ties allowed). No regressions past equality; specifically, `low-quality-scan.jpg` must move from loss to tie-or-win.
 - **Gate B (required):** On the domain-vocabulary subset (medical, legal, technical documents), `afm_cer_zero_config ≤ tesseract_cer − 0.02` (strict win by at least 2 absolute CER points). This is where bundled `customWords` is expected to contribute.
-- **Gate C (required):** On the PDF subset, no output with detectable garbage-character rates > 10% (sanity check — catches the current invoice-standard.pdf failure mode).
+- **Gate C (required):** On the PDF subset, no output with detectable garbage-character rates > 10%. **Predicate:** for a Latin-script ground-truth case, count the fraction of output characters falling in any of these Unicode blocks: `Cyrillic` (U+0400–U+04FF), `Greek and Coptic` (U+0370–U+03FF), `Tibetan` (U+0F00–U+0FFF), or any C0/C1 control character outside `\t \n \r`. Sum-fraction-by-character > 0.10 trips Gate C. The chosen blocks are the canonical "garbage tells" observed in the original `invoice-standard.pdf` failure (`Γ 9ρ69`); they are not language-presence detectors and will not fire on legitimate Latin-script documents that happen to quote a Greek/Cyrillic word. Non-Latin-script ground-truth cases are excluded from Gate C and reported as N/A.
 - **Regression alarm (report-only):** Any case where `afm_cer_zero_config` worsens vs current baseline by more than 3 absolute points.
 
-"Zero-config" means: caller passes only image bytes, no recognition language list, no custom words, no preprocessing flags, no env vars set.
+"Zero-config" means no *tuning* env vars or project files: no `MACAFM_VISION_CUSTOM_WORDS_FILE`, no `.afm/vision-customwords.txt`, no per-request `custom_words[]`, no `preprocess` override, no `pdf_dpi` override, no recognition language list. **Infrastructure** env vars (`MACAFM_MLX_MODEL_CACHE`, `PORT`) are explicitly **not** "tuning" and may be present in the gate harness; matches the Speech-spec convention.
 
 ## Non-goals
 
@@ -151,6 +151,10 @@ Loaded once at server startup; per-request merge is cheap union-with-dedup. Resu
 
 **Bundling:** mirrors the Speech approach and the existing `Resources/webui/` precedent. Plaintext files copied via SPM `.copy("Resources/vision-customwords")` in `Package.swift`. No build-time compile step (Apple's `customWords` API consumes strings directly).
 
+**Resolver caps:** merged list capped at **4096 entries**, per-entry length capped at **100 characters**, applied to every layer (bundled / env / project / request). Truncation is silent; rationale matches the Speech spec — bounds memory and merge cost, and protects against pathological project files swamping bundled defaults.
+
+**PII / data handling:** bundled `vision-customwords/en.txt` ships in the binary plaintext. **Only public-domain or generic terms** — no customer data observed during real-world OCR testing, no internal product codenames. Project policy enforced at PR-review time on `Resources/vision-customwords/`.
+
 ### LowConfidenceReprocessor
 
 Entry: `func reprocess(originalImage:, lowConfidenceRegions:, options:) async -> [VNRecognizedTextObservation]`.
@@ -240,6 +244,14 @@ A half-day spike — smaller than Speech's, because Vision doesn't pivot on a fr
 - Per-stage merges to the parent branch encouraged: `PDFRasterizer` alone is a clear fix and can ship on its own if later stages drag.
 - `roborev-refine` loop during implementation; `roborev-design-review-branch` at merge time.
 - Parent branch (forked from `add-vision-speech-benchmarks`) merges to `main` once both Speech and Vision sub-branches land.
+
+## Resource size budget
+
+Bundled `vision-customwords/en.txt` budgeted at 500–2000 entries (~15–60 kB). Combined with the Speech-side budget the **total resource budget across both subsystems is ≤ 1 MB**; flag any single-file addition over 250 kB or aggregate growth past 1 MB in code review. `default.metallib` and `Resources/webui/` are the existing baseline; the new bundles are additive.
+
+## Cross-subsystem concurrency
+
+Vision (`VNRecognizeTextRequest`) runs in-process on a dedicated Vision queue; MLX runs in-process on Metal; Speech runs out-of-process via Apple's Speech daemon. Vision and MLX share the GPU, so a Vision request concurrent with a long MLX decode does compete for the same Metal command queue — but in practice Vision is short (sub-second per image) and MLX decode is already compute-bound, so contention is bounded. The pool's "one in-flight per key" constraint applies only within Speech; Vision has no equivalent constraint at this revision and serializes per-process via the underlying Vision queue. Revisit if a Vision burst slows MLX decode noticeably under benchmark load.
 
 ## Open items intentionally left to implementation
 
