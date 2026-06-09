@@ -36,16 +36,22 @@ Extensive testing of Qwen3.5-35B-A3B with afm. Uses an experimental technique wi
 
 Run open-source MLX models **or** Apple's on-device Foundation Model through an OpenAI-compatible API. Built entirely in Swift for maximum Metal GPU performance. No Python runtime, no cloud, no API keys.
 
+## What's new in afm-next
+
+> [!IMPORTANT]
+> The nightly build is the future stable release. It includes everything in v0.9.11 plus:
+> - No new features yet — nightly is currently in sync with the stable release
+
+> [!TIP]
+> 🙏 **Huge thanks to [@jesserobbins](https://github.com/jesserobbins)** — first-time contributor, landed two substantial features in this cycle (Vision OCR + Speech transcription). Both PRs brought afm's Apple-native capabilities from the CLI into first-class HTTP APIs. Contributions of this size and quality from a new contributor are rare and appreciated.
+
 ## Install
 
-|  | Stable (v0.9.10) | Nightly (afm-next) |
+|  | Stable (v0.9.11) | Nightly (afm-next) |
 |---|---|---|
 | **Homebrew** | `brew install scouzi1966/afm/afm` | `brew install scouzi1966/afm/afm-next` |
 | **pip** | `pip install macafm` | `pip install --extra-index-url https://kruks.ai/afm/wheels/simple/ macafm-next` |
-| **Release notes** | [v0.9.10](https://github.com/scouzi1966/maclocal-api/releases/tag/v0.9.10) | [v0.9.10-next](https://github.com/scouzi1966/maclocal-api/releases/tag/nightly-20260408-628c2bb) |
-
-> [!NOTE]
-> The stable release (v0.9.10) and the latest nightly are currently at the same level. Either one will give you the same experience.
+| **Release notes** | [v0.9.11](https://github.com/scouzi1966/maclocal-api/releases/tag/v0.9.11) | [v0.9.11-next](https://github.com/scouzi1966/maclocal-api/releases/tag/nightly-20260418-9c3225e) |
 
 > [!TIP]
 > **Switching between stable and nightly:**
@@ -55,11 +61,32 @@ Run open-source MLX models **or** Apple's on-device Foundation Model through an 
 > ASSUMES you did a brew install scouzi1966/afm/afm previously
 > ```
 
-## What's new in afm-next
+### Install a previous version
 
-> [!IMPORTANT]
-> The nightly build is the future stable release. It includes everything in v0.9.10 plus:
-> - No new features yet — nightly is currently in sync with the stable release
+Older stable releases are kept as pinned formulae in the Homebrew tap and as version-pinned wheels on PyPI. Useful for reproducing an issue against a specific build or rolling back without waiting for a new release.
+
+**Homebrew (pinned stable formulae):** `afm@<version>` — available for `0.9.0`, `0.9.1`, `0.9.3`–`0.9.10`.
+
+```bash
+brew install scouzi1966/afm/afm@0.9.10      # install v0.9.10
+brew uninstall afm                          # if current afm is already installed
+brew link afm@0.9.10                        # expose `afm` on PATH
+afm --version                               # → v0.9.10
+```
+
+**Homebrew (pinned nightly formulae):** `afm-next@<full-version>` — e.g. `afm-next@0.9.11-next.9c3225e.20260418`. Lists of available pinned nightlies are at [github.com/scouzi1966/homebrew-afm](https://github.com/scouzi1966/homebrew-afm).
+
+```bash
+brew install scouzi1966/afm/afm-next@0.9.11-next.9c3225e.20260418
+```
+
+**pip (version-pinned wheels):** any published release.
+
+```bash
+pip install macafm==0.9.10                  # previous stable
+pip install --extra-index-url https://kruks.ai/afm/wheels/simple/ \
+  macafm-next==0.9.11.dev20260418           # pinned nightly
+```
 
 ## Quick Start
 
