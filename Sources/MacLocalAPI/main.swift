@@ -2,9 +2,12 @@ import ArgumentParser
 import Foundation
 import Darwin
 
-// Global references for signal handling
-private var globalServer: Server?
-private var shouldKeepRunning = true
+// Global references for signal handling. Accessed from the C signal handler
+// (a nonisolated context), so these opt out of the main-actor isolation that
+// Swift 6 infers for top-level globals. Signal-handler access is inherently
+// single-threaded with respect to the run loop, so the unsafety is contained.
+nonisolated(unsafe) private var globalServer: Server?
+nonisolated(unsafe) private var shouldKeepRunning = true
 
 // Signal handler function
 func handleShutdown(_ signal: Int32) {
@@ -20,12 +23,12 @@ struct ServeCommand: ParsableCommand {
         discussion: "Starts the macOS server that exposes Apple's Foundation Models through OpenAI-compatible API"
     )
     
-    @Option(name: .shortAndLong, help: "Port to run the server on")
-    var port: Int = 9999
-    
+    @Option(name: .shortAndLong, help: "Port to run server on (default: 9999, falls back to ephemeral if busy)")
+    var port: Int?
+
     @Option(name: [.customShort("H"), .long], help: "Hostname to bind server to")
     var hostname: String = "127.0.0.1"
-    
+
     @Flag(name: .shortAndLong, help: "Enable verbose logging")
     var verbose: Bool = false
 
@@ -77,6 +80,9 @@ struct ServeCommand: ParsableCommand {
     @Option(name: .long, help: "Pre-warm the model on server startup for faster first response (y/n, default: y)")
     var prewarm: String = "y"
 
+    @Option(name: .long, help: "Constrain output to match a JSON schema (vLLM-compatible). Applied to chat completions that omit their own response_format.")
+    var guidedJson: String?
+
     func run() throws {
         // Validate temperature parameter
         if let temp = temperature {
@@ -96,13 +102,32 @@ struct ServeCommand: ParsableCommand {
             }
         }
 
+        let defaultGuidedJsonSchema: ResponseFormat?
+        if let guidedJson {
+            let schema = try parseGuidedJsonSchema(guidedJson)
+            defaultGuidedJsonSchema = ResponseFormat(type: "json_schema", jsonSchema: schema)
+        } else {
+            defaultGuidedJsonSchema = nil
+        }
+
+        // Port selection: use requested port, default 9999, or fall back to ephemeral
+        let chosenPort: Int
+        if let requested = port {
+            chosenPort = requested
+        } else if isPortAvailable(9999) {
+            chosenPort = 9999
+        } else {
+            chosenPort = try findEphemeralPort()
+            print("Port 9999 is busy, using ephemeral port \(chosenPort)")
+        }
+
         // Parse prewarm flag
         let prewarmEnabled = prewarm.lowercased() != "n" && prewarm.lowercased() != "no" && prewarm != "0"
         let telegramConfiguration = try makeTelegramConfiguration(
             rawBotToken: telegramBotToken,
             rawAllowlist: telegramAllow,
             hostname: hostname,
-            port: port,
+            port: chosenPort,
             modelID: "foundation",
             instructions: instructions,
             verbose: verbose || veryVerbose || vv,
@@ -128,7 +153,7 @@ struct ServeCommand: ParsableCommand {
         // Start server in async context
         _ = Task {
             do {
-                let server = try await Server(port: port, hostname: hostname, verbose: verbose, veryVerbose: veryVerbose || vv, trace: vv, streamingEnabled: !noStreaming, instructions: instructions, adapter: adapter, temperature: temperature, randomness: randomness, permissiveGuardrails: permissiveGuardrails, stop: stop, webuiEnabled: webui, gatewayEnabled: gateway, prewarmEnabled: prewarmEnabled, telegramConfiguration: telegramConfiguration)
+                let server = try await Server(port: chosenPort, hostname: hostname, verbose: verbose, veryVerbose: veryVerbose || vv, trace: vv, streamingEnabled: !noStreaming, instructions: instructions, adapter: adapter, temperature: temperature, randomness: randomness, permissiveGuardrails: permissiveGuardrails, stop: stop, webuiEnabled: webui, gatewayEnabled: gateway, prewarmEnabled: prewarmEnabled, telegramConfiguration: telegramConfiguration, defaultGuidedJsonSchema: defaultGuidedJsonSchema)
                 globalServer = server
                 try await server.start()
             } catch {
@@ -346,6 +371,8 @@ struct MlxCommand: ParsableCommand {
     var kvBits: Int?
     @Option(name: .long, help: "Prefill step size — number of prompt tokens processed per GPU pass (default: 2048)")
     var prefillStepSize: Int?
+    @Option(name: .long, help: "Pre-warm MLX kernels on startup for faster first response/TTFT (y/n, default: y)")
+    var prewarm: String = "y"
     @Flag(name: .long, help: "Trust remote code (compatibility)")
     var trustRemoteCode: Bool = false
     @Option(name: .long, help: "Chat template (compatibility)")
@@ -390,6 +417,15 @@ struct MlxCommand: ParsableCommand {
 
     @Flag(name: .long, help: "Enable radix tree prefix caching for KV cache reuse across requests")
     var enablePrefixCaching: Bool = false
+
+    @Flag(name: .long, help: "Enable MTP self-speculative decoding (Qwen3.6 models with an mtp.safetensors sidecar). Faster decode, identical greedy output. No-op if the model has no MTP head.")
+    var mtp: Bool = false
+
+    @Option(name: .long, help: "MTP draft depth (accepted for compatibility; the loop currently uses the fixed depth-2-bonus structure from mlx-lm PR #990 — ~+50% decode vs AR on M4 Pro — so this value is not used).")
+    var mtpDepth: Int = 1
+
+    @Option(name: .long, help: "Enable EAGLE3 speculative decoding for a dense Gemma4 verifier. Pass the drafter directory (config.json + safetensors). Faster decode, identical greedy output. No-op if the verifier is not a dense Gemma4 text model.")
+    var eagle3: String?
 
     @Option(name: .long, help: "Write cache timing profile records as JSONL to this file")
     var cacheProfilePath: String?
@@ -467,6 +503,9 @@ struct MlxCommand: ParsableCommand {
         if let prefillStepSize { service.prefillStepSize = prefillStepSize }
         service.kvEvictionPolicy = kvEviction ?? "none"
         service.enablePrefixCaching = enablePrefixCaching
+        service.mtpEnabled = mtp
+        service.mtpDepth = mtpDepth
+        service.eagle3DrafterPath = eagle3
         service.cacheProfilePath = cacheProfilePath
         service.enableGrammarConstraints = enableGrammarConstraints
         // --concurrent N: 0 or 1 silently falls back to serial; nil = serial; 2+ = batch mode
@@ -627,6 +666,8 @@ struct MlxCommand: ParsableCommand {
             print("Loading MLX model (download if needed): \(selectedModel)")
         }
 
+        let prewarmEnabled = prewarm.lowercased() != "n" && prewarm.lowercased() != "no" && prewarm != "0"
+
         _ = Task {
             do {
                 let loadReporter = MLXLoadReporter(modelID: selectedModel)
@@ -639,6 +680,23 @@ struct MlxCommand: ParsableCommand {
                 loadReporter.finish(success: true)
                 // Initialize concurrent scheduler after model is loaded
                 try await service.initScheduler()
+                // Prewarm MLX Metal kernels (prefill + decode + gated-delta step) so the FIRST
+                // real request doesn't pay the one-time ~0.35s graph/kernel compilation that
+                // otherwise inflates time-to-first-token. Best-effort; never blocks serving.
+                if prewarmEnabled {
+                    let prewarmStart = Date()
+                    do {
+                        _ = try await service.generate(
+                            model: selectedModel,
+                            messages: [Message(role: "user", content: "warmup")],
+                            temperature: 0, maxTokens: 4, topP: nil, repetitionPenalty: nil)
+                        if verbose {
+                            print("MLX prewarm complete in \(String(format: "%.2f", Date().timeIntervalSince(prewarmStart)))s")
+                        }
+                    } catch {
+                        if verbose { print("MLX prewarm skipped: \(error)") }
+                    }
+                }
                 let server = try await Server(
                     port: chosenPort,
                     hostname: hostname,
@@ -700,7 +758,7 @@ struct MlxCommand: ParsableCommand {
         }
 
         let group = DispatchGroup()
-        var output: Result<String, Error>?
+        let output = SendableBox<Result<String, Error>?>(nil)
         // In single-prompt mode, suppress ALL output (stdout + stderr) during model loading
         // and generation. Only the final response goes to stdout. --verbose overrides this.
         let stdoutFD = dup(STDOUT_FILENO)
@@ -763,10 +821,10 @@ struct MlxCommand: ParsableCommand {
                     stop: stopSequences,
                     responseFormat: responseFormat
                 )
-                output = .success(res.content)
+                output.value = .success(res.content)
             } catch {
                 MLXLoadReporter.finishActiveWithError(error.localizedDescription)
-                output = .failure(error)
+                output.value = .failure(error)
             }
             group.leave()
         }
@@ -781,7 +839,7 @@ struct MlxCommand: ParsableCommand {
             close(stderrFD)
         }
 
-        switch output {
+        switch output.value {
         case .success(let text):
             if raw {
                 print(text)
@@ -1102,7 +1160,15 @@ struct MacLocalAPI: ParsableCommand {
             description: Extract text and tables from images/PDFs using Apple Vision OCR
             usage: afm vision -f <file> [--table]
             full_details: afm vision --help-json
-        api_endpoints: [/v1/chat/completions, /v1/models, /v1/vision/ocr, /health]
+          speech:
+            description: Transcribe audio to text and synthesize text to speech using Apple Speech/AVFoundation
+            usage: afm speech transcribe -f <file> | afm speech synthesize <text> -o <file>
+            full_details: afm speech --help-json
+          embed:
+            description: Serve OpenAI-compatible embeddings using Apple NaturalLanguage contextual embeddings
+            usage: afm embed -m <model> [--port 9998]
+            full_details: afm embed --list-models
+        api_endpoints: [/v1/chat/completions, /v1/models, /v1/vision/ocr, /v1/embeddings, /health]
         env_vars:
           MACAFM_MLX_MODEL_CACHE: Override model cache directory
           MACAFM_MLX_METALLIB: Override metallib path
@@ -1137,6 +1203,8 @@ struct MacLocalAPI: ParsableCommand {
             - "afm" — Apple Foundation Models (on-device, requires macOS 26+)
             - "afm mlx -m <model>" — MLX open-source models from Hugging Face
             - "afm vision -f <file>" — Vision OCR text/table extraction
+            - "afm speech transcribe -f <file>" — Speech transcription and synthesis
+            - "afm embed -m <model>" — OpenAI-compatible embeddings (Apple NaturalLanguage)
             - "afm -g" — API gateway proxying to local backends
         triggers:
           - start local LLM server
@@ -1145,12 +1213,16 @@ struct MacLocalAPI: ParsableCommand {
           - Apple Foundation Models API
           - local tool calling server
           - vision OCR text extraction
+          - speech transcription and synthesis
+          - local text embeddings for RAG / semantic search
           - API gateway for local LLM backends
         examples:
           - afm --port 9999
           - afm mlx -m Qwen/Qwen3-Coder-Next-4bit --port 9999
           - afm mlx -m mlx-community/Meta-Llama-3.1-8B-Instruct-4bit -s "Hello"
           - afm vision -f image.png
+          - afm speech transcribe -f recording.wav
+          - afm embed -m apple-nl-contextual-en --port 9998
           - afm -g --port 9999
         ---
 
@@ -1180,7 +1252,15 @@ struct RootCommand: ParsableCommand {
             description: Extract text and tables from images/PDFs using Apple Vision OCR
             usage: afm vision -f <file> [--table]
             full_details: afm vision --help-json
-        api_endpoints: [/v1/chat/completions, /v1/models, /v1/vision/ocr, /health]
+          speech:
+            description: Transcribe audio to text and synthesize text to speech using Apple Speech/AVFoundation
+            usage: afm speech transcribe -f <file> | afm speech synthesize <text> -o <file>
+            full_details: afm speech --help-json
+          embed:
+            description: Serve OpenAI-compatible embeddings using Apple NaturalLanguage contextual embeddings
+            usage: afm embed -m <model> [--port 9998]
+            full_details: afm embed --list-models
+        api_endpoints: [/v1/chat/completions, /v1/models, /v1/vision/ocr, /v1/embeddings, /health]
         env_vars:
           MACAFM_MLX_MODEL_CACHE: Override model cache directory
           MACAFM_MLX_METALLIB: Override metallib path
@@ -1215,6 +1295,8 @@ struct RootCommand: ParsableCommand {
             - "afm" — Apple Foundation Models (on-device, requires macOS 26+)
             - "afm mlx -m <model>" — MLX open-source models from Hugging Face
             - "afm vision -f <file>" — Vision OCR text/table extraction
+            - "afm speech transcribe -f <file>" — Speech transcription and synthesis
+            - "afm embed -m <model>" — OpenAI-compatible embeddings (Apple NaturalLanguage)
             - "afm -g" — API gateway proxying to local backends
         triggers:
           - start local LLM server
@@ -1223,12 +1305,16 @@ struct RootCommand: ParsableCommand {
           - Apple Foundation Models API
           - local tool calling server
           - vision OCR text extraction
+          - speech transcription and synthesis
+          - local text embeddings for RAG / semantic search
           - API gateway for local LLM backends
         examples:
           - afm --port 9999
           - afm mlx -m Qwen/Qwen3-Coder-Next-4bit --port 9999
           - afm mlx -m mlx-community/Meta-Llama-3.1-8B-Instruct-4bit -s "Hello"
           - afm vision -f image.png
+          - afm speech transcribe -f recording.wav
+          - afm embed -m apple-nl-contextual-en --port 9998
           - afm -g --port 9999
         ---
 
@@ -1237,7 +1323,7 @@ struct RootCommand: ParsableCommand {
         GitHub: https://github.com/scouzi1966/maclocal-api
         """,
         version: MacLocalAPI.buildVersion,
-        subcommands: [MlxCommand.self, VisionCommand.self, SpeechCommand.self]
+        subcommands: [MlxCommand.self, VisionCommand.self, SpeechCommand.self, EmbeddingsCommand.self]
     )
 
     @Option(name: [.customShort("s"), .long], help: "Run a single prompt without starting the server")
@@ -1258,8 +1344,8 @@ struct RootCommand: ParsableCommand {
     @Option(name: [.customShort("a"), .long], help: "Path to a .fmadapter file for LoRA adapter fine-tuning")
     var adapter: String?
 
-    @Option(name: .shortAndLong, help: "Port to run the server on")
-    var port: Int = 9999
+    @Option(name: .shortAndLong, help: "Port to run server on (default: 9999, falls back to ephemeral if busy)")
+    var port: Int?
 
     @Option(name: [.customShort("H"), .long], help: "Hostname to bind server to")
     var hostname: String = "127.0.0.1"
@@ -1344,7 +1430,8 @@ struct RootCommand: ParsableCommand {
         // If no subcommand specified and no single prompt, run server.
         // Build argument array and parse — direct struct init doesn't work
         // with ArgumentParser property wrappers (they need parse() to initialize).
-        var args: [String] = ["--port", "\(port)", "--hostname", hostname, "--instructions", instructions, "--prewarm", prewarm]
+        var args: [String] = ["--hostname", hostname, "--instructions", instructions, "--prewarm", prewarm]
+        if let port { args += ["--port", "\(port)"] }
         if verbose { args.append("--verbose") }
         if veryVerbose { args.append("--very-verbose") }
         if noStreaming { args.append("--no-streaming") }
@@ -1359,6 +1446,7 @@ struct RootCommand: ParsableCommand {
         if let temperature { args += ["--temperature", "\(temperature)"] }
         if let randomness { args += ["--randomness", randomness] }
         if let stop { args += ["--stop", stop] }
+        if let guidedJson { args += ["--guided-json", guidedJson] }
         var serveCommand = try ServeCommand.parse(args)
         try serveCommand.run()
     }
@@ -1376,30 +1464,49 @@ if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "mlx" {
     }
 } else if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "speech" {
     var args = Array(CommandLine.arguments.dropFirst(2))
-    // Legacy: if the first arg isn't a known subcommand, assume it's a file path
-    // or flag for transcribe (e.g. "afm speech file.wav" or "afm speech -f file.wav").
+    // Legacy shim: pre-subcommand CLI accepted `afm speech file.wav`,
+    // `afm speech -f file.wav`, and `afm speech --list-voices`. Route each
+    // legacy form to the matching subcommand so existing muscle memory keeps
+    // working. Root options would otherwise swallow subcommand options like
+    // `--locale`, so the root stays deliberately flagless (except --help-json).
     let subcommands: Set<String> = ["synthesize", "transcribe", "voices", "help"]
-    if let first = args.first, !subcommands.contains(first), !first.hasPrefix("-") {
-        args.insert("transcribe", at: 0)
+    let transcribeFlags: Set<String> = ["-f", "--file", "--format", "--language", "--timestamps"]
+    if let firstIdx = args.firstIndex(of: "--list-voices") {
+        // Drop the flag and prepend `voices` so any remaining flags (e.g. --locale)
+        // bind to SpeechVoicesCommand.
+        args.remove(at: firstIdx)
+        args.insert("voices", at: 0)
+    } else if let first = args.first, !subcommands.contains(first) {
+        if !first.hasPrefix("-") {
+            // Bare positional — treat as transcribe file path
+            args.insert(contentsOf: ["transcribe", "-f"], at: 0)
+        } else if transcribeFlags.contains(first) {
+            args.insert("transcribe", at: 0)
+        }
+        // Other flags (e.g. --help, --help-json) fall through to SpeechCommand.
     }
     do {
-        var cmd = try SpeechCommand.parseAsRoot(args)
-        // Use CFRunLoop so AVSpeechSynthesizer callbacks can fire on the main thread
-        var caughtError: Error?
+        let cmd = try SpeechCommand.parseAsRoot(args)
+        // Use CFRunLoop so AVSpeechSynthesizer callbacks can fire on the main thread.
+        // The non-Sendable command and the caught error cross into the Task; the
+        // CFRunLoopStop happens-before the reads below, so these boxes are sound.
+        let cmdBox = UncheckedSendable(cmd)
+        let errorBox = SendableBox<Error?>(nil)
         Task {
             do {
-                if var asyncCmd = cmd as? AsyncParsableCommand {
+                if var asyncCmd = cmdBox.value as? AsyncParsableCommand {
                     try await asyncCmd.run()
                 } else {
-                    try cmd.run()
+                    var syncCmd = cmdBox.value
+                    try syncCmd.run()
                 }
             } catch {
-                caughtError = error
+                errorBox.value = error
             }
             CFRunLoopStop(CFRunLoopGetMain())
         }
         CFRunLoopRun()
-        if let error = caughtError {
+        if let error = errorBox.value {
             throw error
         }
     } catch {
@@ -1427,6 +1534,28 @@ if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "mlx" {
     } catch {
         VisionCommand.exit(withError: error)
     }
+} else if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "embed" {
+    let args = Array(CommandLine.arguments.dropFirst(2))
+    do {
+        let cmd = try EmbeddingsCommand.parse(args)
+        let group = DispatchGroup()
+        var caughtError: Error?
+        group.enter()
+        Task {
+            do {
+                try await cmd.run()
+            } catch {
+                caughtError = error
+            }
+            group.leave()
+        }
+        group.wait()
+        if let error = caughtError {
+            throw error
+        }
+    } catch {
+        EmbeddingsCommand.exit(withError: error)
+    }
 } else {
     RootCommand.main()
 }
@@ -1435,9 +1564,9 @@ private func ensureMLXMetalLibraryAvailable(verbose: Bool) throws {
     try MLXMetalLibrary.ensureAvailable(verbose: verbose)
 }
 
-private final class MLXLoadReporter {
+private final class MLXLoadReporter: @unchecked Sendable {
     private static let reporterLock = NSLock()
-    private static weak var activeReporter: MLXLoadReporter?
+    nonisolated(unsafe) private static weak var activeReporter: MLXLoadReporter?
 
     private let modelID: String
     private let lock = NSLock()
@@ -1679,7 +1808,7 @@ extension RootCommand {
         DebugLogger.log("Temperature: \(temperature?.description ?? "nil"), Randomness: \(randomness ?? "nil")")
 
         let group = DispatchGroup()
-        var result: Result<String, Error>?
+        let result = SendableBox<Result<String, Error>?>(nil)
 
         group.enter()
         Task {
@@ -1698,21 +1827,21 @@ extension RootCommand {
                         response = try await foundationService.generateResponse(for: [message], temperature: temperature, randomness: randomness)
                     }
                     DebugLogger.log("Response generated successfully")
-                    result = .success(response)
+                    result.value = .success(response)
                 } else {
                     DebugLogger.log("macOS 26+ not available")
-                    result = .failure(FoundationModelError.notAvailable)
+                    result.value = .failure(FoundationModelError.notAvailable)
                 }
             } catch {
                 DebugLogger.log("Error occurred: \(error)")
-                result = .failure(error)
+                result.value = .failure(error)
             }
             group.leave()
         }
         
         group.wait()
         
-        switch result {
+        switch result.value {
         case .success(let response):
             print(response)
         case .failure(let error):

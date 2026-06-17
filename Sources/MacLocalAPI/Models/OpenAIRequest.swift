@@ -19,9 +19,11 @@ struct ChatCompletionRequest: Content {
     let topLogprobs: Int?
     let stop: [String]?
     let stream: Bool?
+    let streamOptions: StreamOptions?
     let user: String?
     let tools: [RequestTool]?
     let toolChoice: ToolChoice?
+    let parallelToolCalls: Bool?
     let responseFormat: ResponseFormat?
     let chatTemplateKwargs: [String: AnyCodable]?
 
@@ -43,11 +45,19 @@ struct ChatCompletionRequest: Content {
         case topLogprobs = "top_logprobs"
         case stop
         case stream
+        case streamOptions = "stream_options"
         case user
         case tools
         case toolChoice = "tool_choice"
+        case parallelToolCalls = "parallel_tool_calls"
         case responseFormat = "response_format"
         case chatTemplateKwargs = "chat_template_kwargs"
+    }
+
+    /// Whether the final SSE chunk should carry a `usage` block. Mirrors OpenAI's
+    /// `stream_options.include_usage`. Default true preserves existing behavior. (T1.2)
+    var includeStreamingUsage: Bool {
+        streamOptions?.includeUsage ?? true
     }
 
     var effectiveMaxTokens: Int? {
@@ -56,6 +66,15 @@ struct ChatCompletionRequest: Content {
 
     var effectiveRepetitionPenalty: Double? {
         repetitionPenalty ?? repeatPenalty
+    }
+}
+
+/// OpenAI-compatible `stream_options`. Currently models `include_usage`. (T1.2)
+struct StreamOptions: Content {
+    let includeUsage: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case includeUsage = "include_usage"
     }
 }
 
@@ -283,14 +302,14 @@ struct AnyCodable: Codable, Sendable {
     }
 
     /// Convert to a dictionary suitable for ToolSpec ([String: any Sendable])
-    func toSendable() -> Any {
+    func toSendable() -> any Sendable {
         value.toAny()
     }
 
     /// Convert to a type hierarchy compatible with Jinja Value.init(any:).
     /// Strips null values from dicts (Jinja can't handle NSNull or boxed Optional<Any>).
     /// JSON Schema nulls (e.g. "default": null) are semantically equivalent when omitted.
-    func toJinjaCompatible() -> Any {
+    func toJinjaCompatible() -> any Sendable {
         value.toJinjaCompatible()
     }
 }
@@ -326,7 +345,7 @@ enum AnyCodableValue: Codable, Sendable {
         }
     }
 
-    func toAny() -> Any {
+    func toAny() -> any Sendable {
         switch self {
         case .null: return NSNull()
         case .bool(let b): return b
@@ -345,7 +364,7 @@ enum AnyCodableValue: Codable, Sendable {
     /// equivalent when omitted — templates use `is defined` checks, not null comparisons.
     /// Arrays filter out nulls. Standalone nulls become empty string (shouldn't occur in
     /// practice since null only appears as dict values or array elements in JSON Schema).
-    func toJinjaCompatible() -> Any {
+    func toJinjaCompatible() -> any Sendable {
         switch self {
         case .null: return "" // Standalone null fallback; dict/array nulls are stripped
         case .bool(let b): return b
@@ -353,12 +372,12 @@ enum AnyCodableValue: Codable, Sendable {
         case .double(let d): return d
         case .string(let s): return s
         case .array(let arr):
-            return arr.compactMap { element -> Any? in
+            return arr.compactMap { element -> (any Sendable)? in
                 if case .null = element { return nil }
                 return element.toJinjaCompatible()
             }
         case .object(let dict):
-            var result: [String: Any] = [:]
+            var result: [String: any Sendable] = [:]
             for (key, value) in dict {
                 if case .null = value { continue } // Strip null-valued keys
                 result[key] = value.toJinjaCompatible()
@@ -369,7 +388,7 @@ enum AnyCodableValue: Codable, Sendable {
             // Flatten anyOf/oneOf nullable patterns for Jinja template compatibility.
             // e.g. {"anyOf": [{"type": "string"}, {"type": "null"}]} → {"type": "string"}
             // Templates like Gemma 4 do `value['type'] | upper` which crashes on anyOf dicts.
-            if result["type"] == nil, let anyOf = result["anyOf"] as? [[String: Any]] ?? result["oneOf"] as? [[String: Any]] {
+            if result["type"] == nil, let anyOf = result["anyOf"] as? [[String: any Sendable]] ?? result["oneOf"] as? [[String: any Sendable]] {
                 let nonNull = anyOf.filter { ($0["type"] as? String) != "null" }
                 if nonNull.count == 1, let single = nonNull.first {
                     var flattened = result
@@ -459,5 +478,115 @@ struct BatchInputLine: Codable {
     enum CodingKeys: String, CodingKey {
         case customId = "custom_id"
         case method, url, body
+    }
+}
+
+// MARK: - Embeddings API Types
+
+enum EmbeddingInput: Content {
+    case string(String)
+    case array([String])
+    case tokenIDs([Int])
+    case arrayTokenIDs([[Int]])
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let string = try? container.decode(String.self) {
+            self = .string(string)
+        } else if let array = try? container.decode([String].self) {
+            self = .array(array)
+        } else if let tokenIDs = try? container.decode([Int].self) {
+            self = .tokenIDs(tokenIDs)
+        } else if let arrayTokenIDs = try? container.decode([[Int]].self) {
+            self = .arrayTokenIDs(arrayTokenIDs)
+        } else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Embedding input must be a string, array of strings, array of token ids, or array of token-id arrays"
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .string(let string):
+            try container.encode(string)
+        case .array(let array):
+            try container.encode(array)
+        case .tokenIDs(let tokenIDs):
+            try container.encode(tokenIDs)
+        case .arrayTokenIDs(let arrayTokenIDs):
+            try container.encode(arrayTokenIDs)
+        }
+    }
+
+    var strings: [String] {
+        switch self {
+        case .string(let string):
+            return [string]
+        case .array(let array):
+            return array
+        case .tokenIDs, .arrayTokenIDs:
+            return []
+        }
+    }
+
+    var tokenIDArrays: [[Int]] {
+        switch self {
+        case .string, .array:
+            return []
+        case .tokenIDs(let tokenIDs):
+            return [tokenIDs]
+        case .arrayTokenIDs(let arrayTokenIDs):
+            return arrayTokenIDs
+        }
+    }
+
+    var isEmpty: Bool {
+        switch self {
+        case .string(let string):
+            return string.isEmpty
+        case .array(let array):
+            return array.isEmpty
+        case .tokenIDs(let tokenIDs):
+            return tokenIDs.isEmpty
+        case .arrayTokenIDs(let arrayTokenIDs):
+            return arrayTokenIDs.isEmpty
+        }
+    }
+
+    var isTokenized: Bool {
+        switch self {
+        case .tokenIDs, .arrayTokenIDs:
+            return true
+        case .string, .array:
+            return false
+        }
+    }
+}
+
+enum EmbeddingEncodingFormat: String, Content {
+    case float
+    case base64
+}
+
+struct EmbeddingsRequest: Content {
+    let input: EmbeddingInput
+    let model: String?
+    let encodingFormat: EmbeddingEncodingFormat?
+    let dimensions: Int?
+    let user: String?
+
+    enum CodingKeys: String, CodingKey {
+        case input
+        case model
+        case encodingFormat = "encoding_format"
+        case dimensions
+        case user
+    }
+
+    var resolvedEncodingFormat: EmbeddingEncodingFormat {
+        encodingFormat ?? .float
     }
 }

@@ -10,6 +10,7 @@ struct ChatCompletionsController: RouteCollection {
     private let permissiveGuardrails: Bool
     private let veryVerbose: Bool
     private let stop: String?
+    private let defaultGuidedJsonSchema: ResponseFormat?
 
     init(
         streamingEnabled: Bool = true,
@@ -19,7 +20,8 @@ struct ChatCompletionsController: RouteCollection {
         randomness: String? = nil,
         permissiveGuardrails: Bool,
         veryVerbose: Bool = false,
-        stop: String? = nil
+        stop: String? = nil,
+        defaultGuidedJsonSchema: ResponseFormat? = nil
     ) {
         self.streamingEnabled = streamingEnabled
         self.instructions = instructions
@@ -29,6 +31,7 @@ struct ChatCompletionsController: RouteCollection {
         self.permissiveGuardrails = permissiveGuardrails
         self.veryVerbose = veryVerbose
         self.stop = stop
+        self.defaultGuidedJsonSchema = defaultGuidedJsonSchema
     }
     func boot(routes: RoutesBuilder) throws {
         let v1 = routes.grouped("v1")
@@ -324,8 +327,23 @@ struct ChatCompletionsController: RouteCollection {
         httpResponse.headers.add(name: "X-Accel-Buffering", value: "no")
 
         let streamId = UUID().uuidString
+        // T1.4/T1.5: Capture inflight registry + request id for cancellation hook.
+        let inflightRegistry = req.application.inflightRegistry
+        let streamReqId = req.afmRequestID
+        // Register the cancel hook BEFORE the asyncStream closure spawns the
+        // body Task — closes the cancel-arrives-too-early race. (T1.4/T1.5 fix)
+        let cancelHandle = CancellableTaskHandle()
+        if !streamReqId.isEmpty {
+            await inflightRegistry.register(id: streamReqId, cancel: { cancelHandle.cancel() })
+        }
 
         httpResponse.body = .init(asyncStream: { writer in
+            let bodyTask = Task<Void, Never> {
+            // PR #122: Streaming routes account for their own
+            // afm:num_active_connections. See MLXChatCompletionsController
+            // for the rationale.
+            StatsAggregator.shared.connectionStarted()
+            defer { StatsAggregator.shared.connectionEnded() }
             let encoder = JSONEncoder()
             var fullStreamedContent = ""
 
@@ -420,21 +438,26 @@ struct ChatCompletionsController: RouteCollection {
                 if let jsonString = String(data: finalData, encoding: .utf8) {
                     try await writer.write(.buffer(.init(string: "data: \(jsonString)\n\n")))
                 }
-                let usageChunk = ChatCompletionStreamResponse(
-                    id: streamId,
-                    model: chatRequest.model ?? "foundation",
-                    usage: usage,
-                    timings: timings
-                )
-                let usageData = try encoder.encode(usageChunk)
-                if let jsonString = String(data: usageData, encoding: .utf8) {
-                    try await writer.write(.buffer(.init(string: "data: \(jsonString)\n\n")))
+                // Gate the usage chunk on stream_options.include_usage. (T1.2)
+                if chatRequest.includeStreamingUsage {
+                    let usageChunk = ChatCompletionStreamResponse(
+                        id: streamId,
+                        model: chatRequest.model ?? "foundation",
+                        usage: usage,
+                        timings: timings
+                    )
+                    let usageData = try encoder.encode(usageChunk)
+                    if let jsonString = String(data: usageData, encoding: .utf8) {
+                        try await writer.write(.buffer(.init(string: "data: \(jsonString)\n\n")))
+                    }
+                    if self.veryVerbose {
+                        req.logger.info("Foundation stream usage chunk: \(encodeJSON(usageChunk))")
+                    }
                 }
                 if self.veryVerbose {
                     req.logger.info("Foundation full streamed response content: \(fullStreamedContent)")
                     req.logger.info("Foundation stream final usage: \(encodeJSON(usage))")
                     req.logger.info("Foundation stream final chunk: \(encodeJSON(finalChunk))")
-                    req.logger.info("Foundation stream usage chunk: \(encodeJSON(usageChunk))")
                 }
 
                 // Send done marker
@@ -443,58 +466,84 @@ struct ChatCompletionsController: RouteCollection {
                 try await writer.write(.end)
 
             } catch {
-                req.logger.error("Streaming error: \(error)")
-
-                // Detect specific error types and provide user-friendly messages
-                let errorMessage: String
-
-                if let foundationError = error as? FoundationModelError {
-                    switch foundationError {
-                    case .contextWindowExceeded(let provided, let maximum):
-                        errorMessage = "⚠️ **Context window exceeded**\n\nYour conversation has \(provided) tokens but the maximum is \(maximum).\n\nPlease start a new conversation or reduce the message length."
-                    case .guardrailViolation(let message):
-                        errorMessage = "⚠️ **Content Policy Violation**\n\n\(message)\n\nPlease rephrase your request."
-                    default:
-                        errorMessage = "⚠️ **Error**\n\n\(foundationError.localizedDescription)"
+                // Distinguish cooperative cancellation (T1.4/T1.5) from genuine
+                // errors. Cancellation must NOT emit a "⚠️ Error" content chunk.
+                let isCancellation = (error is CancellationError) || Task.isCancelled
+                if isCancellation {
+                    req.logger.info("Streaming cancelled")
+                    let cancelledFinal = ChatCompletionStreamResponse(
+                        id: streamId,
+                        model: chatRequest.model ?? "foundation",
+                        content: "",
+                        isFinished: true,
+                        finishReason: "cancelled"
+                    )
+                    if let data = try? encoder.encode(cancelledFinal),
+                       let jsonString = String(data: data, encoding: .utf8) {
+                        try? await writer.write(.buffer(.init(string: "data: \(jsonString)\n\n")))
                     }
                 } else {
-                    let errorString = String(describing: error)
-                    if errorString.contains("exceededContextWindowSize") || errorString.contains("context") && errorString.contains("exceeds") {
-                        errorMessage = "⚠️ **Context window exceeded**\n\nThe conversation is too long. Apple Foundation Models has a 4096 token limit.\n\nPlease start a new conversation."
-                    } else if errorString.contains("guardrailViolation") || errorString.contains("unsafe content") {
-                        errorMessage = "⚠️ **Content Policy Violation**\n\nYour request was blocked due to content policy restrictions.\n\nPlease rephrase your request."
+                    req.logger.error("Streaming error: \(error)")
+
+                    // Detect specific error types and provide user-friendly messages
+                    let errorMessage: String
+
+                    if let foundationError = error as? FoundationModelError {
+                        switch foundationError {
+                        case .contextWindowExceeded(let provided, let maximum):
+                            errorMessage = "⚠️ **Context window exceeded**\n\nYour conversation has \(provided) tokens but the maximum is \(maximum).\n\nPlease start a new conversation or reduce the message length."
+                        case .guardrailViolation(let message):
+                            errorMessage = "⚠️ **Content Policy Violation**\n\n\(message)\n\nPlease rephrase your request."
+                        default:
+                            errorMessage = "⚠️ **Error**\n\n\(foundationError.localizedDescription)"
+                        }
                     } else {
-                        errorMessage = "⚠️ **Error**\n\n\(error.localizedDescription)"
+                        let errorString = String(describing: error)
+                        if errorString.contains("exceededContextWindowSize") || errorString.contains("context") && errorString.contains("exceeds") {
+                            errorMessage = "⚠️ **Context window exceeded**\n\nThe conversation is too long. Apple Foundation Models has a 4096 token limit.\n\nPlease start a new conversation."
+                        } else if errorString.contains("guardrailViolation") || errorString.contains("unsafe content") {
+                            errorMessage = "⚠️ **Content Policy Violation**\n\nYour request was blocked due to content policy restrictions.\n\nPlease rephrase your request."
+                        } else {
+                            errorMessage = "⚠️ **Error**\n\n\(error.localizedDescription)"
+                        }
                     }
-                }
 
-                // Send error as visible content in the chat (so user sees it)
-                let errorChunk = ChatCompletionStreamResponse(
-                    id: streamId,
-                    model: chatRequest.model ?? "foundation",
-                    content: errorMessage,
-                    isFirst: true
-                )
-                if let errorData = try? encoder.encode(errorChunk),
-                   let jsonString = String(data: errorData, encoding: .utf8) {
-                    try? await writer.write(.buffer(.init(string: "data: \(jsonString)\n\n")))
-                }
+                    // Send error as visible content in the chat (so user sees it)
+                    let errorChunk = ChatCompletionStreamResponse(
+                        id: streamId,
+                        model: chatRequest.model ?? "foundation",
+                        content: errorMessage,
+                        isFirst: true
+                    )
+                    if let errorData = try? encoder.encode(errorChunk),
+                       let jsonString = String(data: errorData, encoding: .utf8) {
+                        try? await writer.write(.buffer(.init(string: "data: \(jsonString)\n\n")))
+                    }
 
-                // Send final chunk to mark completion
-                let finalChunk = ChatCompletionStreamResponse(
-                    id: streamId,
-                    model: chatRequest.model ?? "foundation",
-                    content: "",
-                    isFinished: true
-                )
-                if let finalData = try? encoder.encode(finalChunk),
-                   let jsonString = String(data: finalData, encoding: .utf8) {
-                    try? await writer.write(.buffer(.init(string: "data: \(jsonString)\n\n")))
+                    // Send final chunk to mark completion
+                    let finalChunk = ChatCompletionStreamResponse(
+                        id: streamId,
+                        model: chatRequest.model ?? "foundation",
+                        content: "",
+                        isFinished: true
+                    )
+                    if let finalData = try? encoder.encode(finalChunk),
+                       let jsonString = String(data: finalData, encoding: .utf8) {
+                        try? await writer.write(.buffer(.init(string: "data: \(jsonString)\n\n")))
+                    }
                 }
 
                 // Send [DONE] marker to properly terminate the stream
                 try? await writer.write(.buffer(.init(string: "data: [DONE]\n\n")))
                 try? await writer.write(.end)
+            }
+            } // end bodyTask
+            // T1.4/T1.5: Bridge bodyTask into the pre-registered cancel handle,
+            // await completion, then release.
+            cancelHandle.assign(bodyTask)
+            _ = await bodyTask.value
+            if !streamReqId.isEmpty {
+                await inflightRegistry.release(id: streamReqId)
             }
         })
 
@@ -516,6 +565,10 @@ struct ChatCompletionsController: RouteCollection {
         let model = chatRequest.model ?? "foundation"
 
         httpResponse.body = .init(asyncStream: { writer in
+            // Bypass streaming (vision OCR / speech) — same active-connections
+            // bracket as the regular chat path. (PR #122 review fix)
+            StatsAggregator.shared.connectionStarted()
+            defer { StatsAggregator.shared.connectionEnded() }
             let encoder = JSONEncoder()
 
             do {
@@ -559,11 +612,26 @@ struct ChatCompletionsController: RouteCollection {
         return httpResponse
     }
 
-    /// Check if the request has a strict json_schema response format.
-    private func hasStrictJsonSchema(_ chatRequest: ChatCompletionRequest) -> ResponseJsonSchema? {
-        guard let responseFormat = chatRequest.responseFormat,
-              responseFormat.type == "json_schema",
-              let jsonSchema = responseFormat.jsonSchema,
+    /// Check if the request has a strict json_schema response format. When the
+    /// request omits one, fall back to the server-level --guided-json schema (#103).
+    func hasStrictJsonSchema(_ chatRequest: ChatCompletionRequest) -> ResponseJsonSchema? {
+        Self.resolveStrictJsonSchema(
+            requestFormat: chatRequest.responseFormat,
+            serverDefault: defaultGuidedJsonSchema
+        )
+    }
+
+    /// Pure resolver exposed for unit testing: per-request format wins, falls back
+    /// to the server-level `--guided-json` default. Returns nil unless a strict
+    /// json_schema is in effect. (#103)
+    static func resolveStrictJsonSchema(
+        requestFormat: ResponseFormat?,
+        serverDefault: ResponseFormat?
+    ) -> ResponseJsonSchema? {
+        let format = requestFormat ?? serverDefault
+        guard let format,
+              format.type == "json_schema",
+              let jsonSchema = format.jsonSchema,
               jsonSchema.strict == true else {
             return nil
         }

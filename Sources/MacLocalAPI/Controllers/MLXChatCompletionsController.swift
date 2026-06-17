@@ -104,7 +104,8 @@ struct MLXChatCompletionsController: RouteCollection {
     private static let debugPipeline = ProcessInfo.processInfo.environment["AFM_DEBUG"] == "1"
 
     func chatCompletions(req: Request) async throws -> Response {
-        let reqId = String(UUID().uuidString.prefix(8))
+        // RequestIDMiddleware sets this; controller piggybacks for log correlation. (T1.1)
+        let reqId = req.afmRequestID
         do {
             let httpArrival = Self.debugPipeline ? Date() : Date.distantPast
             let chatRequest = try req.content.decode(ChatCompletionRequest.self)
@@ -391,13 +392,15 @@ struct MLXChatCompletionsController: RouteCollection {
                 content: result.content,
                 toolCalls: result.toolCalls,
                 toolChoice: chatRequest.toolChoice,
+                parallelToolCalls: chatRequest.parallelToolCalls,
                 extractThinking: extractThinking,
                 thinkStartTag: service.thinkStartTag ?? "<think>",
                 thinkEndTag: service.thinkEndTag ?? "</think>",
                 stoppedBySequence: result.stoppedBySequence,
                 completionTokens: completionTok,
                 maxTokens: effectiveMaxTokens,
-                sanitizeContent: sanitizeContent
+                sanitizeContent: sanitizeContent,
+                harmonyChannels: service.harmonyChannels
             )
 
             // If we got tool calls, return a tool_calls response
@@ -520,7 +523,31 @@ struct MLXChatCompletionsController: RouteCollection {
         if wantStreamProfile { service.startAPIProfile() }
 
         let streamReqId = requestId
+        // Capture the registry on the request thread so the asyncStream closure
+        // can register a cancel hook without re-resolving it.
+        let inflightRegistry = req.application.inflightRegistry
+        // Register the cancel hook BEFORE the asyncStream closure spawns the
+        // body Task. Eliminates the race where a cancel arrives between the
+        // Response being returned and the closure firing. (T1.4/T1.5 fix)
+        let cancelHandle = CancellableTaskHandle()
+        if !streamReqId.isEmpty {
+            await inflightRegistry.register(id: streamReqId, cancel: { cancelHandle.cancel() })
+        }
         httpResponse.body = .init(asyncStream: { writer in
+            // T1.4/T1.5: Wrap the streaming body in an explicit Task so we can
+            // cancel it from outside (cancel endpoint, client disconnect detection).
+            // Cooperative cancellation propagates through the AsyncThrowingStream
+            // iterator (`res.stream` below) — when the body Task is cancelled,
+            // its `next()` throws `CancellationError`, the iterator deinits, and
+            // its `onTermination` fires `task.cancel()` on the underlying model
+            // generator (BatchScheduler / MLX serial path), stopping GPU work.
+            let bodyTask = Task<Void, Never> {
+            // PR #122: Streaming routes account for their own
+            // afm:num_active_connections — ActiveConnectionsMiddleware filters
+            // them because its defer fires when the controller returns, not
+            // when the SSE body finishes.
+            StatsAggregator.shared.connectionStarted()
+            defer { StatsAggregator.shared.connectionEnded() }
             let encoder = JSONEncoder()
             var fullContent = ""
             let started = Date()
@@ -587,6 +614,10 @@ struct MLXChatCompletionsController: RouteCollection {
                 // State for <think> tag extraction (Qwen, DeepSeek R1, etc.)
                 var insideThinkBlock = false
                 var thinkBuffer = ""
+                // State for harmony channel parsing (gpt-oss). Mutually exclusive with thinkBuffer. (#121)
+                let harmonyChannels = self.service.harmonyChannels
+                var harmonyState = HarmonyState()
+                var harmonyBuffer = ""
                 var verboseReasoningBuf = ""
                 var verboseContentBuf = ""
                 var logprobBuffer = [ResolvedLogprob]()
@@ -778,7 +809,50 @@ struct MLXChatCompletionsController: RouteCollection {
                         pendingRawTag = piece.debugDescription
                     }
 
-                    if extractThinking {
+                    if extractThinking && harmonyChannels {
+                        harmonyBuffer += piece
+                        let extracted = Self.extractHarmonyChannels(
+                            buffer: &harmonyBuffer,
+                            state: &harmonyState
+                        )
+
+                        let emitContent = extracted.content
+                        let emitReasoning = extracted.reasoning
+                        let flushLogprobs = logprobBuffer.isEmpty ? nil : Self.buildChoiceLogprobs(logprobBuffer)
+                        let hasReasoning = emitReasoning != nil
+                        let hasContent = emitContent != nil
+                        if !deferStructuredOutputContent && (hasReasoning || hasContent || flushLogprobs != nil) {
+                            if self.veryVerbose {
+                                if let r = emitReasoning { verboseReasoningBuf += r }
+                                if let c = emitContent { verboseContentBuf += c }
+                                if verboseReasoningBuf.hasSuffix("\n") || verboseReasoningBuf.count > 200 {
+                                    print("\(Self.purple)[\(Self.timestamp())] SEND reasoning:\n  \(verboseReasoningBuf)\(Self.reset)"); fflush(stdout)
+                                    verboseReasoningBuf = ""
+                                }
+                                if verboseContentBuf.hasSuffix("\n") || verboseContentBuf.count > 200 {
+                                    print("\(Self.teal)[\(Self.timestamp())] SEND content (chunk):\n  \(verboseContentBuf)\(Self.reset)"); fflush(stdout)
+                                    verboseContentBuf = ""
+                                }
+                            }
+                            logprobBuffer = []
+                            let contentChunk = ChatCompletionStreamResponse(
+                                id: streamId,
+                                model: res.modelID,
+                                content: emitContent ?? "",
+                                reasoningContent: emitReasoning,
+                                logprobs: flushLogprobs,
+                                isFirst: false
+                            )
+                            let chunkData = try encoder.encode(contentChunk)
+                            if let jsonString = String(data: chunkData, encoding: .utf8) {
+                                try await writer.write(.buffer(.init(string: "data: \(jsonString)\n\n")))
+                            }
+                        }
+                        if harmonyState.stopReached {
+                            stoppedBySequence = true
+                            break
+                        }
+                    } else if extractThinking {
                         // If the piece is exactly the think start tag (template-injected or
                         // model-generated), just flip the state without adding the literal
                         // tag to the buffer. Prevents double-tag leaks when the template
@@ -986,13 +1060,15 @@ struct MLXChatCompletionsController: RouteCollection {
                     content: fullContent,
                     toolCalls: hasToolCalls ? collectedToolCalls : nil,
                     toolChoice: chatRequest.toolChoice,
+                    parallelToolCalls: chatRequest.parallelToolCalls,
                     extractThinking: extractThinking,
                     thinkStartTag: thinkStartTag ?? "<think>",
                     thinkEndTag: thinkEndTag ?? "</think>",
                     stoppedBySequence: stoppedBySequence,
                     completionTokens: completionTokens,
                     maxTokens: effectiveMaxTokens,
-                    sanitizeContent: sanitizeContent
+                    sanitizeContent: sanitizeContent,
+                    harmonyChannels: harmonyChannels
                 )
                 let finishReason = finalizedTurn.finishReason
                 if self.veryVerbose {
@@ -1027,9 +1103,42 @@ struct MLXChatCompletionsController: RouteCollection {
                 fflush(stdout)
 
                 // === Now flush remaining buffer to client (writer calls may hang/throw) ===
+                // Flush remaining harmony buffer (#121). When the stream ends mid-channel
+                // without a closing <|end|>/<|return|>, emit whatever was being accumulated.
+                if !deferStructuredOutputContent && extractThinking && harmonyChannels && !harmonyBuffer.isEmpty {
+                    let remaining: String?
+                    let remainingReasoning: String?
+                    switch harmonyState.channel {
+                    case .analysis:
+                        remainingReasoning = harmonyBuffer
+                        remaining = nil
+                    case .final:
+                        remaining = harmonyBuffer
+                        remainingReasoning = nil
+                    default:
+                        remaining = nil
+                        remainingReasoning = nil
+                    }
+                    if remaining != nil || remainingReasoning != nil {
+                        let flushLogprobs = logprobBuffer.isEmpty ? nil : Self.buildChoiceLogprobs(logprobBuffer)
+                        logprobBuffer = []
+                        let flushChunk = ChatCompletionStreamResponse(
+                            id: streamId,
+                            model: res.modelID,
+                            content: remaining ?? "",
+                            reasoningContent: remainingReasoning,
+                            logprobs: flushLogprobs,
+                            isFirst: false
+                        )
+                        if let flushData = try? encoder.encode(flushChunk),
+                           let jsonString = String(data: flushData, encoding: .utf8) {
+                            try? await writer.write(.buffer(.init(string: "data: \(jsonString)\n\n")))
+                        }
+                    }
+                }
                 // Flush remaining thinkBuffer content (tool call tags are handled
                 // above and never enter the thinkBuffer, so this is safe).
-                if !deferStructuredOutputContent && extractThinking && !thinkBuffer.isEmpty {
+                if !deferStructuredOutputContent && extractThinking && !harmonyChannels && !thinkBuffer.isEmpty {
                     let remaining: String?
                     let remainingReasoning: String?
                     if insideThinkBlock {
@@ -1108,15 +1217,18 @@ struct MLXChatCompletionsController: RouteCollection {
                 if let jsonString = String(data: finalData, encoding: .utf8) {
                     try? await writer.write(.buffer(.init(string: "data: \(jsonString)\n\n")))
                 }
-                let usageChunk = ChatCompletionStreamResponse(
-                    id: streamId,
-                    model: res.modelID,
-                    usage: usage,
-                    timings: StreamTimings(prompt_n: promptTokens, prompt_ms: promptTime * 1000, predicted_n: completionTokens, predicted_ms: generateTime * 1000)
-                )
-                let usageData = try encoder.encode(usageChunk)
-                if let jsonString = String(data: usageData, encoding: .utf8) {
-                    try? await writer.write(.buffer(.init(string: "data: \(jsonString)\n\n")))
+                // Gate the usage chunk on stream_options.include_usage. (T1.2)
+                if chatRequest.includeStreamingUsage {
+                    let usageChunk = ChatCompletionStreamResponse(
+                        id: streamId,
+                        model: res.modelID,
+                        usage: usage,
+                        timings: StreamTimings(prompt_n: promptTokens, prompt_ms: promptTime * 1000, predicted_n: completionTokens, predicted_ms: generateTime * 1000)
+                    )
+                    let usageData = try encoder.encode(usageChunk)
+                    if let jsonString = String(data: usageData, encoding: .utf8) {
+                        try? await writer.write(.buffer(.init(string: "data: \(jsonString)\n\n")))
+                    }
                 }
                 // AFM Profile: send as a final SSE event before [DONE]
                 if wantStreamProfile {
@@ -1151,31 +1263,60 @@ struct MLXChatCompletionsController: RouteCollection {
                 if wantStreamProfile || wantStreamExtended {
                     _ = self.service.stopAPIProfile(promptTokens: 0, completionTokens: 0, promptTime: 0, generateTime: 0)
                 }
-                // Log summary even on error/cancellation
+                // Distinguish cooperative cancellation (T1.4/T1.5) from genuine
+                // errors. Cancellation must NOT emit a "⚠️ Error" content chunk;
+                // the stream should end cleanly with finish_reason="cancelled".
+                let isCancellation = (error is CancellationError) || Task.isCancelled
                 let completionTokens = self.estimateTokens(fullContent)
                 let generationDuration = max(Date().timeIntervalSince(started), 0.001)
                 let tokPerSec = generationDuration > 0 ? Double(completionTokens) / generationDuration : 0
-                if self.veryVerbose {
-                    let (finalAnswer, _) = Self.extractThinkContent(from: fullContent, startTag: self.service.thinkStartTag ?? "<think>", endTag: self.service.thinkEndTag ?? "</think>")
-                    let trimmedAnswer = finalAnswer.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmedAnswer.isEmpty {
-                        print("\(Self.teal)[\(Self.timestamp())] MLX full answer (before error):\n  \(trimmedAnswer)\(Self.reset)")
+                if isCancellation {
+                    if self.veryVerbose {
+                        print("\(Self.orange)[\(Self.timestamp())] MLX cancelled: stream=true completion_tokens=\(completionTokens) elapsed=\(String(format: "%.2f", generationDuration))s\(Self.reset)")
+                        fflush(stdout)
                     }
-                    print("\(Self.orange)[\(Self.timestamp())] MLX done: stream=true\n  completion_tokens=\(completionTokens)\n  elapsed=\(String(format: "%.2f", generationDuration))s tok/s=\(String(format: "%.1f", tokPerSec))\n  error=\(error.localizedDescription)\(Self.reset)")
-                    fflush(stdout)
-                }
-                req.logger.error("[\(Self.timestamp())] MLX stream error: \(error)")
-                let errorChunk = ChatCompletionStreamResponse(
-                    id: streamId,
-                    model: self.modelID,
-                    content: "⚠️ **Error**\n\n\(error.localizedDescription)",
-                    isFirst: true
-                )
-                if let data = try? encoder.encode(errorChunk), let json = String(data: data, encoding: .utf8) {
-                    try? await writer.write(.buffer(.init(string: "data: \(json)\n\n")))
+                    let cancelledFinal = ChatCompletionStreamResponse(
+                        id: streamId,
+                        model: self.modelID,
+                        content: "",
+                        isFinished: true,
+                        finishReason: "cancelled"
+                    )
+                    if let data = try? encoder.encode(cancelledFinal), let json = String(data: data, encoding: .utf8) {
+                        try? await writer.write(.buffer(.init(string: "data: \(json)\n\n")))
+                    }
+                } else {
+                    if self.veryVerbose {
+                        let (finalAnswer, _) = Self.extractThinkContent(from: fullContent, startTag: self.service.thinkStartTag ?? "<think>", endTag: self.service.thinkEndTag ?? "</think>")
+                        let trimmedAnswer = finalAnswer.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !trimmedAnswer.isEmpty {
+                            print("\(Self.teal)[\(Self.timestamp())] MLX full answer (before error):\n  \(trimmedAnswer)\(Self.reset)")
+                        }
+                        print("\(Self.orange)[\(Self.timestamp())] MLX done: stream=true\n  completion_tokens=\(completionTokens)\n  elapsed=\(String(format: "%.2f", generationDuration))s tok/s=\(String(format: "%.1f", tokPerSec))\n  error=\(error.localizedDescription)\(Self.reset)")
+                        fflush(stdout)
+                    }
+                    req.logger.error("[\(Self.timestamp())] MLX stream error: \(error)")
+                    let errorChunk = ChatCompletionStreamResponse(
+                        id: streamId,
+                        model: self.modelID,
+                        content: "⚠️ **Error**\n\n\(error.localizedDescription)",
+                        isFirst: true
+                    )
+                    if let data = try? encoder.encode(errorChunk), let json = String(data: data, encoding: .utf8) {
+                        try? await writer.write(.buffer(.init(string: "data: \(json)\n\n")))
+                    }
                 }
                 try? await writer.write(.buffer(.init(string: "data: [DONE]\n\n")))
                 try? await writer.write(.end)
+            }
+            } // end bodyTask
+            // T1.4/T1.5: Bridge bodyTask into the pre-registered cancel handle,
+            // await completion, then release. Pre-registration eliminates the
+            // race where cancel arrives before the closure fires.
+            cancelHandle.assign(bodyTask)
+            _ = await bodyTask.value
+            if !streamReqId.isEmpty {
+                await inflightRegistry.release(id: streamReqId)
             }
         })
 
@@ -1338,9 +1479,172 @@ struct MLXChatCompletionsController: RouteCollection {
     private static let cyan = "\u{1B}[38;5;87m"   // -VV trace logging
     private static let reset = "\u{1B}[0m"
 
+    // MARK: - Harmony channel parsing (gpt-oss) (#121)
+
+    enum HarmonyChannel {
+        case none           // Awaiting <|channel|>
+        case awaitingName   // Saw <|channel|>; reading name until <|message|>
+        case analysis       // Inside analysis -> reasoning_content
+        case final          // Inside final -> content
+        case commentary     // Inside commentary (tool calls) — discarded for now
+        case done           // After <|return|>; stop
+    }
+
+    struct HarmonyState {
+        var channel: HarmonyChannel = .none
+        var nameBuf: String = ""
+        var stopReached: Bool = false
+    }
+
+    /// Length of the longest harmony control token. Used for boundary handling
+    /// so we never flush a tail that could still match a control token.
+    private static let harmonyMaxControlLen = 11   // "<|channel|>" / "<|message|>"
+
+    /// Extract harmony channel content from a streaming buffer.
+    /// Routes `<|channel|>analysis<|message|>...<|end|>` to reasoning,
+    /// `<|channel|>final<|message|>...<|return|>/<|end|>` to content,
+    /// drops `commentary` (tool-call channel), and strips control tokens.
+    /// Sets `state.stopReached = true` on `<|return|>`. The buffer retains
+    /// any partial control-token fragment for the next call. (#121)
+    static func extractHarmonyChannels(
+        buffer: inout String,
+        state: inout HarmonyState
+    ) -> (reasoning: String?, content: String?) {
+        var reasoning = ""
+        var content = ""
+
+        parseLoop: while !buffer.isEmpty && !state.stopReached {
+            switch state.channel {
+            case .done:
+                buffer = ""
+                break parseLoop
+
+            case .none:
+                if let r = buffer.range(of: "<|channel|>") {
+                    // Discard preamble (e.g. "<|start|>assistant") before the channel marker
+                    buffer = String(buffer[r.upperBound...])
+                    state.channel = .awaitingName
+                    state.nameBuf = ""
+                } else if buffer.count > Self.harmonyMaxControlLen {
+                    let safeEnd = buffer.index(buffer.endIndex, offsetBy: -Self.harmonyMaxControlLen)
+                    buffer = String(buffer[safeEnd...])
+                    break parseLoop
+                } else {
+                    break parseLoop
+                }
+
+            case .awaitingName:
+                if let r = buffer.range(of: "<|message|>") {
+                    state.nameBuf += String(buffer[..<r.lowerBound])
+                    buffer = String(buffer[r.upperBound...])
+                    let name = state.nameBuf.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    state.nameBuf = ""
+                    switch name {
+                    case "analysis": state.channel = .analysis
+                    case "final": state.channel = .final
+                    case "commentary": state.channel = .commentary
+                    default: state.channel = .commentary
+                    }
+                } else if buffer.count > Self.harmonyMaxControlLen {
+                    let safeEnd = buffer.index(buffer.endIndex, offsetBy: -Self.harmonyMaxControlLen)
+                    state.nameBuf += String(buffer[buffer.startIndex..<safeEnd])
+                    buffer = String(buffer[safeEnd...])
+                    break parseLoop
+                } else {
+                    break parseLoop
+                }
+
+            case .analysis, .final, .commentary:
+                let endRange = buffer.range(of: "<|end|>")
+                let returnRange = buffer.range(of: "<|return|>")
+                let nextMarker: (range: Range<String.Index>, isReturn: Bool)?
+                if let e = endRange, let r = returnRange {
+                    nextMarker = (e.lowerBound < r.lowerBound) ? (e, false) : (r, true)
+                } else if let e = endRange {
+                    nextMarker = (e, false)
+                } else if let r = returnRange {
+                    nextMarker = (r, true)
+                } else {
+                    nextMarker = nil
+                }
+
+                if let marker = nextMarker {
+                    let text = String(buffer[..<marker.range.lowerBound])
+                    switch state.channel {
+                    case .analysis: reasoning += text
+                    case .final: content += text
+                    default: break  // commentary discarded
+                    }
+                    buffer = String(buffer[marker.range.upperBound...])
+                    if marker.isReturn {
+                        state.channel = .done
+                        state.stopReached = true
+                    } else {
+                        state.channel = .none
+                    }
+                } else if buffer.count > Self.harmonyMaxControlLen {
+                    let safeEnd = buffer.index(buffer.endIndex, offsetBy: -Self.harmonyMaxControlLen)
+                    let text = String(buffer[buffer.startIndex..<safeEnd])
+                    switch state.channel {
+                    case .analysis: reasoning += text
+                    case .final: content += text
+                    default: break
+                    }
+                    buffer = String(buffer[safeEnd...])
+                    break parseLoop
+                } else {
+                    break parseLoop
+                }
+            }
+        }
+
+        let r: String? = reasoning.isEmpty ? nil : reasoning
+        let c: String? = content.isEmpty ? nil : content
+        return (reasoning: r, content: c)
+    }
+
+    /// Whole-text harmony extraction for non-streaming responses. (#121)
+    static func extractHarmonyContent(from text: String) -> (content: String, reasoning: String?) {
+        var buffer = text
+        var state = HarmonyState()
+        var allReasoning = ""
+        var allContent = ""
+        while !buffer.isEmpty {
+            let extracted = extractHarmonyChannels(buffer: &buffer, state: &state)
+            if let r = extracted.reasoning { allReasoning += r }
+            if let c = extracted.content { allContent += c }
+            if extracted.reasoning == nil && extracted.content == nil { break }
+        }
+        // Flush remainder for the channel we ended in (no terminator before EOS).
+        if !buffer.isEmpty {
+            switch state.channel {
+            case .analysis: allReasoning += buffer
+            case .final: allContent += buffer
+            default: break
+            }
+        }
+        let reasoning: String? = allReasoning.isEmpty ? nil : allReasoning.trimmingCharacters(in: .whitespacesAndNewlines)
+        let content = allContent.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (content, reasoning)
+    }
+
     /// Extract `<think>...</think>` content from a streaming buffer.
     /// Returns any reasoning and regular content that can be flushed.
     /// The buffer retains incomplete tag fragments for the next call.
+    /// Longest suffix of `buffer` that is a proper prefix of `tag` (capped at tag.count-1).
+    /// Streaming withholds exactly this many trailing chars so it can emit everything else
+    /// immediately while never splitting a boundary tag across chunks. Returns 0 when the
+    /// buffer tail can't begin the tag (the common case → emit with zero added latency).
+    static func partialBoundaryHoldback(_ buffer: String, _ tag: String) -> Int {
+        let b = Array(buffer), t = Array(tag)
+        var k = Swift.min(b.count, t.count - 1)
+        while k > 0 {
+            if Array(b.suffix(k)) == Array(t.prefix(k)) { return k }
+            k -= 1
+        }
+        return 0
+    }
+
     static func extractThinkTags(
         buffer: inout String,
         insideThinkBlock: inout Bool,
@@ -1349,8 +1653,6 @@ struct MLXChatCompletionsController: RouteCollection {
     ) -> (reasoning: String?, content: String?) {
         var reasoning = ""
         var content = ""
-        let startTagLen = startTag.count
-        let endTagLen = endTag.count
 
         while !buffer.isEmpty {
             if insideThinkBlock {
@@ -1358,12 +1660,18 @@ struct MLXChatCompletionsController: RouteCollection {
                     reasoning += String(buffer[buffer.startIndex..<endRange.lowerBound])
                     buffer = String(buffer[endRange.upperBound...])
                     insideThinkBlock = false
-                } else if buffer.count > endTagLen {
-                    let safeEnd = buffer.index(buffer.endIndex, offsetBy: -endTagLen)
-                    reasoning += String(buffer[buffer.startIndex..<safeEnd])
-                    buffer = String(buffer[safeEnd...])
-                    break
                 } else {
+                    // Emit reasoning eagerly: withhold only the trailing chars that could be the
+                    // start of a partial end tag (a prefix of "</think>"), instead of a fixed
+                    // endTagLen. For typical reasoning text (not ending mid-tag) this holds back 0
+                    // chars and streams immediately, cutting first-reasoning-token latency (TTFT)
+                    // by several tokens. Correctness preserved: a partial end tag is never emitted.
+                    let hb = Self.partialBoundaryHoldback(buffer, endTag)
+                    if buffer.count > hb {
+                        let safeEnd = buffer.index(buffer.endIndex, offsetBy: -hb)
+                        reasoning += String(buffer[buffer.startIndex..<safeEnd])
+                        buffer = String(buffer[safeEnd...])
+                    }
                     break
                 }
             } else {
@@ -1372,12 +1680,15 @@ struct MLXChatCompletionsController: RouteCollection {
                     content += before
                     buffer = String(buffer[startRange.upperBound...])
                     insideThinkBlock = true
-                } else if buffer.count > startTagLen {
-                    let safeEnd = buffer.index(buffer.endIndex, offsetBy: -startTagLen)
-                    content += String(buffer[buffer.startIndex..<safeEnd])
-                    buffer = String(buffer[safeEnd...])
-                    break
                 } else {
+                    // Same eager-emit optimization for the pre-think content path: withhold only a
+                    // partial start-tag prefix, not a fixed startTagLen.
+                    let hb = Self.partialBoundaryHoldback(buffer, startTag)
+                    if buffer.count > hb {
+                        let safeEnd = buffer.index(buffer.endIndex, offsetBy: -hb)
+                        content += String(buffer[buffer.startIndex..<safeEnd])
+                        buffer = String(buffer[safeEnd...])
+                    }
                     break
                 }
             }
@@ -1425,15 +1736,23 @@ struct MLXChatCompletionsController: RouteCollection {
         content: String,
         toolCalls: [ResponseToolCall]?,
         toolChoice: ToolChoice?,
+        parallelToolCalls: Bool? = nil,
         extractThinking: Bool,
         thinkStartTag: String,
         thinkEndTag: String,
         stoppedBySequence: Bool,
         completionTokens: Int,
         maxTokens: Int,
-        sanitizeContent: (String) -> String
+        sanitizeContent: (String) -> String,
+        harmonyChannels: Bool = false
     ) -> FinalizedAssistantTurn {
-        let effectiveToolCalls = applyToolChoice(toolCalls, toolChoice: toolChoice)
+        var effectiveToolCalls = applyToolChoice(toolCalls, toolChoice: toolChoice)
+        // Honor parallel_tool_calls=false by truncating to the first call. (T1.3)
+        if parallelToolCalls == false,
+           let calls = effectiveToolCalls,
+           calls.count > 1 {
+            effectiveToolCalls = [calls[0]]
+        }
         if let effectiveToolCalls, !effectiveToolCalls.isEmpty {
             return FinalizedAssistantTurn(
                 finishReason: "tool_calls",
@@ -1446,7 +1765,9 @@ struct MLXChatCompletionsController: RouteCollection {
         let cleanedContent = sanitizeContent(content)
         let finalContent: String
         let reasoningContent: String?
-        if extractThinking {
+        if extractThinking && harmonyChannels {
+            (finalContent, reasoningContent) = extractHarmonyContent(from: cleanedContent)
+        } else if extractThinking {
             (finalContent, reasoningContent) = extractThinkContent(
                 from: cleanedContent,
                 startTag: thinkStartTag,

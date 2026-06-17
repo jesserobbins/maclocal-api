@@ -537,10 +537,17 @@ struct OpenAIError: Content, Error {
         let message: String
         let type: String
         let code: String?
+        /// Correlates with the `X-Request-ID`/`OpenAI-Request-ID` response header. (T1.1)
+        let requestId: String?
+
+        enum CodingKeys: String, CodingKey {
+            case message, type, code
+            case requestId = "request_id"
+        }
     }
 
-    init(message: String, type: String = "invalid_request_error", code: String? = nil) {
-        self.error = ErrorDetail(message: message, type: type, code: code)
+    init(message: String, type: String = "invalid_request_error", code: String? = nil, requestId: String? = nil) {
+        self.error = ErrorDetail(message: message, type: type, code: code, requestId: requestId)
     }
 }
 
@@ -663,5 +670,77 @@ struct BatchListResponse: Content {
         self.object = "list"
         self.data = data
         self.hasMore = false
+    }
+}
+
+// MARK: - Embeddings API Response Types
+
+enum EmbeddingVectorPayload: Content {
+    case float([Float])
+    case base64(String)
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let floatVector = try? container.decode([Float].self) {
+            self = .float(floatVector)
+        } else if let base64 = try? container.decode(String.self) {
+            self = .base64(base64)
+        } else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Embedding payload must be a float array or base64 string"
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .float(let vector):
+            try container.encode(vector)
+        case .base64(let string):
+            try container.encode(string)
+        }
+    }
+}
+
+struct EmbeddingDataItem: Content {
+    let object: String
+    let index: Int
+    let embedding: EmbeddingVectorPayload
+
+    init(index: Int, embedding: EmbeddingVectorPayload) {
+        self.object = "embedding"
+        self.index = index
+        self.embedding = embedding
+    }
+}
+
+/// Usage accounting for the /v1/embeddings endpoint.
+///
+/// Scoped separately from the chat `Usage` struct so the Apple-only embeddings
+/// path does not pull in `MLXMetalLibrary.ensureAvailable()`, which mutates the
+/// process working directory when it initializes the MLX Metal library.
+struct EmbeddingsUsage: Content {
+    let promptTokens: Int
+    let totalTokens: Int
+
+    enum CodingKeys: String, CodingKey {
+        case promptTokens = "prompt_tokens"
+        case totalTokens = "total_tokens"
+    }
+}
+
+struct EmbeddingsResponse: Content {
+    let object: String
+    let data: [EmbeddingDataItem]
+    let model: String
+    let usage: EmbeddingsUsage
+
+    init(model: String, data: [EmbeddingDataItem], promptTokens: Int) {
+        self.object = "list"
+        self.data = data
+        self.model = model
+        self.usage = EmbeddingsUsage(promptTokens: promptTokens, totalTokens: promptTokens)
     }
 }

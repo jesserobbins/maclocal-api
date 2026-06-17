@@ -23,12 +23,13 @@ typealias ChatStreamingResult = (
     thinkEndTag: String?
 )
 
-protocol MLXChatServing {
+protocol MLXChatServing: Sendable {
     var maxConcurrent: Int { get }
     var toolCallParser: String? { get }
     var supportsStrictToolGrammar: Bool { get }
     var thinkStartTag: String? { get }
     var thinkEndTag: String? { get }
+    var harmonyChannels: Bool { get }
     var fixToolArgs: Bool { get }
     var enableGrammarConstraints: Bool { get }
     var defaultGuidedJsonSchema: ResponseFormat? { get }
@@ -92,6 +93,7 @@ protocol MLXChatServing {
 
 extension MLXChatServing {
     var defaultGuidedJsonSchema: ResponseFormat? { nil }
+    var harmonyChannels: Bool { false }
 
     func effectiveResponseFormat(requestFormat: ResponseFormat?) -> ResponseFormat? {
         requestFormat ?? defaultGuidedJsonSchema

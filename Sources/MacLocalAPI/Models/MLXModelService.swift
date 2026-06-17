@@ -5,10 +5,46 @@ import MLX
 import Cmlx
 import MLXLLM
 import MLXVLM
-import MLXLMCommon
+// @preconcurrency: MLXLMCommon predates Swift 6 concurrency. Its value types
+// (LMInput, ModelContext, UserInput, GenerateParameters) aren't Sendable-audited;
+// this downgrades cross-boundary Sendable diagnostics for them to warnings without
+// changing runtime behavior. Access is already serialized via ModelContainer.
+@preconcurrency import MLXLMCommon
 import Tokenizers
 import Hub
 import HuggingFace
+
+/// Process-global holder for the active MTP self-speculative generator.
+///
+/// The MTP head + generator are tied to the loaded model and accessed only inside
+/// `ModelContainer.perform` (serialized), so a single-slot holder is sufficient and avoids
+/// threading the generator through every generation signature. Cleared on model unload.
+final class MTPRuntime: @unchecked Sendable {
+    static let shared = MTPRuntime()
+    private var generator: Qwen3_5MoEMTPGenerator?
+    private let lock = NSLock()
+
+    func install(model: Qwen3_5MoEModel, head: Qwen3_5MoEMTPHead, depth: Int) {
+        lock.withLock { generator = Qwen3_5MoEMTPGenerator(model: model, head: head, depth: depth) }
+    }
+    func clear() { lock.withLock { generator = nil } }
+    var active: Qwen3_5MoEMTPGenerator? { lock.withLock { generator } }
+}
+
+/// Process-global holder for the active EAGLE3 speculative drafter (Gemma4 dense verifier).
+///
+/// Holds the loaded drafter (immutable weights); a fresh `Gemma4Eagle3Generator` is created per
+/// request (its KV cache + seed state are per-sequence). Accessed only inside
+/// `ModelContainer.perform` (serialized). Cleared on model unload.
+final class Eagle3Runtime: @unchecked Sendable {
+    static let shared = Eagle3Runtime()
+    private var drafter: Gemma4Eagle3Drafter?
+    private let lock = NSLock()
+
+    func install(drafter: Gemma4Eagle3Drafter) { lock.withLock { self.drafter = drafter } }
+    func clear() { lock.withLock { drafter = nil } }
+    var active: Gemma4Eagle3Drafter? { lock.withLock { drafter } }
+}
 
 /// Resolved log probability entry with token strings (ready for API response).
 struct ResolvedLogprob: Sendable {
@@ -96,9 +132,51 @@ private let vvCyan = "\u{1B}[38;5;87m"
 private let vvReset = "\u{1B}[0m"
 /// Module-level trace flag, set by MLXModelService.trace when the service is configured.
 /// Used by static parsing/conversion methods that can't access instance properties.
-private var traceLogging = false
+nonisolated(unsafe) private var traceLogging = false
 /// Module-level grammar constraint flag — enables cross-parameter dedup in the XML parser.
-private var grammarConstraintsActive = false
+nonisolated(unsafe) private var grammarConstraintsActive = false
+
+/// Carries values out of the serialized `container.perform` generation closure.
+///
+/// Swift 6 forbids a `@Sendable` closure from capturing-and-mutating local `var`s.
+/// The generation closure runs under the model's serial-access lock and is fully
+/// awaited before any of these fields are read, so there is no real concurrency —
+/// `@unchecked Sendable` documents that the synchronization is provided externally
+/// by `ModelContainer.perform`. This preserves the prior single-sequence behavior
+/// exactly while moving the mutable storage into a reference the closure can capture.
+private final class NonStreamingScratch: @unchecked Sendable {
+    /// Non-Sendable model input, handed to the closure through this box.
+    var userInput: UserInput!
+    var collectedLogprobs = [TokenLogprobData]()
+    var resolvedLogprobs: [ResolvedLogprob]? = nil
+    var collectedToolCalls = [ToolCall]()
+    var completionInfo: GenerateCompletionInfo? = nil
+    var cachedTokenCount = 0
+    var stoppedBySequence = false
+    var cacheOutcome = "disabled"
+    var cacheLookupTime: Double? = nil
+    var cacheRestoreTime: Double? = nil
+    var cacheTrimTime: Double? = nil
+    var cacheTruncateTime: Double? = nil
+    var cacheInputTokenCount = 0
+    var saveTrimTime: Double? = nil
+    var saveTruncateTime: Double? = nil
+    var saveInsertTime: Double? = nil
+}
+
+/// Streaming counterpart of `NonStreamingScratch`. Holds the non-Sendable model
+/// input and the post-generation metric counters that the nested, serialized
+/// `container.perform` closure fills in. Same justification for `@unchecked
+/// Sendable`: the closure runs under the model lock and is awaited before these
+/// fields are read by the metrics observation below it.
+private final class StreamingScratch: @unchecked Sendable {
+    var userInput: UserInput!
+    var streamStatPromptTokens = 0
+    var streamStatCompletionTokens = 0
+    var streamStatPromptTime = 0.0
+    var streamStatGenerateTime = 0.0
+    var streamStatStoppedBySequence = false
+}
 
 final class MLXModelService: @unchecked Sendable {
     private struct ConstrainedDecodingSetup {
@@ -129,6 +207,13 @@ final class MLXModelService: @unchecked Sendable {
     var kvBits: Int?
     var kvEvictionPolicy: String = "none"  // "none" or "streaming"
     var enablePrefixCaching: Bool = false
+    /// MTP self-speculative decoding (--mtp). Activates only when the loaded model has an
+    /// mtp.safetensors sidecar (a Qwen3.6 MTP head); otherwise silently falls back to AR.
+    var mtpEnabled: Bool = false
+    var mtpDepth: Int = 3
+    /// EAGLE3 speculative decoding (--eagle3 <drafter-path>). Activates only when the loaded model
+    /// is a dense Gemma4 verifier and a drafter loads from the given path; otherwise falls back to AR.
+    var eagle3DrafterPath: String?
     /// Server-level default JSON schema from `--guided-json` CLI flag.
     /// Applied to requests that don't specify their own response_format. (#97)
     var defaultGuidedJsonSchema: ResponseFormat?
@@ -207,6 +292,10 @@ final class MLXModelService: @unchecked Sendable {
     /// Set after model load. nil if the model doesn't have think tokens.
     private(set) var thinkStartTag: String?
     private(set) var thinkEndTag: String?
+    /// True when the loaded model uses OpenAI Harmony channel tokens
+    /// (`<|channel|>analysis|message|>...<|end|>`) instead of `<think>` tags.
+    /// Detected from `model_type == "gpt_oss"` in config.json. (#121)
+    private(set) var harmonyChannels: Bool = false
     private var xgrammarService: XGrammarService?
     /// Concurrent generation scheduler (nil = serial mode via container.perform).
     private var scheduler: BatchScheduler?
@@ -544,9 +633,9 @@ final class MLXModelService: @unchecked Sendable {
     // DRAM power → bandwidth calibration via GPU memory stress (MLX).
     // Runs a known GPU workload (x + 1 on 1 GiB array) for 1s, measures DRAM power
     // via IOReport, derives GB/s-per-watt from actual GPU→DRAM traffic.
-    private static var dramIdlePowerW = 0.3
-    private static var dramGBsPerWatt = 10.5  // fallback if calibration fails
-    private static var dramCalibrated = false
+    nonisolated(unsafe) private static var dramIdlePowerW = 0.3
+    nonisolated(unsafe) private static var dramGBsPerWatt = 10.5  // fallback if calibration fails
+    nonisolated(unsafe) private static var dramCalibrated = false
 
     /// Thread-safe dispatch_once calibration — runs async on background queue.
     /// Default dramGBsPerWatt (10.5) is used until calibration completes.
@@ -1151,9 +1240,54 @@ final class MLXModelService: @unchecked Sendable {
                 currentModelID = modelID
                 currentToolCallFormat = detectedFormat
             }
+            // MTP: if requested and the model ships an mtp.safetensors sidecar, load the head
+            // into the container's model. Silently no-op otherwise (falls back to AR).
+            if mtpEnabled {
+                let sidecar = directory.appendingPathComponent("mtp.safetensors").path
+                if FileManager.default.fileExists(atPath: sidecar) {
+                    do {
+                        try await loaded.perform { context in
+                            if let qwen = context.model as? Qwen3_5MoEModel {
+                                let head = try qwen.loadMTPHead(sidecarPath: sidecar)
+                                MTPRuntime.shared.install(model: qwen, head: head, depth: mtpDepth)
+                                print("[\(ts())] [MTP] head loaded — self-speculative decoding enabled (depth \(mtpDepth))")
+                            } else {
+                                print("[\(ts())] [MTP] model is not Qwen3.6 text LLM (\(type(of: context.model))) — MTP disabled")
+                            }
+                        }
+                    } catch {
+                        print("[\(ts())] [MTP] head load failed (\(error)) — falling back to AR")
+                    }
+                } else {
+                    print("[\(ts())] [MTP] no mtp.safetensors at \(modelID) — MTP disabled (AR decode)")
+                }
+            }
+            // EAGLE3: if a drafter path was given and the verifier is a dense Gemma4 text model,
+            // load the drafter. Silently no-op otherwise (falls back to AR).
+            if let drafterPath = eagle3DrafterPath {
+                if FileManager.default.fileExists(atPath: drafterPath + "/config.json") {
+                    do {
+                        let drafter = try Gemma4Eagle3Drafter.load(directory: drafterPath)
+                        let isGemma4 = try await loaded.perform { context in
+                            context.model is Gemma4Model
+                        }
+                        if isGemma4 {
+                            Eagle3Runtime.shared.install(drafter: drafter)
+                            print("[\(ts())] [EAGLE3] drafter loaded from \(drafterPath) — speculative decoding enabled")
+                        } else {
+                            print("[\(ts())] [EAGLE3] verifier is not a dense Gemma4 text model — EAGLE3 disabled")
+                        }
+                    } catch {
+                        print("[\(ts())] [EAGLE3] drafter load failed (\(error)) — falling back to AR")
+                    }
+                } else {
+                    print("[\(ts())] [EAGLE3] no config.json at \(drafterPath) — EAGLE3 disabled (AR decode)")
+                }
+            }
             // Detect think start/end tags from tokenizer vocabulary
-            do {
-                let ctx = try await loaded.perform { context in context }
+            // Run the tokenizer-vocabulary inspection inside `perform` so the
+            // non-Sendable ModelContext never crosses the isolation boundary.
+            try await loaded.perform { context in
                 let knownThinkPairs: [(start: String, end: String)] = [
                     ("<|channel>", "<channel|>"),  // Gemma 4 channel-based thinking
                     ("<think>", "</think>"),
@@ -1168,8 +1302,8 @@ final class MLXModelService: @unchecked Sendable {
                     return ids.count == 1 || (ids.count == 2 && tokenizer.decode(tokens: [ids.last!]) == s)
                 }
                 for pair in knownThinkPairs {
-                    if isSingleToken(pair.start, ctx.tokenizer)
-                        && isSingleToken(pair.end, ctx.tokenizer)
+                    if isSingleToken(pair.start, context.tokenizer)
+                        && isSingleToken(pair.end, context.tokenizer)
                     {
                         self.thinkStartTag = pair.start
                         self.thinkEndTag = pair.end
@@ -1196,6 +1330,22 @@ final class MLXModelService: @unchecked Sendable {
                     print("[\(ts())] [Think] No think tokens found in vocabulary")
                 }
             }
+            // Detect harmony channel format (gpt-oss). When set, the controller
+            // routes <|channel|>analysis|message|> ... <|end|> to reasoning_content
+            // and <|channel|>final|message|> ... <|return|>/<|end|> to content. (#121)
+            self.harmonyChannels = false
+            if let modelDir = self.resolver.localModelDirectory(repoId: modelID) {
+                let configURL = modelDir.appendingPathComponent("config.json")
+                if let data = try? Data(contentsOf: configURL),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let modelType = json["model_type"] as? String,
+                   modelType.lowercased() == "gpt_oss" {
+                    self.harmonyChannels = true
+                    if debugLogging {
+                        print("[\(ts())] [Harmony] Detected gpt_oss model — enabling channel parsing")
+                    }
+                }
+            }
             self.radixCache?.invalidateAll()
             if self.enablePrefixCaching {
                 self.radixCache = RadixTreeCache(
@@ -1204,15 +1354,50 @@ final class MLXModelService: @unchecked Sendable {
                     debugLogging: debugLogging
                 )
                 print("[\(ts())] [PrefixCache] Radix tree prefix caching active (64 entries max)")
+                // /metrics: expose radix fill as afm:radix_cache_fill_perc.
+                // The closure captures `self` weakly so it doesn't extend
+                // the service's lifetime; nil-check guards model unload.
+                StatsAggregator.shared.registerRadixCacheFillReader { [weak self] in
+                    self?.radixCache?.usageFraction ?? 0
+                }
             } else {
                 self.radixCache = nil
                 print("[\(ts())] [PrefixCache] Prefix caching disabled")
+            }
+            // /metrics: expose total GPU memory pressure as
+            // afm:gpu_cache_usage_perc — fraction of Metal's recommended
+            // working set currently in active MLX allocations. This
+            // includes model weights + KV cache + intermediate tensors,
+            // so it's broader than vLLM's strict "KV pool fill" but is
+            // the most useful single signal for "is afm running out of
+            // VRAM?". Registered on every successful model load.
+            let maxWorkingSetBytes = GPU.deviceInfo().maxRecommendedWorkingSetSize
+            StatsAggregator.shared.registerGpuCacheUsageReader {
+                guard maxWorkingSetBytes > 0 else { return 0 }
+                let active = Double(GPU.activeMemory)
+                return min(1.0, active / Double(maxWorkingSetBytes))
             }
             try registry.registerModel(modelID)
             stage?(.ready)
             return modelID
         } catch {
             throw MLXServiceError.loadFailed("\(modelID): \(error.localizedDescription)")
+        }
+    }
+
+    /// Encode text using the loaded model's tokenizer. (T1.6)
+    /// Concurrent mode pulls from the scheduler's nonisolated tokenizer; serial
+    /// mode dives into the container under its actor lock.
+    /// Throws `MLXServiceError.noModelLoaded` if no model is currently loaded.
+    func tokenize(text: String) async throws -> [Int] {
+        if let scheduler = self.scheduler {
+            return scheduler.tokenizer.encode(text: text)
+        }
+        guard let container = withStateLock({ currentContainer }) else {
+            throw MLXServiceError.noModelLoaded
+        }
+        return await container.perform { context in
+            context.tokenizer.encode(text: text)
         }
     }
 
@@ -1371,6 +1556,25 @@ final class MLXModelService: @unchecked Sendable {
         try beginOperation()
         defer { endOperation() }
 
+        // /metrics: serial-path timestamps. The serial generate() has no
+        // explicit queue, so queuedAt == startedAt (queue_time observes ~0).
+        // Token counters (prompt_tokens_total / generation_tokens_total) and
+        // the per-request histograms are recorded at the bottom of this
+        // function, after `completionInfo` is available.
+        let serialQueuedAt = Date()
+        StatsAggregator.shared.requestStarted()
+        // Balance the requests_started_total counter on every exit, including
+        // throws between here and the success path below. Without this, an
+        // error during model load or input prep increments started_total
+        // without a matching completed_total, breaking dashboards and alerts.
+        var serialRequestRecorded = false
+        defer {
+            if !serialRequestRecorded {
+                StatsAggregator.shared.requestSucceeded(reason: "error")
+                StatsAggregator.shared.requestCompleted()
+            }
+        }
+
         let modelID = try await ensureLoaded(model: model, countOperation: false)
         guard let container = withStateLock({ currentContainer }) else { throw MLXServiceError.noModelLoaded }
 
@@ -1381,45 +1585,144 @@ final class MLXModelService: @unchecked Sendable {
         let wantLogprobs = logprobs == true
         let effectiveMaxTokens = capMaxTokensForCapture(maxTokens ?? 2000)
 
-        var params = GenerateParameters(
-            maxTokens: effectiveMaxTokens,
-            kvBits: self.kvBits,
-            kvGroupSize: 64,
-            quantizedKVStart: 0,
-            temperature: normalizedTemperature(temperature),
-            topP: normalizedTopP(topP),
-            repetitionPenalty: normalizedRepetitionPenalty(repetitionPenalty),
-            repetitionContextSize: 64,
-            topK: normalizedTopK(topK),
-            minP: normalizedMinP(minP),
-            presencePenalty: normalizedPresencePenalty(presencePenalty),
-            seed: normalizedSeed(seed),
-            computeLogprobs: wantLogprobs,
-            topLogprobsCount: wantLogprobs ? min(max(topLogprobs ?? 0, 0), 20) : 0,
-            prefillStepSize: self.prefillStepSize
-        )
-
-        var collectedLogprobs = [TokenLogprobData]()
-        var resolvedLogprobs: [ResolvedLogprob]? = nil
-        var collectedToolCalls = [ToolCall]()
-        var completionInfo: GenerateCompletionInfo? = nil
-        var cachedTokenCount = 0
-        var stoppedBySequence = false
-        var cacheOutcome = "disabled"
-        var cacheLookupTime: Double? = nil
-        var cacheRestoreTime: Double? = nil
-        var cacheTrimTime: Double? = nil
-        var cacheTruncateTime: Double? = nil
-        var cacheInputTokenCount = 0
-        var saveTrimTime: Double? = nil
-        var saveTruncateTime: Double? = nil
-        var saveInsertTime: Double? = nil
+        // Mutable generation state lives in a scratch box so the @Sendable
+        // `container.perform` closure (Swift 6) can capture-and-mutate it.
+        // perform serializes the whole generation under the model lock and is
+        // awaited before these fields are read, so access stays single-sequence.
+        let scratch = NonStreamingScratch()
+        scratch.userInput = userInput
         // GPU capture/trace/profile: start before inference
         let capturePath = gpuCapturePath
         let capturing = beginGPUCaptureIfNeeded()
         let tracing = beginGPUTraceIfNeeded()
         if gpuProfile { printGPUProfileHeader() }
+        // ---- MTP self-speculative fast path (greedy, text-only, no tools/grammar/logprobs) ----
+        // Eligible when an MTP head is installed and the request is plain greedy generation.
+        // Produces output identical to greedy AR (validated P2) but with fewer trunk forwards.
+        let mtpEligible = MTPRuntime.shared.active != nil
+            && (temperature ?? 0) <= 0.0
+            && (tools?.isEmpty ?? true)
+            && responseFormat == nil
+            && !wantLogprobs
+        if mtpEligible {
+            if let mtpResult = try await container.perform({ context -> (String, Int, Int)? in
+                guard let gen = MTPRuntime.shared.active else { return nil }
+                let lmInput = try await context.processor.prepare(input: scratch.userInput)
+                if self.isMultimodalInput(lmInput) { return nil }   // MTP is text-only
+                let promptIds = self.extractTokenArray(lmInput)
+                guard !promptIds.isEmpty else { return nil }
+                let eos = Set((context.tokenizer.eosTokenId).map { [$0] } ?? [])
+                let t0 = Date.timeIntervalSinceReferenceDate
+                let outIds = gen.generate(promptIds: promptIds, maxTokens: effectiveMaxTokens, eosIds: eos)
+                let gt = Date.timeIntervalSinceReferenceDate - t0
+                // strip a trailing EOS for the returned text
+                let textIds = (outIds.last.map { eos.contains($0) } ?? false) ? Array(outIds.dropLast()) : outIds
+                let text = context.tokenizer.decode(tokens: textIds)
+                if debugLogging {
+                    let tps = gt > 0 ? Double(outIds.count) / gt : 0
+                    print("[\(ts())] [MTP] generated \(outIds.count) tok in \(String(format: "%.2f", gt))s (\(String(format: "%.1f", tps)) tok/s)")
+                }
+                return (text, promptIds.count, outIds.count)
+            }) {
+                serialRequestRecorded = true
+                StatsAggregator.shared.requestSucceeded(reason: "stop")
+                StatsAggregator.shared.requestCompleted()
+                return (modelID, mtpResult.0, mtpResult.1, mtpResult.2, nil, nil, 0, 0, 0, false)
+            }
+        }
+
+        // ---- EAGLE3 speculative fast path (greedy, text-only, no tools/grammar/logprobs) ----
+        // Eligible when a drafter is installed and the request is plain greedy generation.
+        // Produces output identical to greedy AR (validated P1) with fewer verifier trunk forwards.
+        let eagle3Eligible = Eagle3Runtime.shared.active != nil
+            && (temperature ?? 0) <= 0.0
+            && (tools?.isEmpty ?? true)
+            && responseFormat == nil
+            && !wantLogprobs
+        if eagle3Eligible {
+            if let e3Result = try await container.perform({ context -> (String, Int, Int)? in
+                guard let drafter = Eagle3Runtime.shared.active,
+                      let model = context.model as? Gemma4Model else { return nil }
+                let lmInput = try await context.processor.prepare(input: scratch.userInput)
+                if self.isMultimodalInput(lmInput) { return nil }   // EAGLE3 is text-only
+                let promptIds = self.extractTokenArray(lmInput)
+                guard !promptIds.isEmpty else { return nil }
+                let eos = Set((context.tokenizer.eosTokenId).map { [$0] } ?? [])
+                let t0 = Date.timeIntervalSinceReferenceDate
+                let gen = Gemma4Eagle3Generator(drafter: drafter)
+                // blockSize 2 is the sweet spot on the dense 31B (each round drafts only the carried
+                // seed — zero in-block drafter forwards — so the 2-wide verify amortizes best;
+                // larger blocks add sequential drafter forwards that erase the savings). Overridable.
+                let block = ProcessInfo.processInfo.environment["AFM_EAGLE3_BLOCK"].flatMap { Int($0) } ?? 2
+                let outIds = gen.generateSpeculative(
+                    model: model, promptIds: promptIds, maxTokens: effectiveMaxTokens,
+                    eosIds: eos, blockSize: block)
+                let gt = Date.timeIntervalSinceReferenceDate - t0
+                let textIds = (outIds.last.map { eos.contains($0) } ?? false) ? Array(outIds.dropLast()) : outIds
+                let text = context.tokenizer.decode(tokens: textIds)
+                if debugLogging {
+                    let tps = gt > 0 ? Double(outIds.count) / gt : 0
+                    print("[\(ts())] [EAGLE3] generated \(outIds.count) tok in \(String(format: "%.2f", gt))s (\(String(format: "%.1f", tps)) tok/s)")
+                }
+                return (text, promptIds.count, outIds.count)
+            }) {
+                serialRequestRecorded = true
+                StatsAggregator.shared.requestSucceeded(reason: "stop")
+                StatsAggregator.shared.requestCompleted()
+                return (modelID, e3Result.0, e3Result.1, e3Result.2, nil, nil, 0, 0, 0, false)
+            }
+        }
+
         let generated: String = try await container.perform { context in
+            var params = GenerateParameters(
+                maxTokens: effectiveMaxTokens,
+                kvBits: self.kvBits,
+                kvGroupSize: 64,
+                quantizedKVStart: 0,
+                temperature: normalizedTemperature(temperature),
+                topP: normalizedTopP(topP),
+                repetitionPenalty: normalizedRepetitionPenalty(repetitionPenalty),
+                repetitionContextSize: 64,
+                topK: normalizedTopK(topK),
+                minP: normalizedMinP(minP),
+                presencePenalty: normalizedPresencePenalty(presencePenalty),
+                seed: normalizedSeed(seed),
+                computeLogprobs: wantLogprobs,
+                topLogprobsCount: wantLogprobs ? min(max(topLogprobs ?? 0, 0), 20) : 0,
+                prefillStepSize: self.prefillStepSize
+            )
+            var collectedLogprobs = [TokenLogprobData]()
+            var resolvedLogprobs: [ResolvedLogprob]? = nil
+            var collectedToolCalls = [ToolCall]()
+            var completionInfo: GenerateCompletionInfo? = nil
+            var cachedTokenCount = 0
+            var stoppedBySequence = false
+            var cacheOutcome = "disabled"
+            var cacheLookupTime: Double? = nil
+            var cacheRestoreTime: Double? = nil
+            var cacheTrimTime: Double? = nil
+            var cacheTruncateTime: Double? = nil
+            var cacheInputTokenCount = 0
+            var saveTrimTime: Double? = nil
+            var saveTruncateTime: Double? = nil
+            var saveInsertTime: Double? = nil
+            defer {
+                scratch.collectedLogprobs = collectedLogprobs
+                scratch.resolvedLogprobs = resolvedLogprobs
+                scratch.collectedToolCalls = collectedToolCalls
+                scratch.completionInfo = completionInfo
+                scratch.cachedTokenCount = cachedTokenCount
+                scratch.stoppedBySequence = stoppedBySequence
+                scratch.cacheOutcome = cacheOutcome
+                scratch.cacheLookupTime = cacheLookupTime
+                scratch.cacheRestoreTime = cacheRestoreTime
+                scratch.cacheTrimTime = cacheTrimTime
+                scratch.cacheTruncateTime = cacheTruncateTime
+                scratch.cacheInputTokenCount = cacheInputTokenCount
+                scratch.saveTrimTime = saveTrimTime
+                scratch.saveTruncateTime = saveTruncateTime
+                scratch.saveInsertTime = saveInsertTime
+            }
             // Grammar constraint setup (needs tokenizer from context)
             let constrainedDecoding = self.setupConstrainedDecodingProcessor(
                 modelID: modelID,
@@ -1434,7 +1737,7 @@ final class MLXModelService: @unchecked Sendable {
                 params.extraProcessor = constrainedDecoding.processor
             }
 
-            let input = try await context.processor.prepare(input: userInput)
+            let input = try await context.processor.prepare(input: scratch.userInput)
 
             // DEBUG/VV: decode and print the full prompt to see what the template produced
             if debugLogging || self.trace {
@@ -1559,6 +1862,7 @@ final class MLXModelService: @unchecked Sendable {
                     generateInput = LMInput(text: .init(tokens: MLXArray(suffixTokens)))
                     cachedTokenCount = effectivePrefix
                     cacheOutcome = "hit"
+                    StatsAggregator.shared.cacheHit()  // /metrics: afm:radix_cache_hits_total
                     cacheRestoreTime = tRestore1 - tRestore0
                     cacheTrimTime = tTrim - tRestore1
                     cacheTruncateTime = tRoundtrip - tTrim
@@ -1588,6 +1892,7 @@ final class MLXModelService: @unchecked Sendable {
                 } else {
                     generateInput = input
                     cacheOutcome = bypassExactReplay ? "exact-replay-bypass" : "miss"
+                    StatsAggregator.shared.cacheMiss()  // /metrics: afm:radix_cache_misses_total
                     self.logCachePrefill(
                         mode: "non-streaming",
                         outcome: cacheOutcome,
@@ -1778,6 +2083,23 @@ final class MLXModelService: @unchecked Sendable {
             return out
         }
 
+        // Re-bind generation outputs from the scratch box so the post-closure
+        // code below reads them by their original names unchanged.
+        let resolvedLogprobs = scratch.resolvedLogprobs
+        let collectedToolCalls = scratch.collectedToolCalls
+        let completionInfo = scratch.completionInfo
+        let cachedTokenCount = scratch.cachedTokenCount
+        let stoppedBySequence = scratch.stoppedBySequence
+        let cacheOutcome = scratch.cacheOutcome
+        let cacheLookupTime = scratch.cacheLookupTime
+        let cacheRestoreTime = scratch.cacheRestoreTime
+        let cacheTrimTime = scratch.cacheTrimTime
+        let cacheTruncateTime = scratch.cacheTruncateTime
+        let cacheInputTokenCount = scratch.cacheInputTokenCount
+        let saveTrimTime = scratch.saveTrimTime
+        let saveTruncateTime = scratch.saveTruncateTime
+        let saveInsertTime = scratch.saveInsertTime
+
         // GPU capture/trace/profile: end after GPU sync completes inside container.perform
         if capturing, let path = capturePath {
             endGPUCapture(path: path)
@@ -1850,6 +2172,43 @@ final class MLXModelService: @unchecked Sendable {
                 truncateTime: saveTruncateTime,
                 insertTime: saveInsertTime
             )
+
+            // /metrics: serial-path observations.
+            // - queuedAt ≈ startedAt (no real queue in serial mode)
+            // - firstTokenAt ≈ startedAt + promptTime (prefill ends at first token)
+            // - completedAt = now
+            let completedAt = Date()
+            let firstTokenAt: Date? = (completionTokens > 0 && promptTime >= 0)
+                ? serialQueuedAt.addingTimeInterval(promptTime)
+                : nil
+            StatsAggregator.shared.addPromptTokens(promptTokens)
+            StatsAggregator.shared.addGenTokens(completionTokens)
+            StatsAggregator.shared.observeRequest(
+                StatsAggregator.RequestObservation(
+                    queuedAt: serialQueuedAt.timeIntervalSince1970,
+                    startedAt: serialQueuedAt.timeIntervalSince1970,
+                    firstTokenAt: firstTokenAt?.timeIntervalSince1970,
+                    completedAt: completedAt.timeIntervalSince1970,
+                    promptTokens: promptTokens,
+                    generationTokens: completionTokens,
+                    paramsN: 1,
+                    paramsBestOf: 1
+                )
+            )
+            let serialFinishedReason: String
+            if stoppedBySequence {
+                serialFinishedReason = "stop"
+            } else if completionTokens >= effectiveMaxTokens {
+                serialFinishedReason = "length"
+            } else if responseToolCalls?.isEmpty == false {
+                serialFinishedReason = "tool_calls"
+            } else {
+                serialFinishedReason = "stop"
+            }
+            StatsAggregator.shared.requestSucceeded(reason: serialFinishedReason)
+            StatsAggregator.shared.requestCompleted()
+            serialRequestRecorded = true
+
             return (modelID, finalContent, promptTokens, completionTokens, resolvedLogprobs, responseToolCalls, cachedTokenCount, promptTime, generateTime, stoppedBySequence)
         }
 
@@ -1903,6 +2262,11 @@ final class MLXModelService: @unchecked Sendable {
         let promptTokens = estimateTokens(promptText)
         let wantLogprobs = logprobs == true
         let effectiveMaxTokens = capMaxTokensForCapture(maxTokens ?? 2000)
+
+        // /metrics: streaming-path queue timestamp. The actual
+        // requestStarted/observe calls happen ONLY in the serial-path
+        // task below (the batch path's stats are owned by BatchScheduler).
+        let streamQueuedAt = Date()
 
         var params = GenerateParameters(
             maxTokens: effectiveMaxTokens,
@@ -1975,6 +2339,25 @@ final class MLXModelService: @unchecked Sendable {
             let input = try await scheduler.prepareInput(userInput)
             let tTokenize = debugLogging ? Date() : Date.distantPast
             let preparedPromptTokens = input.text.tokens.reshaped(-1).asArray(Int.self).count
+
+            // If the chat template appended a think start tag to the prompt
+            // (e.g. Qwen3.5-27B's template ends with `<think>\n`), the model
+            // begins generation already inside a think block and the stream
+            // never contains an opening tag. Detect this and synthesize a
+            // leading chunk so the controller's reasoning extractor latches
+            // on. Mirrors the serial-streaming path at line ~2061. (#99)
+            let templateOpenedThink: Bool = {
+                guard let thinkStart = self.thinkStartTag else { return false }
+                let tokens = input.text.tokens
+                let ndim = tokens.ndim
+                let seqLen = tokens.dim(ndim - 1)
+                guard seqLen >= 2 else { return false }
+                let flat = tokens.reshaped(-1)
+                let lastTwo = flat[seqLen - 2 ..< seqLen].asArray(Int.self)
+                let decoded = scheduler.tokenizer.decode(tokens: lastTwo)
+                return decoded.contains(thinkStart)
+            }()
+
             let schedulerStream = scheduler.submit(
                 input: input,
                 parameters: params,
@@ -1991,6 +2374,25 @@ final class MLXModelService: @unchecked Sendable {
                 thinkEndTag: self.thinkEndTag,
                 requestId: reqId
             )
+            let effectiveStream: AsyncThrowingStream<StreamChunk, Error>
+            if templateOpenedThink, let thinkStart = self.thinkStartTag {
+                effectiveStream = AsyncThrowingStream { continuation in
+                    let task = Task {
+                        continuation.yield(StreamChunk(text: thinkStart))
+                        do {
+                            for try await chunk in schedulerStream {
+                                continuation.yield(chunk)
+                            }
+                            continuation.finish()
+                        } catch {
+                            continuation.finish(throwing: error)
+                        }
+                    }
+                    continuation.onTermination = { _ in task.cancel() }
+                }
+            } else {
+                effectiveStream = schedulerStream
+            }
             self.cleanupTempFiles(mediaTempFiles)
 
             if debugLogging {
@@ -2007,7 +2409,105 @@ final class MLXModelService: @unchecked Sendable {
             let toolTags = toolRuntimeConfig.map { ($0.startTag, $0.endTag) }
 
             endOperationOnExit = false
-            return (modelID, schedulerStream, preparedPromptTokens, toolTags?.0, toolTags?.1, self.thinkStartTag, self.thinkEndTag)
+            return (modelID, effectiveStream, preparedPromptTokens, toolTags?.0, toolTags?.1, self.thinkStartTag, self.thinkEndTag)
+        }
+
+        // --- MTP / EAGLE3 speculative streaming fast path (serial, greedy, text-only) ---
+        // Same eligibility as the non-streaming fast paths, plus: no stop sequences (the
+        // speculative generators don't implement stop — fall back to AR when stop is requested).
+        // The generator's per-token `onToken` callback drives incremental detokenization, yielding
+        // an SSE text delta per emitted token; think-tag extraction is done by the controller from
+        // those deltas (we return the think tags). Output matches the non-streaming fast path.
+        let specGreedyStream = (temperature ?? 0) <= 0.0 && (tools?.isEmpty ?? true)
+            && responseFormat == nil && !wantLogprobs && (stop?.isEmpty ?? true)
+        let eagle3StreamEligible = specGreedyStream && Eagle3Runtime.shared.active != nil
+        let mtpStreamEligible = specGreedyStream && MTPRuntime.shared.active != nil
+        if eagle3StreamEligible || mtpStreamEligible {
+            // Prep prompt ids under the lock; nil => multimodal/empty/wrong-model => fall back to AR.
+            // Also detect a template-opened think block (last prompt tokens contain thinkStart): for
+            // thinking models whose chat template begins reasoning in the prompt, the generated
+            // stream never contains the opening tag, so we must synthesize a leading thinkStart chunk
+            // (mirrors the scheduler/serial paths) or the controller classifies reasoning as content.
+            let prep: (ids: [Int], openedThink: Bool)? = try await container.perform { context -> (ids: [Int], openedThink: Bool)? in
+                let lmInput = try await context.processor.prepare(input: userInput)
+                if self.isMultimodalInput(lmInput) { return nil }
+                if eagle3StreamEligible && !(context.model is Gemma4Model) { return nil }
+                let ids = self.extractTokenArray(lmInput)
+                if ids.isEmpty { return nil }
+                var opened = false
+                if let ts = self.thinkStartTag, ids.count >= 2 {
+                    opened = context.tokenizer.decode(tokens: Array(ids.suffix(2))).contains(ts)
+                }
+                return (ids, opened)
+            }
+            if let prep {
+                let promptIds = prep.ids
+                let openedThink = prep.openedThink
+                let useEagle3 = eagle3StreamEligible
+                let maxTok = effectiveMaxTokens
+                let dbg = debugLogging
+                let thinkStartTag = self.thinkStartTag
+                let stream = AsyncThrowingStream<StreamChunk, Error> { continuation in
+                    let task = Task {
+                        StatsAggregator.shared.requestStarted()
+                        if openedThink, let thinkStartTag {
+                            continuation.yield(StreamChunk(text: thinkStartTag))
+                        }
+                        let t0 = Date.timeIntervalSinceReferenceDate
+                        do {
+                            let outCount = try await container.perform { context -> Int in
+                                let eos = Set((context.tokenizer.eosTokenId).map { [$0] } ?? [])
+                                var allTokens: [Int] = []
+                                var prevText = ""
+                                let emit: (Int) -> Bool = { tok in
+                                    if Task.isCancelled { return false }    // client disconnected
+                                    if eos.contains(tok) { return false }   // stop; never stream EOS
+                                    allTokens.append(tok)
+                                    let full = context.tokenizer.decode(tokens: allTokens)
+                                    if full.count > prevText.count {
+                                        continuation.yield(StreamChunk(text: String(full.dropFirst(prevText.count))))
+                                        prevText = full
+                                    }
+                                    return true
+                                }
+                                if useEagle3, let drafter = Eagle3Runtime.shared.active,
+                                   let model = context.model as? Gemma4Model {
+                                    let block = ProcessInfo.processInfo.environment["AFM_EAGLE3_BLOCK"].flatMap { Int($0) } ?? 2
+                                    let g = Gemma4Eagle3Generator(drafter: drafter)
+                                    _ = g.generateSpeculative(model: model, promptIds: promptIds,
+                                                              maxTokens: maxTok, eosIds: eos,
+                                                              blockSize: block, onToken: emit)
+                                } else if let gen = MTPRuntime.shared.active {
+                                    _ = gen.generate(promptIds: promptIds, maxTokens: maxTok,
+                                                     eosIds: eos, onToken: emit)
+                                }
+                                return allTokens.count
+                            }
+                            let gt = Date.timeIntervalSinceReferenceDate - t0
+                            if dbg {
+                                let tps = gt > 0 ? Double(outCount) / gt : 0
+                                print("[\(ts())] [\(useEagle3 ? "EAGLE3" : "MTP")] streamed \(outCount) tok in \(String(format: "%.2f", gt))s (\(String(format: "%.1f", tps)) tok/s)")
+                            }
+                            continuation.yield(StreamChunk(text: "", promptTokens: promptIds.count,
+                                                           completionTokens: outCount, promptTime: 0, generateTime: gt))
+                            StatsAggregator.shared.requestSucceeded(reason: "stop")
+                            StatsAggregator.shared.requestCompleted()
+                            continuation.finish()
+                        } catch {
+                            // Surface model/tokenizer/generator failures instead of masking them as
+                            // an empty success (don't emit a final usage chunk; fail the stream).
+                            StatsAggregator.shared.requestSucceeded(reason: "error")
+                            StatsAggregator.shared.requestCompleted()
+                            continuation.finish(throwing: error)
+                        }
+                        self.endOperation()
+                    }
+                    // Cancel the decode if the SSE client disconnects (frees the serial lock + GPU).
+                    continuation.onTermination = { _ in task.cancel() }
+                }
+                endOperationOnExit = false
+                return (modelID, stream, promptTokens, nil, nil, self.thinkStartTag, self.thinkEndTag)
+            }
         }
 
         // --- Serial path: full-featured generation via container.perform lock ---
@@ -2018,10 +2518,40 @@ final class MLXModelService: @unchecked Sendable {
         let streamGpuProfile = gpuProfile
         if streamGpuProfile { printGPUProfileHeader() }
         let stream = AsyncThrowingStream<StreamChunk, Error> { continuation in
+            // /metrics: serial-streaming counters. Captured here (after the
+            // batch-path branch has been ruled out) so we don't double-count
+            // with BatchScheduler.submit().
+            StatsAggregator.shared.requestStarted()
+            // Mutables filled inside container.perform so the final
+            // observation can fire just before continuation.finish().
+            // Held in a scratch box so the nested @Sendable perform closure can
+            // mutate them (Swift 6); the box also carries the non-Sendable input.
+            let streamScratch = StreamingScratch()
+            streamScratch.userInput = userInput
             let task = Task {
                 defer { self.endOperation() }
                 do {
                     try await container.perform { context in
+                        // Local generation params (the outer `params` is a captured
+                        // var used by the concurrent path; a fresh local keeps this
+                        // @Sendable closure free of captured-var mutation).
+                        var params = GenerateParameters(
+                            maxTokens: effectiveMaxTokens,
+                            kvBits: self.kvBits,
+                            kvGroupSize: 64,
+                            quantizedKVStart: 0,
+                            temperature: normalizedTemperature(temperature),
+                            topP: normalizedTopP(topP),
+                            repetitionPenalty: normalizedRepetitionPenalty(repetitionPenalty),
+                            repetitionContextSize: 64,
+                            topK: normalizedTopK(topK),
+                            minP: normalizedMinP(minP),
+                            presencePenalty: normalizedPresencePenalty(presencePenalty),
+                            seed: normalizedSeed(seed),
+                            computeLogprobs: wantLogprobs,
+                            topLogprobsCount: wantLogprobs ? min(max(topLogprobs ?? 0, 0), 20) : 0,
+                            prefillStepSize: self.prefillStepSize
+                        )
                         // Grammar constraint setup — see non-streaming path for details.
                         let constrainedDecoding = self.setupConstrainedDecodingProcessor(
                             modelID: modelID,
@@ -2036,7 +2566,7 @@ final class MLXModelService: @unchecked Sendable {
                             params.extraProcessor = constrainedDecoding.processor
                         }
 
-                        let input = try await context.processor.prepare(input: userInput)
+                        let input = try await context.processor.prepare(input: streamScratch.userInput)
 
                         // -VV: decode and print the full prompt (streaming path)
                         if self.trace {
@@ -2131,6 +2661,7 @@ final class MLXModelService: @unchecked Sendable {
                                 generateInput = LMInput(text: .init(tokens: MLXArray(suffixTokens)))
                                 streamCachedTokens = effectivePrefix
                                 cacheOutcome = "hit"
+                                StatsAggregator.shared.cacheHit()  // /metrics: afm:radix_cache_hits_total
                                 cacheRestoreTime = tRestore1 - tRestore0
                                 cacheTrimTime = tTrim - tRestore1
                                 cacheTruncateTime = tRoundtrip - tTrim
@@ -2160,6 +2691,7 @@ final class MLXModelService: @unchecked Sendable {
                             } else {
                                 generateInput = input
                                 cacheOutcome = bypassExactReplay ? "exact-replay-bypass" : "miss"
+                                StatsAggregator.shared.cacheMiss()  // /metrics: afm:radix_cache_misses_total
                                 self.logCachePrefill(
                                     mode: "streaming",
                                     outcome: cacheOutcome,
@@ -2261,6 +2793,7 @@ final class MLXModelService: @unchecked Sendable {
                                                     continuation.yield(StreamChunk(text: "", logprobs: resolved, stoppedBySequence: true))
                                                 }
                                             }
+                                            streamScratch.streamStatStoppedBySequence = true  // /metrics: finished_reason=stop
                                             break
                                         }
                                         // Flush safe portion of the buffer (keep tail that could be partial stop match)
@@ -2304,6 +2837,11 @@ final class MLXModelService: @unchecked Sendable {
                                         truncateTime: cacheTruncateTime
                                     )
                                     continuation.yield(StreamChunk(text: "", promptTokens: finalPromptTokens, completionTokens: info.generationTokenCount, promptTime: info.promptTime, generateTime: info.generateTime))
+                                    // /metrics: capture for the post-loop observation
+                                    streamScratch.streamStatPromptTokens = finalPromptTokens
+                                    streamScratch.streamStatCompletionTokens = info.generationTokenCount
+                                    streamScratch.streamStatPromptTime = info.promptTime
+                                    streamScratch.streamStatGenerateTime = info.generateTime
                                     // GPU profile: emit footer with real token counts
                                     if streamGpuProfile {
                                         self.printGPUProfileFooter(promptTokens: finalPromptTokens, completionTokens: info.generationTokenCount, promptTime: info.promptTime, generateTime: info.generateTime)
@@ -2409,7 +2947,46 @@ final class MLXModelService: @unchecked Sendable {
                             insertTime: saveInsertTime
                         )
                     }
+                    // Re-bind metric counters from the scratch box so the
+                    // observation below reads them by their original names.
+                    let streamStatPromptTokens = streamScratch.streamStatPromptTokens
+                    let streamStatCompletionTokens = streamScratch.streamStatCompletionTokens
+                    let streamStatPromptTime = streamScratch.streamStatPromptTime
+                    let streamStatStoppedBySequence = streamScratch.streamStatStoppedBySequence
                     self.cleanupTempFiles(mediaTempFiles)
+
+                    // /metrics: serial-streaming observation. Mirrors the
+                    // non-streaming generate() path; queue time ≈ 0 in
+                    // serial mode so queuedAt == startedAt.
+                    let streamCompletedAt = Date()
+                    let streamFirstTokenAt: Date? = (streamStatCompletionTokens > 0 && streamStatPromptTime >= 0)
+                        ? streamQueuedAt.addingTimeInterval(streamStatPromptTime)
+                        : nil
+                    StatsAggregator.shared.addPromptTokens(streamStatPromptTokens)
+                    StatsAggregator.shared.addGenTokens(streamStatCompletionTokens)
+                    StatsAggregator.shared.observeRequest(
+                        StatsAggregator.RequestObservation(
+                            queuedAt: streamQueuedAt.timeIntervalSince1970,
+                            startedAt: streamQueuedAt.timeIntervalSince1970,
+                            firstTokenAt: streamFirstTokenAt?.timeIntervalSince1970,
+                            completedAt: streamCompletedAt.timeIntervalSince1970,
+                            promptTokens: streamStatPromptTokens,
+                            generationTokens: streamStatCompletionTokens,
+                            paramsN: 1,
+                            paramsBestOf: 1
+                        )
+                    )
+                    let streamReason: String
+                    if streamStatStoppedBySequence {
+                        streamReason = "stop"
+                    } else if streamStatCompletionTokens >= effectiveMaxTokens {
+                        streamReason = "length"
+                    } else {
+                        streamReason = "stop"
+                    }
+                    StatsAggregator.shared.requestSucceeded(reason: streamReason)
+                    StatsAggregator.shared.requestCompleted()
+
                     continuation.finish()
                 } catch {
                     if debugLogging {
@@ -2417,6 +2994,10 @@ final class MLXModelService: @unchecked Sendable {
                     }
                     self.radixCache?.invalidateAll()
                     self.cleanupTempFiles(mediaTempFiles)
+                    // /metrics: error path — still complete the lifecycle so
+                    // requests_completed_total tracks requests_started_total.
+                    StatsAggregator.shared.requestSucceeded(reason: "error")
+                    StatsAggregator.shared.requestCompleted()
                     continuation.finish(throwing: error)
                 }
             }
@@ -2603,12 +3184,33 @@ final class MLXModelService: @unchecked Sendable {
         }
     }
 
+    /// Recursively convert a `JSONSerialization`-derived value (Foundation `Any`)
+    /// into an `any Sendable` tree. Strings bridge `NSString -> String`; `NSNumber`
+    /// and `NSNull` already conform to `Sendable` and are kept as-is so JSON
+    /// round-tripping through `JSONSerialization` stays byte-identical.
+    static func asSendableJSON(_ value: Any) -> any Sendable {
+        switch value {
+        case let s as String: return s
+        case let arr as [Any]: return arr.map { asSendableJSON($0) }
+        case let dict as [String: Any]: return dict.mapValues { asSendableJSON($0) }
+        case let n as NSNumber: return n
+        case is NSNull: return NSNull()
+        default:
+            // Unreachable for the only caller input (`JSONSerialization.jsonObject`
+            // output, which is exclusively NSString/NSNumber/NSNull/NSArray/
+            // NSDictionary). Kept as a non-throwing safety net so an unexpected
+            // value can never crash the tool-call argument path; it degrades to a
+            // string rather than propagating. Revisit if a non-JSON source is added.
+            return String(describing: value)
+        }
+    }
+
     static func remapResponseToolCallArguments(_ rtc: ResponseToolCall, tools: [RequestTool]?) -> ResponseToolCall {
         guard let tools, !tools.isEmpty else { return rtc }
         guard let data = rtc.function.arguments.data(using: .utf8),
               let argsDict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return rtc }
         var sendableArgs = [String: any Sendable]()
-        for (key, value) in argsDict { sendableArgs[key] = value }
+        for (key, value) in argsDict { sendableArgs[key] = Self.asSendableJSON(value) }
         let remapped = remapArgumentKeys(sendableArgs, toolName: rtc.function.name, tools: tools)
         let remappedAny = remapped.mapValues { $0 as Any }
         guard let newData = try? JSONSerialization.data(withJSONObject: remappedAny, options: [.sortedKeys]),
@@ -3171,14 +3773,31 @@ final class MLXModelService: @unchecked Sendable {
         for (k, v) in parsed {
             if let s = v as? String {
                 arguments[k] = s
-            } else if let data = try? JSONSerialization.data(withJSONObject: v),
-                      let s = String(data: data, encoding: .utf8) {
+            } else if let s = jsonValueToString(v) {
                 arguments[k] = s
             } else {
                 arguments[k] = "\(v)"
             }
         }
         return ToolCall(function: .init(name: name, arguments: arguments))
+    }
+
+    /// Serialize a JSON value (parsed via `JSONSerialization`) to its string form.
+    ///
+    /// `JSONSerialization.data(withJSONObject:)` raises an Objective-C
+    /// `NSInvalidArgumentException` ("Invalid top-level type in JSON write") when the
+    /// top-level value is a scalar — a number, boolean, or null. That exception is NOT a
+    /// Swift `Error`, so `try?` cannot catch it and the process crashes. We wrap the value
+    /// in a single-element array (always a valid top-level type), serialize, then strip the
+    /// enclosing brackets to recover the value's JSON representation. Mirrors the idiom in
+    /// `ToolCallStreamingRuntime.jsonEncodeString`.
+    private static func jsonValueToString(_ value: Any) -> String? {
+        guard let data = try? JSONSerialization.data(withJSONObject: [value]),
+              let wrapped = String(data: data, encoding: .utf8),
+              wrapped.count >= 2 else {
+            return nil
+        }
+        return String(wrapped.dropFirst().dropLast())
     }
 
     /// Regex-based XML function parser with entity decoding.
@@ -3214,7 +3833,7 @@ final class MLXModelService: @unchecked Sendable {
                 if let data = val.data(using: .utf8),
                    let parsed = try? JSONSerialization.jsonObject(with: data),
                    (parsed is [Any] || parsed is [String: Any]) {
-                    arguments[key] = parsed
+                    arguments[key] = Self.asSendableJSON(parsed)
                 } else {
                     arguments[key] = val
                 }
@@ -3240,7 +3859,7 @@ final class MLXModelService: @unchecked Sendable {
                     if let data = decoded.data(using: .utf8),
                        let parsed = try? JSONSerialization.jsonObject(with: data),
                        (parsed is [Any] || parsed is [String: Any]) {
-                        arguments[key] = parsed
+                        arguments[key] = Self.asSendableJSON(parsed)
                     } else {
                         arguments[key] = decoded
                     }
@@ -3339,7 +3958,7 @@ final class MLXModelService: @unchecked Sendable {
         var arguments: [String: any Sendable] = [:]
         if let args = (json["arguments"] as? [String: Any]) ?? (json["parameters"] as? [String: Any]) {
             for (k, v) in args {
-                arguments[k] = v
+                arguments[k] = Self.asSendableJSON(v)
             }
         }
         return ToolCall(function: .init(name: name, arguments: arguments))
@@ -4143,7 +4762,7 @@ final class MLXModelService: @unchecked Sendable {
         }
 
         // Merge chat template kwargs: server defaults first, then request-level overrides
-        var resolvedKwargs: [String: Any] = self.defaultChatTemplateKwargs ?? [:]
+        var resolvedKwargs: [String: any Sendable] = (self.defaultChatTemplateKwargs ?? [:]).mapValues { Self.asSendableJSON($0) }
         if let requestKwargs = chatTemplateKwargs {
             for (key, value) in requestKwargs {
                 resolvedKwargs[key] = value.value.toAny()
@@ -4231,20 +4850,23 @@ final class MLXModelService: @unchecked Sendable {
 
     private func awaitURL(url: URL) throws -> (Data, URLResponse) {
         let sem = DispatchSemaphore(value: 0)
-        var result: Result<(Data, URLResponse), Error>?
+        // Box the result so the @Sendable URLSession completion handler can write
+        // it without a captured-var data race. The semaphore guarantees the write
+        // happens-before the read below, so the SendableBox is sound here.
+        let box = SendableBox<Result<(Data, URLResponse), Error>?>(nil)
         let task = URLSession.shared.dataTask(with: url) { data, response, error in
             if let error {
-                result = .failure(error)
+                box.value = .failure(error)
             } else if let data, let response {
-                result = .success((data, response))
+                box.value = .success((data, response))
             } else {
-                result = .failure(MLXServiceError.downloadFailed("image download failed"))
+                box.value = .failure(MLXServiceError.downloadFailed("image download failed"))
             }
             sem.signal()
         }
         task.resume()
         sem.wait()
-        switch result {
+        switch box.value {
         case .success(let pair):
             return pair
         case .failure(let error):
