@@ -15,6 +15,17 @@ struct EmbeddingsController: RouteCollection {
         self.registersModelsRoute = registersModelsRoute
     }
 
+    /// Convenience for a single preloaded backend — wraps `entry`/`backend` in a
+    /// `PreloadedEmbeddingResolver`, the same shape the standalone `afm embed`
+    /// server uses. Lets callers construct the controller from an already-resolved
+    /// model pair without building a resolver by hand.
+    init(modelEntry: EmbeddingModelEntry, backend: any EmbeddingBackend, registersModelsRoute: Bool = true) {
+        self.init(
+            resolver: PreloadedEmbeddingResolver(entry: modelEntry, backend: backend),
+            registersModelsRoute: registersModelsRoute
+        )
+    }
+
     func boot(routes: RoutesBuilder) throws {
         let v1 = routes.grouped("v1")
         v1.on(.POST, "embeddings", body: .collect(maxSize: Self.maxRequestBodySize), use: createEmbeddings)
