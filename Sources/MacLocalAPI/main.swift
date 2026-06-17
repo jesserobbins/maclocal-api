@@ -83,6 +83,12 @@ struct ServeCommand: ParsableCommand {
     @Option(name: .long, help: "Constrain output to match a JSON schema (vLLM-compatible). Applied to chat completions that omit their own response_format.")
     var guidedJson: String?
 
+    @Flag(name: .long, help: "Enable session transcript recording (off by default). Clients set the session via the X-Session-Id request header.")
+    var record: Bool = false
+
+    @Option(name: .long, help: "Transcript directory for --record (default: ~/.afm/sessions)")
+    var transcriptDir: String?
+
     func run() throws {
         // Validate temperature parameter
         if let temp = temperature {
@@ -153,7 +159,7 @@ struct ServeCommand: ParsableCommand {
         // Start server in async context
         _ = Task {
             do {
-                let server = try await Server(port: chosenPort, hostname: hostname, verbose: verbose, veryVerbose: veryVerbose || vv, trace: vv, streamingEnabled: !noStreaming, instructions: instructions, adapter: adapter, temperature: temperature, randomness: randomness, permissiveGuardrails: permissiveGuardrails, stop: stop, webuiEnabled: webui, gatewayEnabled: gateway, prewarmEnabled: prewarmEnabled, telegramConfiguration: telegramConfiguration, defaultGuidedJsonSchema: defaultGuidedJsonSchema)
+                let server = try await Server(port: chosenPort, hostname: hostname, verbose: verbose, veryVerbose: veryVerbose || vv, trace: vv, streamingEnabled: !noStreaming, instructions: instructions, adapter: adapter, temperature: temperature, randomness: randomness, permissiveGuardrails: permissiveGuardrails, stop: stop, webuiEnabled: webui, gatewayEnabled: gateway, prewarmEnabled: prewarmEnabled, telegramConfiguration: telegramConfiguration, defaultGuidedJsonSchema: defaultGuidedJsonSchema, record: record, transcriptDir: transcriptDir)
                 globalServer = server
                 try await server.start()
             } catch {
@@ -390,6 +396,12 @@ struct MlxCommand: ParsableCommand {
 
     @Option(name: .long, help: "Constrain output to match a JSON schema (vLLM-compatible). Auto-disables thinking on reasoning models for deterministic output.")
     var guidedJson: String?
+
+    @Flag(name: .long, help: "Enable session transcript recording (off by default). Clients set the session via the X-Session-Id request header.")
+    var record: Bool = false
+
+    @Option(name: .long, help: "Transcript directory for --record (default: ~/.afm/sessions)")
+    var transcriptDir: String?
 
     @Option(name: .long, help: "Telegram bot token for remote AFM access")
     var telegramBotToken: String?
@@ -725,7 +737,9 @@ struct MlxCommand: ParsableCommand {
                     mlxPresencePenalty: presencePenalty,
                     mlxSeed: seed,
                     mlxMaxLogprobs: maxLogprobs,
-                    contextWindow: contextWindow
+                    contextWindow: contextWindow,
+                    record: record,
+                    transcriptDir: transcriptDir
                 )
                 globalServer = server
                 if !explicitPort && chosenPort != 9999 {
@@ -1386,6 +1400,12 @@ struct RootCommand: ParsableCommand {
     @Option(name: .long, help: "Pre-warm the model on server startup for faster first response (y/n, default: y)")
     var prewarm: String = "y"
 
+    @Flag(name: .long, help: "Enable session transcript recording (off by default). Clients set the session via the X-Session-Id request header.")
+    var record: Bool = false
+
+    @Option(name: .long, help: "Transcript directory for --record (default: ~/.afm/sessions)")
+    var transcriptDir: String?
+
     @Flag(name: .long, help: "Print machine-readable JSON capability card for AI agents and exit")
     var helpJson: Bool = false
 
@@ -1447,6 +1467,8 @@ struct RootCommand: ParsableCommand {
         if let randomness { args += ["--randomness", randomness] }
         if let stop { args += ["--stop", stop] }
         if let guidedJson { args += ["--guided-json", guidedJson] }
+        if record { args.append("--record") }
+        if let transcriptDir { args += ["--transcript-dir", transcriptDir] }
         var serveCommand = try ServeCommand.parse(args)
         try serveCommand.run()
     }

@@ -11,6 +11,7 @@ struct ChatCompletionsController: RouteCollection {
     private let veryVerbose: Bool
     private let stop: String?
     private let defaultGuidedJsonSchema: ResponseFormat?
+    private let transcriptRecorder: TranscriptRecorder?
 
     init(
         streamingEnabled: Bool = true,
@@ -21,7 +22,8 @@ struct ChatCompletionsController: RouteCollection {
         permissiveGuardrails: Bool,
         veryVerbose: Bool = false,
         stop: String? = nil,
-        defaultGuidedJsonSchema: ResponseFormat? = nil
+        defaultGuidedJsonSchema: ResponseFormat? = nil,
+        transcriptRecorder: TranscriptRecorder? = nil
     ) {
         self.streamingEnabled = streamingEnabled
         self.instructions = instructions
@@ -32,6 +34,19 @@ struct ChatCompletionsController: RouteCollection {
         self.veryVerbose = veryVerbose
         self.stop = stop
         self.defaultGuidedJsonSchema = defaultGuidedJsonSchema
+        self.transcriptRecorder = transcriptRecorder
+    }
+
+    /// Resolve the recording session id from request headers and body.
+    /// Returns nil when recording is disabled so callers skip all work.
+    private func resolveSessionID(req: Request, chatRequest: ChatCompletionRequest) -> String? {
+        guard transcriptRecorder != nil else { return nil }
+        let firstUser = chatRequest.messages.first(where: { $0.role == "user" })?.textContent
+        return TranscriptRecorder.resolveSessionID(
+            header: req.headers.first(name: "X-Session-Id"),
+            bodyUser: chatRequest.user,
+            firstUserMessage: firstUser
+        )
     }
     func boot(routes: RoutesBuilder) throws {
         let v1 = routes.grouped("v1")
@@ -204,6 +219,20 @@ struct ChatCompletionsController: RouteCollection {
                 req.logger.info("Foundation full response: \(encodeJSON(response))")
             }
 
+            if let recorder = transcriptRecorder, let sessionId = resolveSessionID(req: req, chatRequest: chatRequest) {
+                await recorder.record(
+                    sessionId: sessionId,
+                    model: chatRequest.model ?? "foundation",
+                    requestMessages: chatRequest.messages,
+                    assistant: RecordedAssistant(
+                        content: content,
+                        finishReason: stopReason,
+                        promptTokens: promptTokens,
+                        completionTokens: completionTokens
+                    )
+                )
+            }
+
             return try await createSuccessResponse(req: req, response: response)
 
         } catch let foundationError as FoundationModelError {
@@ -327,6 +356,12 @@ struct ChatCompletionsController: RouteCollection {
         httpResponse.headers.add(name: "X-Accel-Buffering", value: "no")
 
         let streamId = UUID().uuidString
+        // Resolve the transcript session id on the request thread; the closure
+        // below cannot read `req` headers safely. nil when recording is off.
+        let recorder = transcriptRecorder
+        let recordSessionId = resolveSessionID(req: req, chatRequest: chatRequest)
+        let recordMessages = chatRequest.messages
+        let recordModel = chatRequest.model ?? "foundation"
         // T1.4/T1.5: Capture inflight registry + request id for cancellation hook.
         let inflightRegistry = req.application.inflightRegistry
         let streamReqId = req.afmRequestID
@@ -392,7 +427,7 @@ struct ChatCompletionsController: RouteCollection {
                     )
                     isFirst = false
                     completionTokens += self.estimateTokens(for: chunk)
-                    if self.veryVerbose {
+                    if self.veryVerbose || recorder != nil {
                         fullStreamedContent += chunk
                     }
 
@@ -415,6 +450,23 @@ struct ChatCompletionsController: RouteCollection {
                 )
                 let effectiveMaxTokens = chatRequest.effectiveMaxTokens ?? 2000
                 let finishReason = completionTokens >= effectiveMaxTokens ? "length" : "stop"
+
+                // Record the completed streaming turn on the success path, once.
+                // The catch branch handles cancellation/errors, so partial
+                // streams never reach here.
+                if let recorder, let recordSessionId {
+                    await recorder.record(
+                        sessionId: recordSessionId,
+                        model: recordModel,
+                        requestMessages: recordMessages,
+                        assistant: RecordedAssistant(
+                            content: fullStreamedContent,
+                            finishReason: finishReason,
+                            promptTokens: promptTokens,
+                            completionTokens: completionTokens
+                        )
+                    )
+                }
 
                 // Build timings for webui tokens/sec display
                 let timings = StreamTimings(

@@ -37,6 +37,7 @@ struct MLXChatCompletionsController: RouteCollection {
     private let trace: Bool
     private let rawOutput: Bool
     private let stop: String?
+    private let transcriptRecorder: TranscriptRecorder?
 
     init(
         streamingEnabled: Bool = true,
@@ -54,7 +55,8 @@ struct MLXChatCompletionsController: RouteCollection {
         veryVerbose: Bool = false,
         trace: Bool = false,
         rawOutput: Bool = false,
-        stop: String? = nil
+        stop: String? = nil,
+        transcriptRecorder: TranscriptRecorder? = nil
     ) {
         self.streamingEnabled = streamingEnabled
         self.modelID = modelID
@@ -72,6 +74,19 @@ struct MLXChatCompletionsController: RouteCollection {
         self.trace = trace
         self.rawOutput = rawOutput
         self.stop = stop
+        self.transcriptRecorder = transcriptRecorder
+    }
+
+    /// Resolve the recording session id from the request headers and body.
+    /// Returns nil when recording is disabled so callers skip all work.
+    private func resolveSessionID(req: Request, chatRequest: ChatCompletionRequest) -> String? {
+        guard transcriptRecorder != nil else { return nil }
+        let firstUser = chatRequest.messages.first(where: { $0.role == "user" })?.textContent
+        return TranscriptRecorder.resolveSessionID(
+            header: req.headers.first(name: "X-Session-Id"),
+            bodyUser: chatRequest.user,
+            firstUserMessage: firstUser
+        )
     }
 
     /// Merge CLI --stop sequences with API-level stop sequences, deduplicating.
@@ -449,6 +464,21 @@ struct MLXChatCompletionsController: RouteCollection {
                     }
                     fflush(stdout)
                 }
+                if let recorder = transcriptRecorder, let sessionId = resolveSessionID(req: req, chatRequest: chatRequest) {
+                    await recorder.record(
+                        sessionId: sessionId,
+                        model: result.modelID,
+                        requestMessages: chatRequest.messages,
+                        assistant: RecordedAssistant(
+                            content: finalizedTurn.content,
+                            reasoning: finalizedTurn.reasoningContent,
+                            toolCalls: toolCalls,
+                            finishReason: "tool_calls",
+                            promptTokens: result.promptTokens,
+                            completionTokens: completionTok
+                        )
+                    )
+                }
                 return try await createSuccessResponse(req: req, response: response, grammarDowngraded: grammarDowngraded)
             }
 
@@ -485,6 +515,21 @@ struct MLXChatCompletionsController: RouteCollection {
             if veryVerbose {
                 print("\(Self.teal)[\(Self.timestamp())] SEND full response:\n\(encodeJSON(response))\(Self.reset)"); fflush(stdout)
             }
+            if let recorder = transcriptRecorder, let sessionId = resolveSessionID(req: req, chatRequest: chatRequest) {
+                await recorder.record(
+                    sessionId: sessionId,
+                    model: result.modelID,
+                    requestMessages: chatRequest.messages,
+                    assistant: RecordedAssistant(
+                        content: finalizedTurn.content,
+                        reasoning: finalizedTurn.reasoningContent,
+                        toolCalls: nil,
+                        finishReason: stopReason,
+                        promptTokens: result.promptTokens,
+                        completionTokens: completionTok
+                    )
+                )
+            }
             return try await createSuccessResponse(req: req, response: response, grammarDowngraded: grammarDowngraded)
         } catch let abort as Abort {
             req.logger.error("[\(Self.timestamp())] MLX completions error: \(abort)")
@@ -515,6 +560,12 @@ struct MLXChatCompletionsController: RouteCollection {
         }
 
         let streamId = UUID().uuidString
+
+        // Resolve the transcript session id on the request thread (the closure
+        // below cannot read `req` headers safely). nil when recording is off.
+        let recorder = transcriptRecorder
+        let recordSessionId = resolveSessionID(req: req, chatRequest: chatRequest)
+        let recordMessages = chatRequest.messages
 
         // AFM Profile: start GPU monitoring if client requests it
         let streamProfileHeader = req.headers.first(name: "X-AFM-Profile")?.lowercased()
@@ -1071,6 +1122,25 @@ struct MLXChatCompletionsController: RouteCollection {
                     harmonyChannels: harmonyChannels
                 )
                 let finishReason = finalizedTurn.finishReason
+                // Record the completed streaming turn on the success path, once,
+                // after the assistant turn is fully assembled. Cancel/error
+                // branches throw before reaching here, so partial streams are
+                // never persisted.
+                if let recorder, let recordSessionId {
+                    await recorder.record(
+                        sessionId: recordSessionId,
+                        model: res.modelID,
+                        requestMessages: recordMessages,
+                        assistant: RecordedAssistant(
+                            content: finalizedTurn.content,
+                            reasoning: finalizedTurn.reasoningContent,
+                            toolCalls: finalizedTurn.toolCalls,
+                            finishReason: finishReason,
+                            promptTokens: promptTokens,
+                            completionTokens: completionTokens
+                        )
+                    )
+                }
                 if self.veryVerbose {
                     if finishReason == "tool_calls" {
                         print("\(Self.orange)[\(Self.timestamp())] MLX done: stream=true\n  prompt_tokens=\(promptTokens) completion_tokens=\(completionTokens)\n  elapsed=\(String(format: "%.2f", generationDuration))s tok/s=\(String(format: "%.1f", tokPerSec))\n  finish_reason=tool_calls\(Self.reset)")

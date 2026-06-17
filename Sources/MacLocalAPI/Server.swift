@@ -198,6 +198,7 @@ class Server: @unchecked Sendable {
     private let mlxSeed: Int?
     private let mlxMaxLogprobs: Int
     private let contextWindow: Int?
+    private let transcriptRecorder: TranscriptRecorder?
     private var telegramBridge: TelegramBridge?
 
     private static let audioAvailable: Bool = {
@@ -205,7 +206,7 @@ class Server: @unchecked Sendable {
         return false
     }()
 
-    init(port: Int, hostname: String, verbose: Bool, veryVerbose: Bool = false, trace: Bool = false, streamingEnabled: Bool, instructions: String, adapter: String? = nil, temperature: Double? = nil, randomness: String? = nil, permissiveGuardrails: Bool = false, stop: String? = nil, webuiEnabled: Bool = false, gatewayEnabled: Bool = false, prewarmEnabled: Bool = true, telegramConfiguration: TelegramConfiguration? = nil, defaultGuidedJsonSchema: ResponseFormat? = nil, mlxModelID: String? = nil, mlxModelService: MLXModelService? = nil, mlxRepetitionPenalty: Double? = nil, mlxTopP: Double? = nil, mlxMaxTokens: Int? = nil, mlxRawOutput: Bool = false, mlxTopK: Int? = nil, mlxMinP: Double? = nil, mlxPresencePenalty: Double? = nil, mlxSeed: Int? = nil, mlxMaxLogprobs: Int? = nil, contextWindow: Int? = nil) async throws {
+    init(port: Int, hostname: String, verbose: Bool, veryVerbose: Bool = false, trace: Bool = false, streamingEnabled: Bool, instructions: String, adapter: String? = nil, temperature: Double? = nil, randomness: String? = nil, permissiveGuardrails: Bool = false, stop: String? = nil, webuiEnabled: Bool = false, gatewayEnabled: Bool = false, prewarmEnabled: Bool = true, telegramConfiguration: TelegramConfiguration? = nil, defaultGuidedJsonSchema: ResponseFormat? = nil, mlxModelID: String? = nil, mlxModelService: MLXModelService? = nil, mlxRepetitionPenalty: Double? = nil, mlxTopP: Double? = nil, mlxMaxTokens: Int? = nil, mlxRawOutput: Bool = false, mlxTopK: Int? = nil, mlxMinP: Double? = nil, mlxPresencePenalty: Double? = nil, mlxSeed: Int? = nil, mlxMaxLogprobs: Int? = nil, contextWindow: Int? = nil, record: Bool = false, transcriptDir: String? = nil) async throws {
         self.port = port
         self.hostname = hostname
         self.verbose = verbose
@@ -236,6 +237,15 @@ class Server: @unchecked Sendable {
         self.mlxSeed = mlxSeed
         self.mlxMaxLogprobs = mlxMaxLogprobs ?? 20
         self.contextWindow = contextWindow
+
+        // Session transcript recording is opt-in (--record). Absent the flag,
+        // no recorder is created and no transcript directory is ever touched.
+        if record {
+            let dirPath = transcriptDir ?? Server.defaultTranscriptDir()
+            self.transcriptRecorder = TranscriptRecorder(transcriptDir: URL(fileURLWithPath: dirPath))
+        } else {
+            self.transcriptRecorder = nil
+        }
 
         // Create environment without command line arguments to prevent Vapor from parsing them
         var env = Environment(name: "development", arguments: ["afm"])
@@ -444,7 +454,8 @@ class Server: @unchecked Sendable {
                 veryVerbose: veryVerbose,
                 trace: trace,
                 rawOutput: mlxRawOutput,
-                stop: stop
+                stop: stop,
+                transcriptRecorder: transcriptRecorder
             )
             try app.register(collection: mlxController)
 
@@ -499,7 +510,8 @@ class Server: @unchecked Sendable {
                 permissiveGuardrails: permissiveGuardrails,
                 veryVerbose: veryVerbose,
                 stop: stop,
-                defaultGuidedJsonSchema: defaultGuidedJsonSchema
+                defaultGuidedJsonSchema: defaultGuidedJsonSchema,
+                transcriptRecorder: transcriptRecorder
             )
             try app.register(collection: chatController)
         }
@@ -1788,6 +1800,13 @@ class Server: @unchecked Sendable {
     }
 
     /// Find the webui index.html.gz file
+    /// Default transcript directory when --record is set without an explicit
+    /// --transcript-dir: ~/.afm/sessions.
+    private static func defaultTranscriptDir() -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return home.appendingPathComponent(".afm/sessions").path
+    }
+
     private static func findWebuiPath() -> String? {
         let fileManager = FileManager.default
         let cwd = fileManager.currentDirectoryPath
