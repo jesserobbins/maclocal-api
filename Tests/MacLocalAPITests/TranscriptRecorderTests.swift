@@ -112,6 +112,71 @@ final class TranscriptRecorderTests: XCTestCase {
         XCTAssertEqual(lines.last?["backend"] as? String, "foundation")
     }
 
+    // MARK: - schema_version and seq
+
+    func testSchemaVersionOnMetaAndContiguousSeqOnEveryLine() async throws {
+        let dir = makeTempDir()
+        let recorder = makeRecorder(dir)
+
+        // Turn 1: [system, user] → meta + 2 messages + assistant = seq 0..3.
+        await recorder.record(
+            sessionId: "sess-1", model: "m",
+            requestMessages: [
+                Message(role: "system", content: "sys"),
+                Message(role: "user", content: "u1"),
+            ],
+            assistant: RecordedAssistant(content: "a1", finishReason: "stop")
+        )
+        // Turn 2: echo history + new user → +user +assistant = seq 4..5.
+        await recorder.record(
+            sessionId: "sess-1", model: "m",
+            requestMessages: [
+                Message(role: "system", content: "sys"),
+                Message(role: "user", content: "u1"),
+                Message(role: "assistant", content: "a1"),
+                Message(role: "user", content: "u2"),
+            ],
+            assistant: RecordedAssistant(content: "a2", finishReason: "stop")
+        )
+
+        let lines = try readLines(sessionFiles(in: dir)[0])
+        // schema_version only on the meta line.
+        XCTAssertEqual(lines[0]["schema_version"] as? Int, 1)
+        XCTAssertNil(lines[1]["schema_version"], "schema_version is meta-only")
+
+        // seq is a contiguous monotonic index across all lines, starting at 0.
+        let seqs = lines.map { $0["seq"] as? Int }
+        XCTAssertEqual(seqs, [0, 1, 2, 3, 4, 5],
+                       "seq must be contiguous across appended turns, not reset per call")
+    }
+
+    func testRerouteRestartsSeqAtZeroInTheNewFile() async throws {
+        let dir = makeTempDir()
+        let recorder = makeRecorder(dir)
+
+        // Turn 1.
+        await recorder.record(
+            sessionId: "sess-1", model: "m",
+            requestMessages: [Message(role: "user", content: "u1")],
+            assistant: RecordedAssistant(content: "a1", finishReason: "stop")
+        )
+        // Turn 2 diverges (edited) → reroutes to a fresh file.
+        await recorder.record(
+            sessionId: "sess-1", model: "m",
+            requestMessages: [Message(role: "user", content: "u1-edited")],
+            assistant: RecordedAssistant(content: "a2", finishReason: "stop")
+        )
+
+        let files = sessionFiles(in: dir)
+        XCTAssertEqual(files.count, 2)
+        // The rerouted file is its own agentsview session, so its seq restarts
+        // at 0 (meta), 1 (user), 2 (assistant).
+        let rerouted = try readLines(files.first { $0.lastPathComponent != "sess-1.jsonl" }!)
+        XCTAssertEqual(rerouted.map { $0["seq"] as? Int }, [0, 1, 2],
+                       "a rerouted file must restart seq at 0")
+        XCTAssertEqual(rerouted[0]["schema_version"] as? Int, 1)
+    }
+
     // MARK: - Reasoning separation
 
     func testReasoningRecordedSeparatelyFromContent() async throws {
@@ -570,12 +635,14 @@ final class TranscriptRecorderTests: XCTestCase {
     }
 
     func testSanitizeRestrictsToSafeCharacters() {
-        XCTAssertEqual(TranscriptRecorder.sanitize("ok.session_id-1"), "ok.session_id-1")
+        // '.' is mapped out too, so ids satisfy agentsview's IsValidSessionID
+        // (alphanumeric/dash/underscore only).
+        XCTAssertEqual(TranscriptRecorder.sanitize("ok.session_id-1"), "ok_session_id-1")
         XCTAssertEqual(TranscriptRecorder.sanitize("a/b c:d"), "a_b_c_d")
         // Empty → hashed (non-empty, safe).
         let hashed = TranscriptRecorder.sanitize("")
         XCTAssertFalse(hashed.isEmpty)
-        XCTAssertNotNil(hashed.range(of: #"^[A-Za-z0-9._-]+$"#, options: .regularExpression))
+        XCTAssertNotNil(hashed.range(of: #"^[A-Za-z0-9_-]+$"#, options: .regularExpression))
     }
 
     // MARK: - Timestamp format

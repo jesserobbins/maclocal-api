@@ -51,6 +51,10 @@ struct RecordedAssistant {
 /// Per-session serialization is provided by actor isolation: the fingerprint
 /// map and file appends are a single critical section, so lines never interleave.
 actor TranscriptRecorder {
+    /// Transcript format version, stamped on the session_meta line. Bump when the
+    /// line shape changes in a way a consumer must know about.
+    private static let schemaVersion = 1
+
     private let transcriptDir: URL
 
     /// AFM build version and backend name (`foundation` / `mlx`), stamped on the
@@ -130,11 +134,17 @@ actor TranscriptRecorder {
 
         var lines: [String] = []
 
+        // `seq` is a monotonic per-file line index (meta = 0). It rides the same
+        // reset as `persisted`: a redirect sets `persisted = []`, so the fresh
+        // file restarts at 0. On a continuing file, the lines already written =
+        // persistedPrefix.count + 1 (the meta line), which is the next seq.
+        var seq = persisted.isEmpty ? 0 : persisted.count + 1
+
         if persisted.isEmpty {
-            lines.append(metaLine(sessionId: sanitized, model: model))
+            lines.append(metaLine(sessionId: sanitized, model: model, seq: seq)); seq += 1
             // First call: persist every request message.
             for message in requestMessages {
-                lines.append(messageLine(message))
+                lines.append(messageLine(message, seq: seq)); seq += 1
             }
         } else {
             // Subsequent call: persist only the request messages beyond the
@@ -143,12 +153,12 @@ actor TranscriptRecorder {
             // index `persisted.count` onward is genuinely new.
             if requestMessages.count > persisted.count {
                 for message in requestMessages[persisted.count...] {
-                    lines.append(messageLine(message))
+                    lines.append(messageLine(message, seq: seq)); seq += 1
                 }
             }
         }
 
-        lines.append(assistantLine(assistant))
+        lines.append(assistantLine(assistant, seq: seq))
 
         append(lines, to: file)
 
@@ -165,9 +175,11 @@ actor TranscriptRecorder {
 
     // MARK: - Line builders
 
-    private func metaLine(sessionId: String, model: String) -> String {
+    private func metaLine(sessionId: String, model: String, seq: Int) -> String {
         encode([
             "role": "session_meta",
+            "schema_version": Self.schemaVersion,
+            "seq": seq,
             "session_id": sessionId,
             "model": model,
             "platform": "afm",
@@ -177,7 +189,7 @@ actor TranscriptRecorder {
         ])
     }
 
-    private func messageLine(_ message: Message) -> String {
+    private func messageLine(_ message: Message, seq: Int) -> String {
         // Scope: this recorder captures the text-level API conversation as
         // received. The agentsview JSONL shape types `content` as a string, so a
         // multimodal `.parts` message records its joined text only (image parts
@@ -193,6 +205,7 @@ actor TranscriptRecorder {
         // textContent ("") — these are intentionally independent.
         var obj: [String: Any] = [
             "role": message.role,
+            "seq": seq,
             "content": message.content == nil ? NSNull() : message.textContent,
             "timestamp": timestamp(),
         ]
@@ -214,9 +227,10 @@ actor TranscriptRecorder {
         return encode(obj)
     }
 
-    private func assistantLine(_ assistant: RecordedAssistant) -> String {
+    private func assistantLine(_ assistant: RecordedAssistant, seq: Int) -> String {
         var obj: [String: Any] = [
             "role": "assistant",
+            "seq": seq,
             "content": assistant.content == nil ? NSNull() : assistant.content!,
             "finish_reason": assistant.finishReason,
             "platform": "afm",
@@ -309,7 +323,10 @@ actor TranscriptRecorder {
 
     /// Restrict to [A-Za-z0-9._-]; hash if the result would be unwieldy or empty.
     static func sanitize(_ id: String) -> String {
-        let allowed = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
+        // Allowlist excludes '.' so ids satisfy agentsview's IsValidSessionID
+        // (alphanumeric/dash/underscore); a period would parse and display but
+        // break the by-id source-file lookup used for UI linking.
+        let allowed = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
         let cleaned = String(id.map { allowed.contains($0) ? $0 : "_" })
         if cleaned.isEmpty || cleaned.count > 128 {
             return hashed(id)

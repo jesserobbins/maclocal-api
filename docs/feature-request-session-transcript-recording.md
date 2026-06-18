@@ -4,11 +4,13 @@ Add an opt-in `--record` flag that writes each chat session to disk as OpenAI-sh
 
 (I am testing this in my repo already, will send a PR when I think it's ready and if you are supportive of approach)
 
+@Keesan12 reviewed this with real depth and several of their points changed the design. The strict versioned first line and the per-line `seq` index both come from their feedback, as does the provenance-over-text framing (backend, turn index, status, schema version matter more than the message text once you're auditing or replaying). The deferred list below is mostly their suggestions.
+
 ## Motivation
 
 Logging agent calls is proving valuable for developers and end users. A healthy set of tools now read session logs and give you search, analytics, token accounting, and replay over them: [agentsview](https://www.agentsview.io) ([kenn-io/agentsview](https://github.com/kenn-io/agentsview), one I use and contribute to), [ccusage](https://github.com/ccusage/ccusage), and others. They all consume the JSONL transcripts.
 
-AFM has no way to generate those logs outside of debugging, so users miss the benefit and there's no record to point these tools at. I propose AFM write the same JSONL shape those tools already read, so every local AFM session drops into that existing tooling with no glue code / "for free".
+AFM has no way to generate those logs outside of debugging, so users miss the benefit and there's no record to point these tools at. I propose AFM write the same JSONL shape those tools already read, so a local AFM session lands in a format that tooling already understands. (Format compatibility isn't the same as auto-ingestion: getting AFM sessions to show up in a given tool, with the right agent identity and per-message usage, is a small consumer-side step. That's mine to handle on the agentsview side, and it's separate from AFM's format.)
 
 Note: I think the opportunity is much bigger in gateway mode, where AFM fronts the Foundation model, MLX, and proxied backends under one surface. That makes it the best place to capture local traffic in one consistent format. This proposal starts with AFM's own inference, Foundation and MLX. Recording the gatewayed backends is the natural next step.
 
@@ -18,9 +20,11 @@ Note: I think the opportunity is much bigger in gateway mode, where AFM fronts t
 
 Each file is one JSON object per line:
 
-- A `session_meta` first line: session id, model, timestamp, and the identification fields below.
+- A `session_meta` first line: `schema_version`, session id, model, timestamp, and the identification fields below.
 - One line per request message (`system`/`user`/`assistant`/`tool`), preserving `tool_calls`, `tool_call_id`, and `name`.
 - One `assistant` line per completed turn: `content`, `reasoning` when present, `tool_calls`, `finish_reason`, and `usage`.
+
+Every line also carries a `seq`, a monotonically increasing index, so a consumer never has to infer turn order from timestamps. `schema_version` and `seq` are additive: lenient parsers ignore fields they don't know, so they don't break existing consumers.
 
 **Framework identification.** A recorded session should mark itself AFM-produced, so a token-usage leaderboard or similar tool can tell an AFM run from another agent's. The meta line already has `platform: "afm"`; it should also carry `afm_version` and `backend` (`foundation`, `mlx`, or the gateway backend name), stamped on every `assistant` line too so the identity survives when a tool reads individual turns.
 
@@ -48,6 +52,15 @@ Out of scope for now, each deferred for a specific reason:
 - **Per-endpoint toggles.** The backend that serves a request, not the route, is the unit worth controlling, and the per-model filter already covers that.
 - **Redaction / sampling.** Needs a content-rewriting design that shouldn't hold up basic recording, and gets safer once there are real transcripts to test against.
 - **Retention / rotation.** A file-lifecycle concern that's orthogonal to capture. The files are plain JSONL an operator or a cron job can manage today.
+
+## Deferred
+
+These came out of @Keesan12's review. I agree with the direction and want them in eventually, just not in the first version:
+
+- **Terminal event for cancelled/errored runs.** Writing nothing is indistinguishable from recording being off. Recording it means hooking the cancel/error paths the recorder is deliberately kept out of, and a new record type is a change consumers have to handle. Worth doing once the mechanism is settled.
+- **Raw + normalized tool calls.** Keep both the normalized shape and the raw provider payload. Caveat: AFM normalizes some formats internally before the recorder sees them, so "raw" means the payload as AFM received it, not the model's literal original.
+- **A dedicated logging facility and schema.** If this gets adopted, a purpose-built logger with its own schema likely beats bolting fields onto the current shape. Better designed against real usage than up front.
+- **Gateway-proxied recording** (see Scope) and the **per-endpoint / redaction / retention** items (see Configurability) remain deferred for the reasons noted there.
 
 ## Why opt-in and off by default
 
