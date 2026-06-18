@@ -546,6 +546,117 @@ final class MLXChatCompletionsControllerStreamingTests: XCTestCase {
         }
     }
 
+    // MARK: - Transcript recording (controller ↔ recorder integration)
+
+    private func makeTempDir() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("afm-ctrl-transcript-\(UUID().uuidString)")
+    }
+
+    private func transcriptFiles(in dir: URL) -> [URL] {
+        let items = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        return items.filter { $0.pathExtension == "jsonl" }
+    }
+
+    private func transcriptLines(in dir: URL) throws -> [[String: Any]] {
+        guard let file = transcriptFiles(in: dir).first else { return [] }
+        let text = try String(contentsOf: file, encoding: .utf8)
+        return text.split(separator: "\n", omittingEmptySubsequences: true).compactMap {
+            (try? JSONSerialization.jsonObject(with: Data($0.utf8))) as? [String: Any]
+        }
+    }
+
+    /// Streaming and non-streaming must produce the same recorded transcript
+    /// shape for the same turn: same roles in order, same assistant content,
+    /// same finish_reason. (Test-plan: identical transcript shapes.)
+    func testStreamingAndNonStreamingRecordIdenticalTranscriptShape() async throws {
+        let answer = "The capital is Paris."
+
+        // Non-streaming run.
+        let nonStreamDir = makeTempDir()
+        let nonStreamService = FakeMLXChatService(
+            generateResult: (
+                modelID: "test-model", content: answer,
+                promptTokens: 11, completionTokens: 5, tokenLogprobs: nil,
+                toolCalls: nil, cachedTokens: 0, promptTime: 0.02, generateTime: 0.01,
+                stoppedBySequence: false
+            ),
+            streamingResult: makeStreamingResult(chunks: [])
+        )
+        try MLXChatCompletionsController(
+            modelID: "test-model", service: nonStreamService,
+            temperature: nil, repetitionPenalty: nil,
+            transcriptRecorder: TranscriptRecorder(transcriptDir: nonStreamDir, afmVersion: "v-test", backend: "mlx")
+        ).boot(routes: app)
+        let nsBody = try requestBody(stream: false, prompt: "Capital of France?", toolsJSON: "[]")
+        try await app.testable(method: .running(port: 0)).test(.POST, "/v1/chat/completions", headers: requestHeaders(for: nsBody), body: nsBody) { res async in
+            XCTAssertEqual(res.status, .ok)
+        }
+
+        // Streaming run (same answer, delivered as chunks) on a second app so the
+        // route isn't double-registered.
+        let streamApp = try await Application.make(.testing)
+        defer { Task { try? await streamApp.asyncShutdown() } }
+        let streamDir = makeTempDir()
+        let streamService = FakeMLXChatService(
+            streamingResult: makeStreamingResult(chunks: [
+                StreamChunk(text: "The capital "),
+                StreamChunk(text: "is Paris."),
+                StreamChunk(text: "", promptTokens: 11, completionTokens: 5, cachedTokens: 0, promptTime: 0.02, generateTime: 0.01),
+            ])
+        )
+        try MLXChatCompletionsController(
+            modelID: "test-model", service: streamService,
+            temperature: nil, repetitionPenalty: nil,
+            transcriptRecorder: TranscriptRecorder(transcriptDir: streamDir, afmVersion: "v-test", backend: "mlx")
+        ).boot(routes: streamApp)
+        let sBody = try requestBody(stream: true, prompt: "Capital of France?", toolsJSON: "[]")
+        try await streamApp.testable(method: .running(port: 0)).test(.POST, "/v1/chat/completions", headers: requestHeaders(for: sBody), body: sBody) { res async in
+            XCTAssertEqual(res.status, .ok)
+        }
+
+        let ns = try transcriptLines(in: nonStreamDir)
+        let st = try transcriptLines(in: streamDir)
+
+        // Same roles in the same order: meta, user, assistant.
+        XCTAssertEqual(ns.map { $0["role"] as? String }, ["session_meta", "user", "assistant"])
+        XCTAssertEqual(ns.map { $0["role"] as? String }, st.map { $0["role"] as? String },
+                       "streaming and non-streaming must record the same role sequence")
+
+        // Same assistant content and finish_reason.
+        XCTAssertEqual(ns.last?["content"] as? String, answer)
+        XCTAssertEqual(st.last?["content"] as? String, answer,
+                       "streamed chunks must reassemble to the non-streaming content")
+        XCTAssertEqual(ns.last?["finish_reason"] as? String, st.last?["finish_reason"] as? String)
+    }
+
+    /// A stream that errors mid-flight must record nothing — the record call
+    /// sits after the stream is fully assembled, past the error branch.
+    /// (Test-plan: cancelled/errored stream records nothing.)
+    func testErroredStreamRecordsNothing() async throws {
+        let dir = makeTempDir()
+        let service = FakeMLXChatService(
+            streamingResult: Self.makeThrowingStreamingResult(
+                chunksBeforeError: [StreamChunk(text: "partial answer ")]
+            )
+        )
+        try MLXChatCompletionsController(
+            modelID: "test-model", service: service,
+            temperature: nil, repetitionPenalty: nil,
+            transcriptRecorder: TranscriptRecorder(transcriptDir: dir, afmVersion: "v-test", backend: "mlx")
+        ).boot(routes: app)
+
+        let body = try requestBody(stream: true, prompt: "hi", toolsJSON: "[]")
+        try await app.testable(method: .running(port: 0)).test(.POST, "/v1/chat/completions", headers: requestHeaders(for: body), body: body) { res async in
+            // The SSE response itself completes (error surfaced as a chunk); the
+            // point is the transcript, not the HTTP status.
+            XCTAssertEqual(res.status, .ok)
+        }
+
+        XCTAssertTrue(transcriptFiles(in: dir).isEmpty,
+                      "an errored stream must not write a transcript file")
+    }
+
     private func requestBody(
         stream: Bool = true,
         prompt: String = "What is the weather in Berlin?",
@@ -579,6 +690,27 @@ final class MLXChatCompletionsControllerStreamingTests: XCTestCase {
 
     private func makeStreamingResult(chunks: [StreamChunk]) -> ChatStreamingResult {
         Self.makeDelayedStreamingResult(modelID: "test-model", chunks: chunks, delayNanoseconds: nil)
+    }
+
+    /// A streaming result that yields the given chunks then throws, simulating a
+    /// generation error / cancellation mid-stream.
+    private static func makeThrowingStreamingResult(chunksBeforeError: [StreamChunk]) -> ChatStreamingResult {
+        struct StreamFailure: Error {}
+        let stream = AsyncThrowingStream<StreamChunk, Error> { continuation in
+            Task {
+                for chunk in chunksBeforeError { continuation.yield(chunk) }
+                continuation.finish(throwing: StreamFailure())
+            }
+        }
+        return (
+            modelID: "test-model",
+            stream: stream,
+            promptTokens: 8,
+            toolCallStartTag: "<tool_call>",
+            toolCallEndTag: "</tool_call>",
+            thinkStartTag: nil,
+            thinkEndTag: nil
+        )
     }
 
     private static func makeDelayedStreamingResult(modelID: String, chunks: [StreamChunk], delayNanoseconds: UInt64?) -> ChatStreamingResult {
