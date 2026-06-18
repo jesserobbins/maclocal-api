@@ -96,6 +96,11 @@ actor TranscriptRecorder {
         // reroute to a fresh suffixed file rather than corrupting this one.
         if !persisted.isEmpty && !Self.isPrefix(persisted, of: incoming) {
             let fresh = Self.suffixedID(sanitized, existing: Set(persistedPrefix.keys), in: transcriptDir)
+            // An edited/truncated history fragments one logical conversation
+            // across files. Note each reroute so the fragmentation is visible —
+            // a client that wants a single transcript should set a stable
+            // X-Session-Id and echo full history.
+            FileHandle.standardError.write(Data("[transcript] session \(sanitized) history diverged; rerouting to \(fresh).jsonl\n".utf8))
             persistedPrefix[fresh] = []
             activeFile[fresh] = fileURL(for: fresh)
             record(sessionId: fresh, model: model, requestMessages: requestMessages, assistant: assistant)
@@ -153,9 +158,13 @@ actor TranscriptRecorder {
     }
 
     private func messageLine(_ message: Message) -> String {
+        // Preserve null content (e.g. a tool-call-only assistant message) as JSON
+        // null rather than collapsing it to "", so the consumer can tell a
+        // tool-only turn from an empty-text turn. Fingerprinting still uses
+        // textContent ("") — these are intentionally independent.
         var obj: [String: Any] = [
             "role": message.role,
-            "content": message.textContent,
+            "content": message.content == nil ? NSNull() : message.textContent,
             "timestamp": timestamp(),
         ]
         if let toolCalls = message.toolCalls, !toolCalls.isEmpty {
@@ -179,7 +188,7 @@ actor TranscriptRecorder {
     private func assistantLine(_ assistant: RecordedAssistant) -> String {
         var obj: [String: Any] = [
             "role": "assistant",
-            "content": assistant.content ?? "",
+            "content": assistant.content == nil ? NSNull() : assistant.content!,
             "finish_reason": assistant.finishReason,
             "timestamp": timestamp(),
         ]
@@ -278,7 +287,7 @@ actor TranscriptRecorder {
 
     private static func hashed(_ value: String) -> String {
         let digest = SHA256.hash(data: Data(value.utf8))
-        return digest.map { String(format: "%02x", $0) }.joined().prefix(32).description
+        return String(digest.map { String(format: "%02x", $0) }.joined().prefix(32))
     }
 
     /// Pick the lowest `<base>-<n>` (n >= 2) that collides with neither an

@@ -89,6 +89,28 @@ struct MLXChatCompletionsController: RouteCollection {
         )
     }
 
+    /// Record one completed turn from a non-streaming handler. Resolves the
+    /// session id from the request (safe here — still on the request thread) and
+    /// no-ops when recording is off. The streaming path resolves the id ahead of
+    /// the response closure instead (it cannot touch `req` there) and records
+    /// directly. Centralizes the guard+resolve+record so the call sites don't
+    /// duplicate it.
+    private func recordTurn(
+        req: Request,
+        chatRequest: ChatCompletionRequest,
+        model: String,
+        assistant: RecordedAssistant
+    ) async {
+        guard let recorder = transcriptRecorder,
+              let sessionId = resolveSessionID(req: req, chatRequest: chatRequest) else { return }
+        await recorder.record(
+            sessionId: sessionId,
+            model: model,
+            requestMessages: chatRequest.messages,
+            assistant: assistant
+        )
+    }
+
     /// Merge CLI --stop sequences with API-level stop sequences, deduplicating.
     private func mergeStopSequences(cliStop: String?, apiStop: [String]?) -> [String]? {
         var merged: [String] = []
@@ -464,21 +486,19 @@ struct MLXChatCompletionsController: RouteCollection {
                     }
                     fflush(stdout)
                 }
-                if let recorder = transcriptRecorder, let sessionId = resolveSessionID(req: req, chatRequest: chatRequest) {
-                    await recorder.record(
-                        sessionId: sessionId,
-                        model: result.modelID,
-                        requestMessages: chatRequest.messages,
-                        assistant: RecordedAssistant(
-                            content: finalizedTurn.content,
-                            reasoning: finalizedTurn.reasoningContent,
-                            toolCalls: toolCalls,
-                            finishReason: "tool_calls",
-                            promptTokens: result.promptTokens,
-                            completionTokens: completionTok
-                        )
+                await recordTurn(
+                    req: req,
+                    chatRequest: chatRequest,
+                    model: result.modelID,
+                    assistant: RecordedAssistant(
+                        content: finalizedTurn.content,
+                        reasoning: finalizedTurn.reasoningContent,
+                        toolCalls: toolCalls,
+                        finishReason: "tool_calls",
+                        promptTokens: result.promptTokens,
+                        completionTokens: completionTok
                     )
-                }
+                )
                 return try await createSuccessResponse(req: req, response: response, grammarDowngraded: grammarDowngraded)
             }
 
@@ -515,21 +535,19 @@ struct MLXChatCompletionsController: RouteCollection {
             if veryVerbose {
                 print("\(Self.teal)[\(Self.timestamp())] SEND full response:\n\(encodeJSON(response))\(Self.reset)"); fflush(stdout)
             }
-            if let recorder = transcriptRecorder, let sessionId = resolveSessionID(req: req, chatRequest: chatRequest) {
-                await recorder.record(
-                    sessionId: sessionId,
-                    model: result.modelID,
-                    requestMessages: chatRequest.messages,
-                    assistant: RecordedAssistant(
-                        content: finalizedTurn.content,
-                        reasoning: finalizedTurn.reasoningContent,
-                        toolCalls: nil,
-                        finishReason: stopReason,
-                        promptTokens: result.promptTokens,
-                        completionTokens: completionTok
-                    )
+            await recordTurn(
+                req: req,
+                chatRequest: chatRequest,
+                model: result.modelID,
+                assistant: RecordedAssistant(
+                    content: finalizedTurn.content,
+                    reasoning: finalizedTurn.reasoningContent,
+                    toolCalls: nil,
+                    finishReason: stopReason,
+                    promptTokens: result.promptTokens,
+                    completionTokens: completionTok
                 )
-            }
+            )
             return try await createSuccessResponse(req: req, response: response, grammarDowngraded: grammarDowngraded)
         } catch let abort as Abort {
             req.logger.error("[\(Self.timestamp())] MLX completions error: \(abort)")

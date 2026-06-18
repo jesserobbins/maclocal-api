@@ -333,6 +333,9 @@ final class TranscriptRecorderTests: XCTestCase {
 
         let assistantToolCall = lines[2]
         XCTAssertEqual(assistantToolCall["role"] as? String, "assistant")
+        // Tool-call-only message had null content; it must persist as JSON null,
+        // not "" — so the consumer can tell a tool-only turn from an empty one.
+        XCTAssertTrue(assistantToolCall["content"] is NSNull, "null content must serialize as JSON null")
         let tcs = assistantToolCall["tool_calls"] as? [[String: Any]]
         XCTAssertEqual(tcs?.count, 1)
         XCTAssertEqual(tcs?[0]["id"] as? String, "call_1")
@@ -367,6 +370,7 @@ final class TranscriptRecorderTests: XCTestCase {
         let lines = try readLines(sessionFiles(in: dir)[0])
         let assistant = lines.last!
         XCTAssertEqual(assistant["finish_reason"] as? String, "tool_calls")
+        XCTAssertTrue(assistant["content"] is NSNull, "nil assistant content must serialize as JSON null")
         let toolCalls = assistant["tool_calls"] as? [[String: Any]]
         XCTAssertEqual(toolCalls?.count, 1)
         XCTAssertEqual(toolCalls?[0]["id"] as? String, "call_abc")

@@ -48,6 +48,27 @@ struct ChatCompletionsController: RouteCollection {
             firstUserMessage: firstUser
         )
     }
+
+    /// Record one completed turn from the non-streaming handler. Resolves the
+    /// session id from the request (safe here — still on the request thread) and
+    /// no-ops when recording is off. The streaming path resolves the id ahead of
+    /// the response closure instead (it cannot touch `req` there).
+    private func recordTurn(
+        req: Request,
+        chatRequest: ChatCompletionRequest,
+        model: String,
+        assistant: RecordedAssistant
+    ) async {
+        guard let recorder = transcriptRecorder,
+              let sessionId = resolveSessionID(req: req, chatRequest: chatRequest) else { return }
+        await recorder.record(
+            sessionId: sessionId,
+            model: model,
+            requestMessages: chatRequest.messages,
+            assistant: assistant
+        )
+    }
+
     func boot(routes: RoutesBuilder) throws {
         let v1 = routes.grouped("v1")
         // Set explicit body size limit for long conversations
@@ -219,19 +240,17 @@ struct ChatCompletionsController: RouteCollection {
                 req.logger.info("Foundation full response: \(encodeJSON(response))")
             }
 
-            if let recorder = transcriptRecorder, let sessionId = resolveSessionID(req: req, chatRequest: chatRequest) {
-                await recorder.record(
-                    sessionId: sessionId,
-                    model: chatRequest.model ?? "foundation",
-                    requestMessages: chatRequest.messages,
-                    assistant: RecordedAssistant(
-                        content: content,
-                        finishReason: stopReason,
-                        promptTokens: promptTokens,
-                        completionTokens: completionTokens
-                    )
+            await recordTurn(
+                req: req,
+                chatRequest: chatRequest,
+                model: chatRequest.model ?? "foundation",
+                assistant: RecordedAssistant(
+                    content: content,
+                    finishReason: stopReason,
+                    promptTokens: promptTokens,
+                    completionTokens: completionTokens
                 )
-            }
+            )
 
             return try await createSuccessResponse(req: req, response: response)
 
@@ -449,6 +468,10 @@ struct ChatCompletionsController: RouteCollection {
                     promptTime: promptTime
                 )
                 let effectiveMaxTokens = chatRequest.effectiveMaxTokens ?? 2000
+                // Heuristic for the Foundation streaming path: completionTokens is
+                // an estimate, so a turn that stopped naturally near the cap may be
+                // labelled "length". This matches what the SSE response reports, so
+                // the transcript stays consistent with what the client saw.
                 let finishReason = completionTokens >= effectiveMaxTokens ? "length" : "stop"
 
                 // Record the completed streaming turn on the success path, once.
