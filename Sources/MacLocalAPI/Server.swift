@@ -242,7 +242,14 @@ class Server: @unchecked Sendable {
         // no recorder is created and no transcript directory is ever touched.
         if record {
             let dirPath = transcriptDir ?? Server.defaultTranscriptDir()
-            self.transcriptRecorder = TranscriptRecorder(transcriptDir: URL(fileURLWithPath: dirPath))
+            // One backend per server process on the in-scope paths: MLX when an
+            // MLX model/service is wired, Foundation otherwise.
+            let backend = (mlxModelID != nil && mlxModelService != nil) ? "mlx" : "foundation"
+            self.transcriptRecorder = TranscriptRecorder(
+                transcriptDir: URL(fileURLWithPath: dirPath),
+                afmVersion: BuildInfo.version ?? "dev-build",
+                backend: backend
+            )
         } else {
             self.transcriptRecorder = nil
         }

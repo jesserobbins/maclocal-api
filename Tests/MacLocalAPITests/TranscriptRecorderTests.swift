@@ -16,6 +16,10 @@ final class TranscriptRecorderTests: XCTestCase {
         return dir
     }
 
+    private func makeRecorder(_ dir: URL, backend: String = "mlx") -> TranscriptRecorder {
+        TranscriptRecorder(transcriptDir: dir, afmVersion: "v-test", backend: backend)
+    }
+
     private func readLines(_ url: URL) throws -> [[String: Any]] {
         let text = try String(contentsOf: url, encoding: .utf8)
         return text.split(separator: "\n", omittingEmptySubsequences: true).map { line in
@@ -33,7 +37,7 @@ final class TranscriptRecorderTests: XCTestCase {
 
     func testFirstCallWritesMetaThenAllRequestMessagesThenAssistant() async throws {
         let dir = makeTempDir()
-        let recorder = TranscriptRecorder(transcriptDir: dir)
+        let recorder = makeRecorder(dir)
 
         let request = [
             Message(role: "system", content: "You are helpful"),
@@ -64,11 +68,75 @@ final class TranscriptRecorderTests: XCTestCase {
         XCTAssertEqual(lines[3]["finish_reason"] as? String, "stop")
     }
 
+    // MARK: - Framework identification (platform / afm_version / backend)
+
+    func testMetaAndAssistantLinesCarryFrameworkIdentity() async throws {
+        let dir = makeTempDir()
+        let recorder = makeRecorder(dir, backend: "mlx")
+
+        await recorder.record(
+            sessionId: "sess-1",
+            model: "test-model",
+            requestMessages: [Message(role: "user", content: "hi")],
+            assistant: RecordedAssistant(content: "yo", finishReason: "stop")
+        )
+
+        let lines = try readLines(sessionFiles(in: dir)[0])
+        // session_meta carries platform, afm_version, backend so a tool reading
+        // the whole file can attribute the session to AFM.
+        let meta = lines[0]
+        XCTAssertEqual(meta["role"] as? String, "session_meta")
+        XCTAssertEqual(meta["platform"] as? String, "afm")
+        XCTAssertEqual(meta["afm_version"] as? String, "v-test")
+        XCTAssertEqual(meta["backend"] as? String, "mlx")
+
+        // Every assistant line repeats the identity so it survives a tool that
+        // reads individual turns rather than the meta line.
+        let assistant = lines.last!
+        XCTAssertEqual(assistant["role"] as? String, "assistant")
+        XCTAssertEqual(assistant["platform"] as? String, "afm")
+        XCTAssertEqual(assistant["afm_version"] as? String, "v-test")
+        XCTAssertEqual(assistant["backend"] as? String, "mlx")
+    }
+
+    func testBackendReflectsTheServingBackend() async throws {
+        let dir = makeTempDir()
+        let recorder = makeRecorder(dir, backend: "foundation")
+        await recorder.record(
+            sessionId: "sess-1", model: "foundation",
+            requestMessages: [Message(role: "user", content: "hi")],
+            assistant: RecordedAssistant(content: "yo", finishReason: "stop")
+        )
+        let lines = try readLines(sessionFiles(in: dir)[0])
+        XCTAssertEqual(lines[0]["backend"] as? String, "foundation")
+        XCTAssertEqual(lines.last?["backend"] as? String, "foundation")
+    }
+
+    // MARK: - Reasoning separation
+
+    func testReasoningRecordedSeparatelyFromContent() async throws {
+        let dir = makeTempDir()
+        let recorder = makeRecorder(dir)
+        await recorder.record(
+            sessionId: "sess-1", model: "m",
+            requestMessages: [Message(role: "user", content: "think")],
+            assistant: RecordedAssistant(
+                content: "the answer is 4",
+                reasoning: "2+2 = 4",
+                finishReason: "stop"
+            )
+        )
+        let assistant = try readLines(sessionFiles(in: dir)[0]).last!
+        XCTAssertEqual(assistant["content"] as? String, "the answer is 4")
+        XCTAssertEqual(assistant["reasoning"] as? String, "2+2 = 4",
+                       "reasoning must be a separate field, not folded into content")
+    }
+
     // MARK: - Delta append / dedup (the off-by-one trap)
 
     func testSecondCallAppendsOnlyNewTurnNoHistoryDuplication() async throws {
         let dir = makeTempDir()
-        let recorder = TranscriptRecorder(transcriptDir: dir)
+        let recorder = makeRecorder(dir)
 
         // Turn 1: request [system, user1]
         await recorder.record(
@@ -113,7 +181,7 @@ final class TranscriptRecorderTests: XCTestCase {
 
     func testTruncatedHistoryStartsNewFileRatherThanCorrupting() async throws {
         let dir = makeTempDir()
-        let recorder = TranscriptRecorder(transcriptDir: dir)
+        let recorder = makeRecorder(dir)
 
         // Turn 1: request [system, user1] (count becomes 3)
         await recorder.record(
@@ -152,7 +220,7 @@ final class TranscriptRecorderTests: XCTestCase {
 
     func testSameLengthEditedHistoryStartsNewFileRatherThanCorrupting() async throws {
         let dir = makeTempDir()
-        let recorder = TranscriptRecorder(transcriptDir: dir)
+        let recorder = makeRecorder(dir)
 
         // Turn 1: [system, user1] → persisted prefix is [system, user1, a1].
         await recorder.record(
@@ -198,7 +266,7 @@ final class TranscriptRecorderTests: XCTestCase {
 
     func testEditedEarlierTurnWithGrownHistoryStartsNewFile() async throws {
         let dir = makeTempDir()
-        let recorder = TranscriptRecorder(transcriptDir: dir)
+        let recorder = makeRecorder(dir)
 
         // Turn 1: [system, user1].
         await recorder.record(
@@ -234,7 +302,7 @@ final class TranscriptRecorderTests: XCTestCase {
 
     func testEchoedAssistantWithMatchingPrefixAppendsToSameFile() async throws {
         let dir = makeTempDir()
-        let recorder = TranscriptRecorder(transcriptDir: dir)
+        let recorder = makeRecorder(dir)
 
         // Turn 1: request [sys, u1] → persisted prefix [sys, u1, a1].
         await recorder.record(
@@ -272,7 +340,7 @@ final class TranscriptRecorderTests: XCTestCase {
 
     func testNaturalRegenerateReroutesBecausePriorAssistantNotEchoed() async throws {
         let dir = makeTempDir()
-        let recorder = TranscriptRecorder(transcriptDir: dir)
+        let recorder = makeRecorder(dir)
 
         let request = [
             Message(role: "system", content: "sys"),
@@ -306,7 +374,7 @@ final class TranscriptRecorderTests: XCTestCase {
 
     func testRequestToolMessagesRoundTripThroughRecord() async throws {
         let dir = makeTempDir()
-        let recorder = TranscriptRecorder(transcriptDir: dir)
+        let recorder = makeRecorder(dir)
 
         // A multi-turn request carrying an assistant-with-tool_calls message and
         // a tool result message, as a client would echo back after a tool call.
@@ -352,7 +420,7 @@ final class TranscriptRecorderTests: XCTestCase {
         let dir = makeTempDir()
 
         // Process 1: record one turn for a stable session id.
-        let recorder1 = TranscriptRecorder(transcriptDir: dir)
+        let recorder1 = makeRecorder(dir)
         await recorder1.record(
             sessionId: "stable-id", model: "m",
             requestMessages: [Message(role: "user", content: "u1")],
@@ -363,7 +431,7 @@ final class TranscriptRecorderTests: XCTestCase {
         // Process 2 (simulated restart): fresh recorder, empty in-memory state,
         // same session id. The file exists on disk, so appending would duplicate
         // session_meta + history. It must redirect to a fresh file instead.
-        let recorder2 = TranscriptRecorder(transcriptDir: dir)
+        let recorder2 = makeRecorder(dir)
         await recorder2.record(
             sessionId: "stable-id", model: "m",
             requestMessages: [Message(role: "user", content: "u2")],
@@ -400,7 +468,7 @@ final class TranscriptRecorderTests: XCTestCase {
 
     func testContinuedDivergedConversationStaysInOneRedirectedFile() async throws {
         let dir = makeTempDir()
-        let recorder = TranscriptRecorder(transcriptDir: dir)
+        let recorder = makeRecorder(dir)
 
         // Turn 1 → persisted [u1, a1].
         await recorder.record(
@@ -438,7 +506,7 @@ final class TranscriptRecorderTests: XCTestCase {
 
     func testAssistantToolCallsSerializeInOpenAIShape() async throws {
         let dir = makeTempDir()
-        let recorder = TranscriptRecorder(transcriptDir: dir)
+        let recorder = makeRecorder(dir)
 
         let tc = ResponseToolCall(
             index: 0,
@@ -514,7 +582,7 @@ final class TranscriptRecorderTests: XCTestCase {
 
     func testTimestampIsNaiveMicrosecondISO8601() async throws {
         let dir = makeTempDir()
-        let recorder = TranscriptRecorder(transcriptDir: dir)
+        let recorder = makeRecorder(dir)
         await recorder.record(
             sessionId: "sess-1",
             model: "m",

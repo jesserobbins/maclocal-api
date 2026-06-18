@@ -53,6 +53,13 @@ struct RecordedAssistant {
 actor TranscriptRecorder {
     private let transcriptDir: URL
 
+    /// AFM build version and backend name (`foundation` / `mlx`), stamped on the
+    /// session_meta line and every assistant line so a transcript identifies
+    /// itself as AFM-produced even when a tool reads individual turns. Both are
+    /// fixed per server instance (one backend per process on the in-scope paths).
+    private let afmVersion: String
+    private let backend: String
+
     /// Maps a session id to the per-message fingerprints already persisted to
     /// its file, in order — request messages plus each assistant response line.
     /// The next call's incoming history must have these as a prefix; otherwise
@@ -73,8 +80,10 @@ actor TranscriptRecorder {
         return f
     }()
 
-    init(transcriptDir: URL) {
+    init(transcriptDir: URL, afmVersion: String, backend: String) {
         self.transcriptDir = transcriptDir
+        self.afmVersion = afmVersion
+        self.backend = backend
     }
 
     /// Record one completed turn: the new request messages since the last call
@@ -162,6 +171,8 @@ actor TranscriptRecorder {
             "session_id": sessionId,
             "model": model,
             "platform": "afm",
+            "afm_version": afmVersion,
+            "backend": backend,
             "timestamp": timestamp(),
         ])
     }
@@ -208,6 +219,9 @@ actor TranscriptRecorder {
             "role": "assistant",
             "content": assistant.content == nil ? NSNull() : assistant.content!,
             "finish_reason": assistant.finishReason,
+            "platform": "afm",
+            "afm_version": afmVersion,
+            "backend": backend,
             "timestamp": timestamp(),
         ]
         if let reasoning = assistant.reasoning, !reasoning.isEmpty {
