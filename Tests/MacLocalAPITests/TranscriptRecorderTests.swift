@@ -348,6 +348,92 @@ final class TranscriptRecorderTests: XCTestCase {
         XCTAssertEqual(toolResult["content"] as? String, "62F")
     }
 
+    func testRestartWithExistingFileRedirectsAndKeepsSubsequentTurnsInOneFile() async throws {
+        let dir = makeTempDir()
+
+        // Process 1: record one turn for a stable session id.
+        let recorder1 = TranscriptRecorder(transcriptDir: dir)
+        await recorder1.record(
+            sessionId: "stable-id", model: "m",
+            requestMessages: [Message(role: "user", content: "u1")],
+            assistant: RecordedAssistant(content: "a1", finishReason: "stop")
+        )
+        XCTAssertEqual(sessionFiles(in: dir).count, 1)
+
+        // Process 2 (simulated restart): fresh recorder, empty in-memory state,
+        // same session id. The file exists on disk, so appending would duplicate
+        // session_meta + history. It must redirect to a fresh file instead.
+        let recorder2 = TranscriptRecorder(transcriptDir: dir)
+        await recorder2.record(
+            sessionId: "stable-id", model: "m",
+            requestMessages: [Message(role: "user", content: "u2")],
+            assistant: RecordedAssistant(content: "a2", finishReason: "stop")
+        )
+        // Second post-restart turn: client echoes the new file's history. This
+        // MUST append to the SAME redirected file, not fragment to a third.
+        await recorder2.record(
+            sessionId: "stable-id", model: "m",
+            requestMessages: [
+                Message(role: "user", content: "u2"),
+                Message(role: "assistant", content: "a2"),
+                Message(role: "user", content: "u3"),
+            ],
+            assistant: RecordedAssistant(content: "a3", finishReason: "stop")
+        )
+
+        let files = sessionFiles(in: dir)
+        XCTAssertEqual(files.count, 2, "restart redirects to one new file, not a new file per turn")
+
+        // Original untouched: exactly one session_meta, ends at a1.
+        let original = try readLines(files.first { $0.lastPathComponent == "stable-id.jsonl" }!)
+        XCTAssertEqual(original.filter { $0["role"] as? String == "session_meta" }.count, 1)
+        XCTAssertEqual(original.last?["content"] as? String, "a1")
+
+        // Redirected file holds both post-restart turns, one meta, no dup history.
+        let redirected = try readLines(files.first { $0.lastPathComponent != "stable-id.jsonl" }!)
+        XCTAssertEqual(redirected.filter { $0["role"] as? String == "session_meta" }.count, 1,
+                       "redirected file must have exactly one session_meta")
+        let contents = redirected.compactMap { $0["content"] as? String }
+        XCTAssertEqual(contents.filter { $0 == "a2" }.count, 1, "a2 appears once (no history dup across turns)")
+        XCTAssertEqual(redirected.last?["content"] as? String, "a3")
+    }
+
+    func testContinuedDivergedConversationStaysInOneRedirectedFile() async throws {
+        let dir = makeTempDir()
+        let recorder = TranscriptRecorder(transcriptDir: dir)
+
+        // Turn 1 → persisted [u1, a1].
+        await recorder.record(
+            sessionId: "sess-1", model: "m",
+            requestMessages: [Message(role: "user", content: "u1")],
+            assistant: RecordedAssistant(content: "a1", finishReason: "stop")
+        )
+        // Turn 2 diverges (edited first turn) → redirects to a fresh file.
+        await recorder.record(
+            sessionId: "sess-1", model: "m",
+            requestMessages: [Message(role: "user", content: "u1-edited")],
+            assistant: RecordedAssistant(content: "a2", finishReason: "stop")
+        )
+        // Turn 3 continues the diverged conversation (echoes the new history).
+        // It MUST append to the redirected file, not spawn a third file.
+        await recorder.record(
+            sessionId: "sess-1", model: "m",
+            requestMessages: [
+                Message(role: "user", content: "u1-edited"),
+                Message(role: "assistant", content: "a2"),
+                Message(role: "user", content: "u3"),
+            ],
+            assistant: RecordedAssistant(content: "a3", finishReason: "stop")
+        )
+
+        let files = sessionFiles(in: dir)
+        XCTAssertEqual(files.count, 2, "a continued diverged conversation stays in one redirected file")
+        let redirected = try readLines(files.first { $0.lastPathComponent != "sess-1.jsonl" }!)
+        let contents = redirected.compactMap { $0["content"] as? String }
+        XCTAssertEqual(contents.filter { $0 == "a2" }.count, 1, "a2 once (no per-turn fragmentation)")
+        XCTAssertEqual(redirected.last?["content"] as? String, "a3")
+    }
+
     // MARK: - tool_calls shape
 
     func testAssistantToolCallsSerializeInOpenAIShape() async throws {

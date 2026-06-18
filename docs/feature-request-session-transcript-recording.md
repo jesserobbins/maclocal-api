@@ -2,13 +2,11 @@
 
 ## Motivation
 
-Run Claude Code, Codex, or any of 20+ other agents and you get session history for free: every conversation lands on disk as JSONL, and a category of local-first tools reads it for search, analytics, token accounting, and replay. [agentsview](https://www.agentsview.io) ([kenn-io/agentsview](https://github.com/kenn-io/agentsview)) is one I contribute to. Point it at your agent logs and you can see what you ran, what came back, which tools fired, and what it cost.
+Logging agent calls is turning out to be genuinely valuable for developers and end users. A healthy set of tools now read session logs and give you search, analytics, token accounting, and replay over them. [agentsview](https://www.agentsview.io) ([kenn-io/agentsview](https://github.com/kenn-io/agentsview), one I contribute to) and [ccusage](https://github.com/ccusage/ccusage) are two, and there are more. They all consume the JSONL transcripts that coding agents write to disk.
 
-AFM is the exception. It speaks the same OpenAI wire format as everything else, but it keeps no record. The one local backend I'd most want in that analytics workflow is the one that's invisible to it.
+AFM has no way to generate those logs. So its users miss the direct benefit, and there's no record to point any of these tools at. That gap is wider in gateway mode, where AFM fronts the Foundation model, MLX, and proxied backends like Ollama, LM Studio, and Jan under one surface: it's the one place you could capture all of that local traffic in a single consistent format, and right now it captures none of it.
 
-This closes the gap. Have AFM write the same JSONL shape the other agents write, and every local AFM session drops into that existing tooling with no glue code. Same logging and analytics I already get from everything else, now for the model running on my own machine.
-
-Recording at the AFM layer also compounds with gateway mode. AFM already proxies Ollama, LM Studio, and Jan under one OpenAI surface, so it's the single point every local backend converges through. That makes it the right place to record: instrument once, get uniform transcripts across everything you route, instead of wiring up each backend on its own.
+The fix is to have AFM write the same JSONL shape those tools already read. Then every local AFM session drops into that existing tooling with no glue code, and the same analysis people get from every other agent works for the models running on their own machine.
 
 ## Summary
 
@@ -29,6 +27,17 @@ Recording is best-effort: it runs after the response is assembled, on the succes
 Scope of this change: AFM's own inference is recorded, streaming and non-streaming. That covers the Foundation model under `afm`/`afm serve` and the MLX model under `afm mlx`. Gateway-proxied backends (Ollama, LM Studio, Jan) take a separate proxy path that returns before the recorder, so they are not recorded yet. The gateway is exactly what makes AFM the natural place to extend one recorder across all of them, and hooking the proxy path is a straightforward follow-on.
 
 > **Decision for Jesse (strip before filing):** the line above proposes proxy recording as a follow-on. The alternative is to include it in the initial PR. That's a larger change, since proxied responses come back as opaque streams the recorder would have to parse. Default is follow-on.
+
+## Configurability
+
+AFM fronts a mixed fleet under one OpenAI surface: the Foundation model, MLX, `/v1/embeddings`, and (in gateway mode) proxied backends like Ollama, LM Studio, and Jan. Recording should be controllable at the granularity of what actually serves a request. The server already resolves the model id and backend name before the record hook fires, so this is a filter at the decision point rather than new plumbing. This is the proposed configuration surface beyond the shipped `--record`/`--transcript-dir`; the flags below are part of this proposal, not already built.
+
+- **Per-backend / per-model filter.** `--record-models <glob,...>` and `--record-exclude <glob,...>`, matched against the resolved model id or backend name. Today that governs the inference AFM records (Foundation, MLX); once proxy recording lands as the follow-on above, the same filter spans the proxied backends, so you can record Foundation and Ollama while skipping an experimental backend, or record only the one model you're evaluating. The `session_meta` line already carries the model, so downstream tools can filter after the fact too. The server-side filter is about not writing the bytes at all, for volume and privacy.
+- **Default: conversational turns, embeddings excluded.** `--record` targets chat sessions. The main server now also serves `/v1/embeddings`, so embedding traffic flows through the same instance, but embeddings are high-volume vector lookups rather than sessions and stay out of recording by default. The filter above can name them in if anyone wants them.
+- **Per-request override.** Honor an `X-Record: off` (or `on`) header to override the server default for a single call, matching the existing `X-AFM-Profile` and `X-Session-Id` per-request headers. Skip recording a throwaway probe or a sensitive prompt without touching server config.
+- **Per-instance.** Already covered: run multiple `afm` instances on different ports with different `--transcript-dir` values for fully isolated transcript stores. Nothing new to build.
+
+Deliberately out of scope: per-endpoint toggles (the fleet, not the route, is the unit of control), redaction/sampling filters, and retention/rotation policies. Real someday, none requested now, each its own config surface. Keeping the first cut to the filters above.
 
 ## Why opt-in and off by default
 

@@ -87,24 +87,33 @@ actor TranscriptRecorder {
         assistant: RecordedAssistant
     ) {
         let sanitized = Self.sanitize(sessionId)
-        let persisted = persistedPrefix[sanitized] ?? []
+        var persisted = persistedPrefix[sanitized] ?? []
         let incoming = requestMessages.map { Self.fingerprint($0) }
 
-        // The persisted history must be a prefix of the incoming history. It is
-        // not when the client truncated (incoming shorter) or edited an earlier
-        // turn (a fingerprint diverges before the persisted end). Either way,
-        // reroute to a fresh suffixed file rather than corrupting this one.
-        if !persisted.isEmpty && !Self.isPrefix(persisted, of: incoming) {
+        // Decide whether we can keep appending to this session's current file, or
+        // must redirect it to a fresh suffixed one. Two cases force a redirect:
+        //
+        //  1. History diverged — the persisted prefix is no longer a prefix of
+        //     the incoming history (client truncated or edited an earlier turn).
+        //  2. Restart — we have no in-memory prefix for this id (`persisted`
+        //     empty) yet a file already exists on disk for it, e.g. a stable
+        //     X-Session-Id reused across a server restart. Appending would write
+        //     a second session_meta + duplicate history into the existing file.
+        //
+        // Both redirect by re-pointing `activeFile[sanitized]` at a fresh file
+        // and treating this as a first write (persisted = []), so the session's
+        // *subsequent* turns adopt the new file and keep appending there rather
+        // than fragmenting one file per turn. The original file is untouched.
+        let diverged = !persisted.isEmpty && !Self.isPrefix(persisted, of: incoming)
+        let restartCollision = persisted.isEmpty
+            && activeFile[sanitized] == nil
+            && FileManager.default.fileExists(atPath: fileURL(for: sanitized).path)
+        if diverged || restartCollision {
             let fresh = Self.suffixedID(sanitized, existing: Set(persistedPrefix.keys), in: transcriptDir)
-            // An edited/truncated history fragments one logical conversation
-            // across files. Note each reroute so the fragmentation is visible —
-            // a client that wants a single transcript should set a stable
-            // X-Session-Id and echo full history.
-            FileHandle.standardError.write(Data("[transcript] session \(sanitized) history diverged; rerouting to \(fresh).jsonl\n".utf8))
-            persistedPrefix[fresh] = []
-            activeFile[fresh] = fileURL(for: fresh)
-            record(sessionId: fresh, model: model, requestMessages: requestMessages, assistant: assistant)
-            return
+            let reason = diverged ? "history diverged" : "file exists from a prior run"
+            FileHandle.standardError.write(Data("[transcript] session \(sanitized) \(reason); rerouting to \(fresh).jsonl\n".utf8))
+            activeFile[sanitized] = fileURL(for: fresh)
+            persisted = []
         }
 
         let file = activeFile[sanitized] ?? fileURL(for: sanitized)
@@ -164,6 +173,8 @@ actor TranscriptRecorder {
         // are dropped) — text-only is the consumer's native shape, not a lossy
         // workaround. Likewise the recorded messages are the request as sent,
         // not any processed/expanded form the model saw (e.g. vision-OCR).
+        // Corollary: an image-only delta (same text, different image) is
+        // invisible to prefix matching, since the fingerprint is text-derived.
         //
         // Preserve null content (e.g. a tool-call-only assistant message) as JSON
         // null rather than collapsing it to "", so the consumer can tell a
