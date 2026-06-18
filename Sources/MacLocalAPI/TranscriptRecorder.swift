@@ -35,21 +35,29 @@ struct RecordedAssistant {
 /// it stable.
 ///
 /// AFM re-receives the entire conversation history on every call, so a naive
-/// append would duplicate every prior turn. The recorder tracks a persisted
-/// message count per session and appends only the genuinely new turn(s) plus
-/// the new assistant line. If a client truncates/edits history (sends fewer
-/// messages than already persisted), the session is rerouted to a new
-/// suffixed file rather than corrupting the existing one.
+/// append would duplicate every prior turn. The recorder fingerprints every
+/// message it has persisted per session and appends only the genuinely new
+/// turn(s) plus the new assistant line. If a client truncates or edits history
+/// — sends fewer messages, or the same/more messages whose earlier content no
+/// longer matches what was persisted — the persisted fingerprints are no longer
+/// a prefix of the incoming history, so the session is rerouted to a new
+/// suffixed file rather than corrupting the existing one. (If the client
+/// instead echoes the prior assistant turn back and asks for another reply, the
+/// persisted prefix still matches and the new reply is appended as an extra
+/// assistant line. A natural regenerate — resending the original request
+/// without the prior assistant — is a shorter, non-matching prefix, so it
+/// reroutes; one file per regenerate is the conservative choice.)
 ///
-/// Per-session serialization is provided by actor isolation: the count map and
-/// file appends are a single critical section, so lines never interleave.
+/// Per-session serialization is provided by actor isolation: the fingerprint
+/// map and file appends are a single critical section, so lines never interleave.
 actor TranscriptRecorder {
     private let transcriptDir: URL
 
-    /// Maps a session id to the number of messages already persisted to its
-    /// file (request messages + each assistant response line). The invariant
-    /// after a successful record() is: count == requestMessages.count + 1.
-    private var persistedCount: [String: Int] = [:]
+    /// Maps a session id to the per-message fingerprints already persisted to
+    /// its file, in order — request messages plus each assistant response line.
+    /// The next call's incoming history must have these as a prefix; otherwise
+    /// the client edited/truncated and the session reroutes to a suffixed file.
+    private var persistedPrefix: [String: [String]] = [:]
 
     /// Maps a session id to the on-disk file currently receiving its lines.
     /// Diverges from `<sessionId>.jsonl` only after a truncated-history
@@ -79,14 +87,16 @@ actor TranscriptRecorder {
         assistant: RecordedAssistant
     ) {
         let sanitized = Self.sanitize(sessionId)
-        let count = persistedCount[sanitized] ?? 0
+        let persisted = persistedPrefix[sanitized] ?? []
+        let incoming = requestMessages.map { Self.fingerprint($0) }
 
-        // Truncated/edited history: the client sent fewer messages than we have
-        // already persisted. Reroute to a fresh suffixed file rather than
-        // corrupting the existing transcript.
-        if !requestMessages.isEmpty && requestMessages.count < count {
-            let fresh = Self.suffixedID(sanitized, existing: Set(persistedCount.keys))
-            persistedCount[fresh] = 0
+        // The persisted history must be a prefix of the incoming history. It is
+        // not when the client truncated (incoming shorter) or edited an earlier
+        // turn (a fingerprint diverges before the persisted end). Either way,
+        // reroute to a fresh suffixed file rather than corrupting this one.
+        if !persisted.isEmpty && !Self.isPrefix(persisted, of: incoming) {
+            let fresh = Self.suffixedID(sanitized, existing: Set(persistedPrefix.keys), in: transcriptDir)
+            persistedPrefix[fresh] = []
             activeFile[fresh] = fileURL(for: fresh)
             record(sessionId: fresh, model: model, requestMessages: requestMessages, assistant: assistant)
             return
@@ -97,20 +107,19 @@ actor TranscriptRecorder {
 
         var lines: [String] = []
 
-        if count == 0 {
+        if persisted.isEmpty {
             lines.append(metaLine(sessionId: sanitized, model: model))
             // First call: persist every request message.
             for message in requestMessages {
                 lines.append(messageLine(message))
             }
         } else {
-            // Subsequent call: persist only the genuinely new request messages.
-            // count includes the previous assistant line, which the client
-            // echoes back as one message, so messages[count-1...] would re-add
-            // it. The new messages are everything from index `count` onward,
-            // because count == previousRequest.count + 1 (the assistant line).
-            if requestMessages.count > count {
-                for message in requestMessages[count...] {
+            // Subsequent call: persist only the request messages beyond the
+            // persisted prefix. The persisted prefix already includes the prior
+            // assistant line, which the client echoes back, so anything from
+            // index `persisted.count` onward is genuinely new.
+            if requestMessages.count > persisted.count {
+                for message in requestMessages[persisted.count...] {
                     lines.append(messageLine(message))
                 }
             }
@@ -120,8 +129,15 @@ actor TranscriptRecorder {
 
         append(lines, to: file)
 
-        // New persisted count = all request messages + the assistant line.
-        persistedCount[sanitized] = requestMessages.count + 1
+        // New persisted prefix = all request fingerprints + the assistant line.
+        persistedPrefix[sanitized] = incoming + [Self.assistantFingerprint(assistant)]
+    }
+
+    /// Whether `lhs` is a (non-strict) prefix of `rhs`: same elements in order
+    /// for the first `lhs.count` positions.
+    private static func isPrefix(_ lhs: [String], of rhs: [String]) -> Bool {
+        guard lhs.count <= rhs.count else { return false }
+        return Array(rhs.prefix(lhs.count)) == lhs
     }
 
     // MARK: - Line builders
@@ -179,8 +195,11 @@ actor TranscriptRecorder {
                 ]
             }
         }
-        if let prompt = assistant.promptTokens, let completion = assistant.completionTokens {
-            obj["usage"] = ["prompt_tokens": prompt, "completion_tokens": completion]
+        if assistant.promptTokens != nil || assistant.completionTokens != nil {
+            var usage: [String: Any] = [:]
+            if let prompt = assistant.promptTokens { usage["prompt_tokens"] = prompt }
+            if let completion = assistant.completionTokens { usage["completion_tokens"] = completion }
+            obj["usage"] = usage
         }
         return encode(obj)
     }
@@ -220,6 +239,31 @@ actor TranscriptRecorder {
         Self.timestampFormatter.string(from: Date())
     }
 
+    // MARK: - Fingerprints
+
+    /// Content fingerprint of a request message: role, text, and any tool-call
+    /// signature. Used for prefix matching so an edited earlier turn is detected
+    /// even when the message count is unchanged or larger.
+    private static func fingerprint(_ message: Message) -> String {
+        var parts = ["\(message.role)\u{1F}\(message.textContent)"]
+        if let toolCalls = message.toolCalls, !toolCalls.isEmpty {
+            parts.append(toolCalls.map { "\($0.id)\u{1F}\($0.function.name)\u{1F}\($0.function.arguments)" }.joined(separator: "\u{1E}"))
+        }
+        if let toolCallId = message.toolCallId { parts.append("tcid\u{1F}\(toolCallId)") }
+        if let name = message.name { parts.append("name\u{1F}\(name)") }
+        return hashed(parts.joined(separator: "\u{1D}"))
+    }
+
+    /// Fingerprint of the assistant line as it is persisted, so the next call's
+    /// echoed-back assistant message matches the persisted prefix.
+    private static func assistantFingerprint(_ assistant: RecordedAssistant) -> String {
+        var parts = ["assistant\u{1F}\(assistant.content ?? "")"]
+        if let toolCalls = assistant.toolCalls, !toolCalls.isEmpty {
+            parts.append(toolCalls.map { "\($0.id)\u{1F}\($0.function.name)\u{1F}\($0.function.arguments)" }.joined(separator: "\u{1E}"))
+        }
+        return hashed(parts.joined(separator: "\u{1D}"))
+    }
+
     // MARK: - Session id
 
     /// Restrict to [A-Za-z0-9._-]; hash if the result would be unwieldy or empty.
@@ -237,9 +281,16 @@ actor TranscriptRecorder {
         return digest.map { String(format: "%02x", $0) }.joined().prefix(32).description
     }
 
-    private static func suffixedID(_ base: String, existing: Set<String>) -> String {
+    /// Pick the lowest `<base>-<n>` (n >= 2) that collides with neither an
+    /// in-memory session key nor an existing file on disk. Checking disk too
+    /// means a reroute after a server restart (when `existing` is empty) won't
+    /// reopen a suffixed file left by a prior process.
+    private static func suffixedID(_ base: String, existing: Set<String>, in dir: URL) -> String {
         var n = 2
-        while existing.contains("\(base)-\(n)") { n += 1 }
+        while existing.contains("\(base)-\(n)")
+            || FileManager.default.fileExists(atPath: dir.appendingPathComponent("\(base)-\(n).jsonl").path) {
+            n += 1
+        }
         return "\(base)-\(n)"
     }
 
