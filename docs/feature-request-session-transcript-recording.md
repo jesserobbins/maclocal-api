@@ -2,11 +2,13 @@
 
 ## Motivation
 
-When you run a local model, the conversations disappear the moment the response streams back. There is no record of what you asked, what came back, which tools fired, or how many tokens it cost. The server is the one place every request already passes through, and right now it throws all of that away.
+Run Claude Code, Codex, or any of 20+ other agents and you get session history for free: every conversation lands on disk as JSONL, and a category of local-first tools reads it for search, analytics, token accounting, and replay. [agentsview](https://www.agentsview.io) ([kenn-io/agentsview](https://github.com/kenn-io/agentsview)) is one I contribute to. Point it at your agent logs and you can see what you ran, what came back, which tools fired, and what it cost.
 
-I want the sessions on disk. Plain files I own, on my machine, in a format I can grep, replay, diff, and feed back in as eval or fine-tuning data. Nothing phones home. AFM already speaks OpenAI on the wire. It should be able to write OpenAI-shaped transcripts to a directory I control, and it should write nothing unless I ask.
+AFM is the exception. It speaks the same OpenAI wire format as everything else, but it keeps no record. The one local backend I'd most want in that analytics workflow is the one that's invisible to it.
 
-The format matters because a whole category of local-first session-analysis tools already reads the transcripts coding agents write: search, analytics, token accounting, replay. They consume OpenAI-shaped JSONL from Claude Code, Codex, and 20+ other agents. [agentsview](https://www.agentsview.io) ([kenn-io/agentsview](https://github.com/kenn-io/agentsview)) is the one I contribute to, so it's the one I can speak to firsthand. If AFM writes the same JSONL shape, every local AFM session drops into that existing tooling with no glue code. That is the payoff I am after, and the format below is chosen to land there.
+This closes the gap. Have AFM write the same JSONL shape the other agents write, and every local AFM session drops into that existing tooling with no glue code. Same logging and analytics I already get from everything else, now for the model running on my own machine.
+
+Recording at the AFM layer also compounds with gateway mode. AFM already proxies Ollama, LM Studio, and Jan under one OpenAI surface, so it's the single point every local backend converges through. That makes it the right place to record: instrument once, get uniform transcripts across everything you route, instead of wiring up each backend on its own.
 
 ## Summary
 
@@ -22,7 +24,11 @@ Session identity resolves in priority order: an `X-Session-Id` request header, t
 
 A chat client re-sends the whole history on every call, so a naive append would duplicate every prior turn. The recorder tracks what it has already persisted per session and appends only the genuinely new messages plus the new assistant reply. If a client truncates or edits earlier history so the persisted lines no longer match, that session reroutes to a fresh suffixed file rather than corrupting the existing transcript.
 
-Recording is best-effort: it runs after the response is assembled, on the success path only, and any file IO error is logged and swallowed so it can never affect the request. Partial or cancelled streams are not recorded. Works for both the Foundation and MLX backends, streaming and non-streaming.
+Recording is best-effort: it runs after the response is assembled, on the success path only, and any file IO error is logged and swallowed so it can never affect the request. Partial or cancelled streams are not recorded.
+
+Scope of this change: AFM's own inference is recorded, streaming and non-streaming. That covers the Foundation model under `afm`/`afm serve` and the MLX model under `afm mlx`. Gateway-proxied backends (Ollama, LM Studio, Jan) take a separate proxy path that returns before the recorder, so they are not recorded yet. The gateway is exactly what makes AFM the natural place to extend one recorder across all of them, and hooking the proxy path is a straightforward follow-on.
+
+> **Decision for Jesse (strip before filing):** the line above proposes proxy recording as a follow-on. The alternative is to include it in the initial PR. That's a larger change, since proxied responses come back as opaque streams the recorder would have to parse. Default is follow-on.
 
 ## Why opt-in and off by default
 

@@ -186,6 +186,10 @@ struct ChatCompletionsController: RouteCollection {
                         // not report token usage, by leaving prompt/completion
                         // tokens at zero rather than producing a misleading
                         // estimate over image-bearing message parts.
+                        //
+                        // Deliberately not recorded: this is an image-only turn
+                        // with no model conversation, and the transcript format
+                        // is text-level (see TranscriptRecorder.messageLine).
                         let response = ChatCompletionResponse(
                             model: chatRequest.model ?? "foundation",
                             content: extractedContent,

@@ -158,6 +158,13 @@ actor TranscriptRecorder {
     }
 
     private func messageLine(_ message: Message) -> String {
+        // Scope: this recorder captures the text-level API conversation as
+        // received. The agentsview JSONL shape types `content` as a string, so a
+        // multimodal `.parts` message records its joined text only (image parts
+        // are dropped) — text-only is the consumer's native shape, not a lossy
+        // workaround. Likewise the recorded messages are the request as sent,
+        // not any processed/expanded form the model saw (e.g. vision-OCR).
+        //
         // Preserve null content (e.g. a tool-call-only assistant message) as JSON
         // null rather than collapsing it to "", so the consumer can tell a
         // tool-only turn from an empty-text turn. Fingerprinting still uses
