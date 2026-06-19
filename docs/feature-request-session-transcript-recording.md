@@ -2,7 +2,15 @@
 
 Add an opt-in `--record` flag that writes each chat session to disk as OpenAI-shaped JSONL, the same format the coding-agent session tools already read. This turns AFM runs into transcripts you can search, analyze, and replay with existing tooling. It covers AFM's own inference (Foundation and MLX) to start, is off by default, and never blocks a request.
 
-(I am testing this in my repo already, will send a PR when I think it's ready and if you are supportive of approach)
+**Status: in progress — working and testable on my fork.** The `--record`
+implementation (Foundation + MLX, streaming and non-streaming) is live on
+[`feat/session-transcript-recording`](https://github.com/jesserobbins/maclocal-api/tree/feat/session-transcript-recording)
+([PR #6](https://github.com/jesserobbins/maclocal-api/pull/6)) for anyone who
+wants to try it. Build that branch and run e.g.
+`afm mlx -m <model> --record --transcript-dir ~/.afm/sessions`; transcripts land
+as one `<sessionId>.jsonl` per session. Still iterating on the shape and on the
+consumer-side ingestion (see Motivation); feedback welcome before I open this
+upstream.
 
 @Keesan12 reviewed this with real depth and several of their points changed the design. The strict versioned first line and the per-line `seq` index both come from their feedback, as does the provenance-over-text framing (backend, turn index, status, schema version matter more than the message text once you're auditing or replaying). The deferred list below is mostly their suggestions.
 
