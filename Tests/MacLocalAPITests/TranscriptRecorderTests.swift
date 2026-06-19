@@ -242,6 +242,59 @@ final class TranscriptRecorderTests: XCTestCase {
         XCTAssertEqual(lines[5]["content"] as? String, "a2")
     }
 
+    // MARK: - Usage + metrics
+
+    func testCanonicalUsageShapeWithCacheAndTiming() async throws {
+        let dir = makeTempDir()
+        let recorder = makeRecorder(dir)
+        await recorder.record(
+            sessionId: "sess-1", model: "m",
+            requestMessages: [Message(role: "user", content: "hi")],
+            assistant: RecordedAssistant(
+                content: "yo", finishReason: "stop",
+                promptTokens: 14, completionTokens: 6,
+                cachedTokens: 10,
+                promptTime: 0.02, generateTime: 0.5
+            )
+        )
+        let assistant = try readLines(sessionFiles(in: dir)[0]).last!
+        let usage = assistant["usage"] as? [String: Any]
+        XCTAssertEqual(usage?["prompt_tokens"] as? Int, 14)
+        XCTAssertEqual(usage?["completion_tokens"] as? Int, 6)
+        XCTAssertEqual(usage?["total_tokens"] as? Int, 20, "total_tokens = prompt + completion")
+        // cached_tokens nests under prompt_tokens_details (OpenAI canonical shape).
+        let details = usage?["prompt_tokens_details"] as? [String: Any]
+        XCTAssertEqual(details?["cached_tokens"] as? Int, 10)
+        // Real (MLX) counts are not marked estimated.
+        XCTAssertNil(usage?["estimated"])
+        // Timing lives in afm_metrics, not usage.
+        XCTAssertNil(usage?["prompt_time"], "timing must not pollute the OpenAI usage object")
+        let metrics = assistant["afm_metrics"] as? [String: Any]
+        XCTAssertEqual(metrics?["prompt_time"] as? Double, 0.02)
+        XCTAssertEqual(metrics?["generate_time"] as? Double, 0.5)
+    }
+
+    func testEstimatedTokensMarkedAndNoCacheOmitsDetails() async throws {
+        let dir = makeTempDir()
+        let recorder = makeRecorder(dir, backend: "foundation")
+        // Foundation-shaped: estimated tokens, no cache, no timing.
+        await recorder.record(
+            sessionId: "sess-1", model: "foundation",
+            requestMessages: [Message(role: "user", content: "hi")],
+            assistant: RecordedAssistant(
+                content: "yo", finishReason: "stop",
+                promptTokens: 12, completionTokens: 4,
+                tokensEstimated: true
+            )
+        )
+        let assistant = try readLines(sessionFiles(in: dir)[0]).last!
+        let usage = assistant["usage"] as? [String: Any]
+        XCTAssertEqual(usage?["total_tokens"] as? Int, 16)
+        XCTAssertEqual(usage?["estimated"] as? Bool, true, "estimated tokens must be marked")
+        XCTAssertNil(usage?["prompt_tokens_details"], "no cache → no prompt_tokens_details")
+        XCTAssertNil(assistant["afm_metrics"], "no timing → no afm_metrics")
+    }
+
     // MARK: - Truncated-history fallback
 
     func testTruncatedHistoryStartsNewFileRatherThanCorrupting() async throws {

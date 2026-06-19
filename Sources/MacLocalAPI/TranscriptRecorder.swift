@@ -11,6 +11,20 @@ struct RecordedAssistant {
     let finishReason: String
     let promptTokens: Int?
     let completionTokens: Int?
+    /// Prompt tokens served from the prompt cache (MLX prefix cache). Maps to
+    /// OpenAI's `usage.prompt_tokens_details.cached_tokens`. Nil when the backend
+    /// has no cache concept (Foundation).
+    let cachedTokens: Int?
+    /// True when the token counts are heuristic estimates rather than measured
+    /// (the Foundation path estimates tokens; MLX reports real counts). Stamped
+    /// on the recorded usage so an accounting tool doesn't treat a guess as fact.
+    let tokensEstimated: Bool
+    /// Prompt (prefill) processing wall-clock seconds, when measured. Recorded
+    /// under `afm_metrics`, not `usage` — it isn't an OpenAI field. tok/s is
+    /// intentionally not stored: it's derivable from tokens / time.
+    let promptTime: Double?
+    /// Generation (decode) wall-clock seconds, when measured.
+    let generateTime: Double?
 
     init(
         content: String?,
@@ -18,7 +32,11 @@ struct RecordedAssistant {
         toolCalls: [ResponseToolCall]? = nil,
         finishReason: String,
         promptTokens: Int? = nil,
-        completionTokens: Int? = nil
+        completionTokens: Int? = nil,
+        cachedTokens: Int? = nil,
+        tokensEstimated: Bool = false,
+        promptTime: Double? = nil,
+        generateTime: Double? = nil
     ) {
         self.content = content
         self.reasoning = reasoning
@@ -26,6 +44,10 @@ struct RecordedAssistant {
         self.finishReason = finishReason
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
+        self.cachedTokens = cachedTokens
+        self.tokensEstimated = tokensEstimated
+        self.promptTime = promptTime
+        self.generateTime = generateTime
     }
 }
 
@@ -250,11 +272,31 @@ actor TranscriptRecorder {
                 ]
             }
         }
+        // Canonical OpenAI `usage` shape so ccusage / leaderboard tools read it
+        // for free: prompt/completion/total_tokens, cached_tokens nested under
+        // prompt_tokens_details. `estimated` marks heuristic counts (Foundation).
         if assistant.promptTokens != nil || assistant.completionTokens != nil {
             var usage: [String: Any] = [:]
             if let prompt = assistant.promptTokens { usage["prompt_tokens"] = prompt }
             if let completion = assistant.completionTokens { usage["completion_tokens"] = completion }
+            if let prompt = assistant.promptTokens, let completion = assistant.completionTokens {
+                usage["total_tokens"] = prompt + completion
+            }
+            if let cached = assistant.cachedTokens {
+                usage["prompt_tokens_details"] = ["cached_tokens": cached]
+            }
+            if assistant.tokensEstimated {
+                usage["estimated"] = true
+            }
             obj["usage"] = usage
+        }
+        // AFM-namespaced timing (wall-clock seconds), kept out of `usage` since
+        // it isn't an OpenAI field. Emitted only when measured.
+        var metrics: [String: Any] = [:]
+        if let pt = assistant.promptTime { metrics["prompt_time"] = pt }
+        if let gt = assistant.generateTime { metrics["generate_time"] = gt }
+        if !metrics.isEmpty {
+            obj["afm_metrics"] = metrics
         }
         return encode(obj)
     }

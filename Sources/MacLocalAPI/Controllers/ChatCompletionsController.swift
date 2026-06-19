@@ -252,7 +252,8 @@ struct ChatCompletionsController: RouteCollection {
                     content: content,
                     finishReason: stopReason,
                     promptTokens: promptTokens,
-                    completionTokens: completionTokens
+                    completionTokens: completionTokens,
+                    tokensEstimated: true
                 )
             )
 
@@ -490,7 +491,10 @@ struct ChatCompletionsController: RouteCollection {
                             content: fullStreamedContent,
                             finishReason: finishReason,
                             promptTokens: promptTokens,
-                            completionTokens: completionTokens
+                            completionTokens: completionTokens,
+                            tokensEstimated: true,
+                            promptTime: promptTime,
+                            generateTime: completionTime
                         )
                     )
                 }

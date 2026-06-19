@@ -496,7 +496,10 @@ struct MLXChatCompletionsController: RouteCollection {
                         toolCalls: toolCalls,
                         finishReason: "tool_calls",
                         promptTokens: result.promptTokens,
-                        completionTokens: completionTok
+                        completionTokens: completionTok,
+                        cachedTokens: result.cachedTokens,
+                        promptTime: promptTime,
+                        generateTime: generateTime
                     )
                 )
                 return try await createSuccessResponse(req: req, response: response, grammarDowngraded: grammarDowngraded)
@@ -545,7 +548,10 @@ struct MLXChatCompletionsController: RouteCollection {
                     toolCalls: nil,
                     finishReason: stopReason,
                     promptTokens: result.promptTokens,
-                    completionTokens: completionTok
+                    completionTokens: completionTok,
+                    cachedTokens: result.cachedTokens,
+                    promptTime: promptTime,
+                    generateTime: generateTime
                 )
             )
             return try await createSuccessResponse(req: req, response: response, grammarDowngraded: grammarDowngraded)
@@ -1155,7 +1161,10 @@ struct MLXChatCompletionsController: RouteCollection {
                             toolCalls: finalizedTurn.toolCalls,
                             finishReason: finishReason,
                             promptTokens: promptTokens,
-                            completionTokens: completionTokens
+                            completionTokens: completionTokens,
+                            cachedTokens: realCachedTokens,
+                            promptTime: realPromptTime,
+                            generateTime: realGenerateTime ?? generationDuration
                         )
                     )
                 }
