@@ -9,7 +9,7 @@
 # Steps:
 #   0) Verify / install toolchain dependencies (git, Swift/Xcode CLT, Node + npm)
 #   1) Initialize git submodules (mlx-swift-lm, llama.cpp, ...)
-#   2) Apply the MLX + xgrammar patch sets (Scripts/patches)
+#   2) Apply the DwarfStar, MLX, and xgrammar patch sets (Scripts/patches)
 #   3) Build the llama.cpp webui assets and embed them
 #   4) Clean + resolve Swift packages
 #   4b) Rebuild the MLX Metal shader library (default.metallib) from the kernel sources
@@ -30,6 +30,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$ROOT_DIR/Scripts"
 
 BUILD_CONFIG="release"
+INCLUDE_BUILD_COMMIT=true
 DO_CLEAN=true
 DO_SUBMODULES=true
 DO_PATCHES=true
@@ -56,9 +57,10 @@ Usage: ./build.sh [options]
 
 Options:
   --debug              Build debug instead of release
+  --stable             Build a stable binary without a commit suffix
   --no-clean           Skip clean step before build
   --skip-submodules    Skip git submodule init/update
-  --skip-patches       Skip MLX + xgrammar patch application
+  --skip-patches       Skip DwarfStar, MLX, and xgrammar patch application
   --skip-webui         Skip llama.cpp webui build
   --skip-metallib      Skip rebuilding default.metallib (use the committed prebuilt one)
   --yes, -y            Assume "yes" for dependency-install prompts (non-interactive)
@@ -73,6 +75,7 @@ USAGE
 for arg in "$@"; do
   case "$arg" in
     --debug) BUILD_CONFIG="debug" ;;
+    --stable) INCLUDE_BUILD_COMMIT=false ;;
     --no-clean) DO_CLEAN=false ;;
     --skip-submodules) DO_SUBMODULES=false ;;
     --skip-patches) DO_PATCHES=false ;;
@@ -214,11 +217,29 @@ else
   log_warn "Skipping submodule initialization"
 fi
 
+if [ -n "$(git -C "$ROOT_DIR/vendor/ds4" status --porcelain --untracked-files=all)" ]; then
+  log_error "vendor/ds4 is not clean; DwarfStar must remain an unchanged upstream dependency"
+  exit 1
+fi
+
+EXPECTED_DS4_REVISION="$(git -C "$ROOT_DIR" ls-files -s vendor/ds4 | awk '{print $2}')"
+ACTUAL_DS4_REVISION="$(git -C "$ROOT_DIR/vendor/ds4" rev-parse HEAD)"
+if [ -z "$EXPECTED_DS4_REVISION" ] || [ "$ACTUAL_DS4_REVISION" != "$EXPECTED_DS4_REVISION" ]; then
+  log_error "vendor/ds4 revision mismatch (expected ${EXPECTED_DS4_REVISION:-missing}, actual $ACTUAL_DS4_REVISION)"
+  log_error "Run: git submodule update --init vendor/ds4"
+  exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # Step 2: Patches
 # ---------------------------------------------------------------------------
+MLX_SWIFT_USES_LEGACY_BACKPORTS=false
+if grep -qF 'exact: "0.30.3"' "$ROOT_DIR/Package.swift"; then
+  MLX_SWIFT_USES_LEGACY_BACKPORTS=true
+fi
+
 if $DO_PATCHES; then
-  log_step "Applying MLX patch set"
+  log_step "Applying vendored dependency patch sets"
   if [ ! -x "$SCRIPTS_DIR/apply-mlx-patches.sh" ]; then
     log_error "Missing patch script: $SCRIPTS_DIR/apply-mlx-patches.sh"
     exit 1
@@ -227,7 +248,7 @@ if $DO_PATCHES; then
   "$SCRIPTS_DIR/apply-mlx-patches.sh" --check
   "$SCRIPTS_DIR/patches/apply-xgrammar-patches.sh"
 else
-  log_warn "Skipping MLX patch application"
+  log_warn "Skipping vendored dependency patch application"
 fi
 
 # ---------------------------------------------------------------------------
@@ -259,8 +280,8 @@ fi
 # Step 4: Resource validation + Swift build
 # ---------------------------------------------------------------------------
 log_step "Validating required resources"
-if [ ! -f "$ROOT_DIR/Sources/MacLocalAPI/Resources/default.metallib" ]; then
-  log_error "Missing metallib: Sources/MacLocalAPI/Resources/default.metallib"
+if [ ! -f "$ROOT_DIR/Sources/AFMKitMLX/Resources/default.metallib" ]; then
+  log_error "Missing metallib: Sources/AFMKitMLX/Resources/default.metallib"
   exit 1
 fi
 
@@ -272,15 +293,32 @@ fi
 log_step "Resolving Swift packages"
 swift package resolve
 
+if $DO_PATCHES; then
+  log_step "Applying persistent DeepSeek V4 MLX primitive"
+  "$SCRIPTS_DIR/apply-mlx-deepseek-v4-kernels.sh"
+  "$SCRIPTS_DIR/apply-mlx-deepseek-v4-kernels.sh" --check
+  # The complete MLX core patch includes the F8_E8M0 loader change. Verify it
+  # only after applying that patch so a clean checkout is never left in the
+  # partial state that the all-or-nothing patch guard correctly rejects.
+  "$SCRIPTS_DIR/apply-mlx-official-fp8-loader.sh"
+fi
+
 # ---------------------------------------------------------------------------
 # Step 4a: Apply MLX C++ / Metal-kernel patches to the resolved mlx-swift checkout
 # ---------------------------------------------------------------------------
 # These patch the EPHEMERAL .build/checkouts/mlx-swift C++ tree (wiped by clean/re-resolve),
 # so they must run AFTER `swift package resolve` and BEFORE the metallib rebuild (which compiles
 # the patched kernels) and `swift build` (which compiles the patched dispatch C++).
+#   - apply-mlx-qmv-wide-backport.sh : mlx#3764 qmv_wide small-batch matvec (spec-decode verify,
+#                                      batch B=2-8). FULL-FILE replacement — MUST run before
+#                                      apply-mlx-cpp-patches.sh, which edits the same files.
 #   - apply-mlx-cpp-patches.sh    : qmv_fast_wide quantized matvec kernels
 #   - apply-mlx-sdpa-backport.sh  : 0.31.3 adaptive-block SDPA (decode@16k ~+10%, correct)
-if $DO_PATCHES; then
+if $DO_PATCHES && $MLX_SWIFT_USES_LEGACY_BACKPORTS; then
+  if [ -x "$SCRIPTS_DIR/apply-mlx-qmv-wide-backport.sh" ]; then
+    log_step "Applying MLX qmv_wide backport (mlx#3764)"
+    "$SCRIPTS_DIR/apply-mlx-qmv-wide-backport.sh"
+  fi
   if [ -x "$SCRIPTS_DIR/apply-mlx-cpp-patches.sh" ]; then
     log_step "Applying MLX C++ kernel patches (qmv_fast_wide)"
     "$SCRIPTS_DIR/apply-mlx-cpp-patches.sh"
@@ -289,6 +327,8 @@ if $DO_PATCHES; then
     log_step "Applying MLX SDPA 0.31.3 adaptive-block backport"
     "$SCRIPTS_DIR/apply-mlx-sdpa-backport.sh"
   fi
+elif $DO_PATCHES; then
+  log_info "Skipping legacy MLX 0.30.3 kernel backports for the active MLX runtime"
 else
   log_warn "Skipping MLX C++ / SDPA patches (--skip-patches)"
 fi
@@ -297,7 +337,7 @@ fi
 # Step 4b: Rebuild the MLX Metal shader library (default.metallib) from source
 # ---------------------------------------------------------------------------
 # IMPORTANT: `swift build` does NOT compile any Metal — it only copies the committed
-# Sources/MacLocalAPI/Resources/default.metallib into the app bundle. The kernel *sources*
+# Sources/AFMKitMLX/Resources/default.metallib into the app bundle. The kernel *sources*
 # live in the resolved mlx-swift dependency (.build/checkouts/mlx-swift), so this step
 # regenerates that binary from source — ensuring the shipped kernels actually match the
 # (possibly patched) kernel tree rather than a stale prebuilt blob.
@@ -316,7 +356,7 @@ if $DO_METALLIB; then
       xcodebuild -downloadComponent MetalToolchain
       "$SCRIPTS_DIR/rebuild-metallib.sh"
     else
-      log_warn "Falling back to the committed prebuilt metallib (Sources/MacLocalAPI/Resources/default.metallib)."
+      log_warn "Falling back to the committed prebuilt metallib (Sources/AFMKitMLX/Resources/default.metallib)."
       log_warn "To build it from source later: xcodebuild -downloadComponent MetalToolchain && ./Scripts/rebuild-metallib.sh"
     fi
   fi
@@ -324,39 +364,44 @@ else
   log_warn "Skipping metallib rebuild (--skip-metallib): using committed prebuilt metallib"
 fi
 
-log_step "Injecting build commit into BuildInfo.swift"
-BUILD_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-BUILDINFO="$ROOT_DIR/Sources/MacLocalAPI/BuildInfo.swift"
-if [ -f "$BUILDINFO" ]; then
-  sed -i '' "s/static let commit: String? = nil/static let commit: String? = \"${BUILD_COMMIT}\"/" "$BUILDINFO"
-  log_info "Commit: $BUILD_COMMIT"
+BUILDINFO="$ROOT_DIR/Sources/AFMKit/BuildInfo.swift"
+BUILDINFO_BACKUP=""
+restore_buildinfo() {
+  if [ -n "$BUILDINFO_BACKUP" ] && [ -f "$BUILDINFO_BACKUP" ]; then
+    cp "$BUILDINFO_BACKUP" "$BUILDINFO"
+    rm -f "$BUILDINFO_BACKUP"
+  fi
+}
+
+if $INCLUDE_BUILD_COMMIT; then
+  log_step "Injecting build commit into BuildInfo.swift"
+  BUILD_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+  if [ -f "$BUILDINFO" ]; then
+    BUILDINFO_BACKUP="$ROOT_DIR/.build/BuildInfo.swift.pre-build"
+    cp "$BUILDINFO" "$BUILDINFO_BACKUP"
+    trap restore_buildinfo EXIT
+    sed -i '' "s/static let commit: String? = nil/static let commit: String? = \"${BUILD_COMMIT}\"/" "$BUILDINFO"
+    log_info "Commit: $BUILD_COMMIT"
+  fi
+else
+  log_step "Building stable version without commit suffix"
 fi
 
 log_step "Building afm ($BUILD_CONFIG)"
 # Disable MemberImportVisibility — async-kit (transitive from Vapor) is missing
 # explicit imports for DequeModule/OrderedCollections, which Swift 6 enforces.
 if [ "$BUILD_CONFIG" = "release" ]; then
-  swift build -c release \
+  "$SCRIPTS_DIR/swiftpm-reliable.sh" build -c release \
     --product afm \
-    -Xswiftc -O \
-    -Xswiftc -whole-module-optimization \
-    -Xswiftc -cross-module-optimization \
     -Xswiftc -disable-upcoming-feature \
     -Xswiftc MemberImportVisibility
 else
-  swift build -c "$BUILD_CONFIG" \
+  "$SCRIPTS_DIR/swiftpm-reliable.sh" build -c "$BUILD_CONFIG" \
     -Xswiftc -disable-upcoming-feature \
     -Xswiftc MemberImportVisibility
 fi
 
-BIN_PATH_1="$ROOT_DIR/.build/arm64-apple-macosx/$BUILD_CONFIG/afm"
-BIN_PATH_2="$ROOT_DIR/.build/$BUILD_CONFIG/afm"
-
-if [ -x "$BIN_PATH_1" ]; then
-  FINAL_BIN="$BIN_PATH_1"
-elif [ -x "$BIN_PATH_2" ]; then
-  FINAL_BIN="$BIN_PATH_2"
-else
+if ! FINAL_BIN="$($SCRIPTS_DIR/find-afm-binary.sh "$BUILD_CONFIG")"; then
   log_error "Build finished but afm binary was not found"
   exit 1
 fi
@@ -366,40 +411,53 @@ if [ "$BUILD_CONFIG" = "release" ]; then
   log_info "Stripped debug symbols"
 fi
 
-# Restore BuildInfo.swift to committed state (keep working tree clean)
-if [ -f "$BUILDINFO" ]; then
-  git checkout -- "$BUILDINFO" 2>/dev/null || true
-fi
+# Restore the exact pre-build file, including legitimate local version edits.
+restore_buildinfo
+trap - EXIT
 
 FINAL_DIR="$(dirname "$FINAL_BIN")"
 
-# Verify the MLX metallib resource bundle is present
-METALLIB_BUNDLE="$FINAL_DIR/MacLocalAPI_MacLocalAPI.bundle/default.metallib"
-if [ -f "$METALLIB_BUNDLE" ]; then
+# Verify the MLX metallib resource bundle is present. SwiftPM uses a flat bundle
+# with some toolchains and a macOS Contents/Resources bundle with Xcode 27.
+METALLIB_BUNDLE_DIR="$FINAL_DIR/MacLocalAPI_AFMKitMLX.bundle"
+if [ -f "$METALLIB_BUNDLE_DIR/default.metallib" ]; then
+  METALLIB_BUNDLE="$METALLIB_BUNDLE_DIR/default.metallib"
+elif [ -f "$METALLIB_BUNDLE_DIR/Contents/Resources/default.metallib" ]; then
+  METALLIB_BUNDLE="$METALLIB_BUNDLE_DIR/Contents/Resources/default.metallib"
+else
+  METALLIB_BUNDLE=""
+fi
+if [ -n "$METALLIB_BUNDLE" ]; then
   log_info "MLX metallib bundle OK ($(du -h "$METALLIB_BUNDLE" | cut -f1 | xargs))"
 else
-  log_error "Missing MLX metallib bundle: $METALLIB_BUNDLE"
+  log_error "Missing MLX metallib bundle under: $METALLIB_BUNDLE_DIR"
   exit 1
 fi
+
+# The selected Xcode may be newer than the package deployment target. Verify
+# both the executable and embedded MLX shaders before anything is packaged.
+"$SCRIPTS_DIR/check-macos26-compatibility.sh" "$FINAL_BIN" "$METALLIB_BUNDLE"
 
 # Verify Info.plist is embedded in the binary's __TEXT,__info_plist section.
 # Without this, macOS 26 SIGABRTs any process that requests privacy-sensitive APIs
 # (Speech Recognition, microphone, camera, etc.) — the Speech transcription feature
 # and any future privacy-API integration will crash on first use.
 # The linker flags in Package.swift (-Xlinker -sectcreate -Xlinker __TEXT
-# -Xlinker __info_plist -Xlinker Sources/MacLocalAPI/Info.plist) must be preserved.
+# -Xlinker __info_plist -Xlinker Sources/AFMCLI/Info.plist) must be preserved.
 INFO_PLIST_SECTION=$(otool -l "$FINAL_BIN" 2>/dev/null | grep -A2 '__info_plist' | head -3)
 if echo "$INFO_PLIST_SECTION" | grep -q '__info_plist'; then
-  if strings "$FINAL_BIN" | grep -q 'NSSpeechRecognitionUsageDescription'; then
+  # No `grep -q` here: -q closes the pipe on first hit, which SIGPIPEs `strings` (exit 141)
+  # and — under `set -o pipefail` — fails the check even though the key IS present.
+  if [ "$(strings "$FINAL_BIN" | grep -c 'NSSpeechRecognitionUsageDescription')" -gt 0 ]; then
     log_info "Info.plist embedded OK (NSSpeechRecognitionUsageDescription present)"
   else
     log_error "Info.plist section present but NSSpeechRecognitionUsageDescription key is missing"
-    log_error "Check Sources/MacLocalAPI/Info.plist — required for Apple Speech Recognition"
+    log_error "Check Sources/AFMCLI/Info.plist — required for Apple Speech Recognition"
     exit 1
   fi
 else
   log_error "Missing __TEXT,__info_plist section in binary"
-  log_error "Check Package.swift linker flags and Sources/MacLocalAPI/Info.plist exists"
+  log_error "Check Package.swift linker flags and Sources/AFMCLI/Info.plist exists"
   log_error "macOS 26 SIGABRTs any process that calls privacy-sensitive APIs without Info.plist"
   exit 1
 fi
@@ -410,16 +468,7 @@ fi
 # Point at the bundle that was ACTUALLY built ($METALLIB_BUNDLE is config-aware via $FINAL_DIR),
 # not a hardcoded release path — a `--debug` build has no release bundle in a clean checkout.
 ln -sf "$METALLIB_BUNDLE" "$ROOT_DIR/default.metallib"
-# Also mirror into the OTHER config's bundle so `swift test` works regardless of which config
-# the tester uses (debug ↔ release), for our own MLXMetalLibrary resolver.
-if [ "$BUILD_CONFIG" = "release" ]; then
-  OTHER_BUNDLE="$ROOT_DIR/.build/arm64-apple-macosx/debug/MacLocalAPI_MacLocalAPI.bundle"
-else
-  OTHER_BUNDLE="$ROOT_DIR/.build/arm64-apple-macosx/release/MacLocalAPI_MacLocalAPI.bundle"
-fi
-mkdir -p "$OTHER_BUNDLE"
-cp "$METALLIB_BUNDLE" "$OTHER_BUNDLE/default.metallib"
-log_info "Metallib available for swift test (symlink -> $BUILD_CONFIG bundle + mirror)"
+log_info "Metallib available for swift test (symlink -> $BUILD_CONFIG bundle)"
 
 # ---------------------------------------------------------------------------
 # Step 6 (optional): Install to /usr/local
@@ -430,7 +479,7 @@ log_info "Metallib available for swift test (symlink -> $BUILD_CONFIG bundle + m
 # root-owned, so writes escalate with sudo only when it isn't already writable.
 if $DO_INSTALL; then
   log_step "Installing afm to $INSTALL_PREFIX/bin"
-  BUNDLE_SRC="$FINAL_DIR/MacLocalAPI_MacLocalAPI.bundle"
+  BUNDLE_SRC="$METALLIB_BUNDLE_DIR"
   WEBUI_SRC="$ROOT_DIR/Resources/webui/index.html.gz"
 
   SUDO=""
@@ -446,10 +495,10 @@ if $DO_INSTALL; then
   # Keep the bundle in libexec and symlink it next to the binary — this mirrors
   # the Homebrew formula and avoids macOS code-signing stripping a bundle placed
   # directly in bin.
-  $SUDO rm -rf "$INSTALL_PREFIX/libexec/afm/MacLocalAPI_MacLocalAPI.bundle"
-  $SUDO cp -R "$BUNDLE_SRC" "$INSTALL_PREFIX/libexec/afm/MacLocalAPI_MacLocalAPI.bundle"
-  $SUDO ln -sfn "$INSTALL_PREFIX/libexec/afm/MacLocalAPI_MacLocalAPI.bundle" \
-    "$INSTALL_PREFIX/bin/MacLocalAPI_MacLocalAPI.bundle"
+  $SUDO rm -rf "$INSTALL_PREFIX/libexec/afm/MacLocalAPI_AFMKitMLX.bundle"
+  $SUDO cp -R "$BUNDLE_SRC" "$INSTALL_PREFIX/libexec/afm/MacLocalAPI_AFMKitMLX.bundle"
+  $SUDO ln -sfn "$INSTALL_PREFIX/libexec/afm/MacLocalAPI_AFMKitMLX.bundle" \
+    "$INSTALL_PREFIX/bin/MacLocalAPI_AFMKitMLX.bundle"
 
   if [ -f "$WEBUI_SRC" ]; then
     $SUDO install -m 644 "$WEBUI_SRC" "$INSTALL_PREFIX/share/afm/webui/index.html.gz"

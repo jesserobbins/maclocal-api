@@ -31,8 +31,8 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
-AFM_BINARY = REPO_ROOT / ".build" / "arm64-apple-macosx" / "release" / "afm"
-REPORT_DIR = SCRIPT_DIR / "results"
+AFM_BINARY = Path(os.environ.get("AFM_BINARY", REPO_ROOT / ".build" / "arm64-apple-macosx" / "release" / "afm"))
+REPORT_DIR = Path(os.environ.get("AFM_REPORT_DIR", SCRIPT_DIR / "results"))
 MODEL_CACHE = os.environ.get("MACAFM_MLX_MODEL_CACHE", str(Path.home() / ".cache" / "macafm" / "models"))
 DEFAULT_MODEL = "mlx-community/Qwen3.5-35B-A3B-4bit"
 DEFAULT_TOKENIZER = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
@@ -378,7 +378,10 @@ def main() -> int:
         results.append(run_openai_python_stream(args.base_url, args.model))
         results.append(run_openai_python_nonstream_logprobs(args.base_url, args.model))
         results.append(run_openai_python_stream_logprobs(args.base_url, args.model))
-        results.append(run_vllm_bench(args.base_url[:-3] if args.base_url.endswith("/v1") else args.base_url, args.model, args.tokenizer))
+        if __import__("shutil").which("vllm"):
+            results.append(run_vllm_bench(args.base_url[:-3] if args.base_url.endswith("/v1") else args.base_url, args.model, args.tokenizer))
+        else:
+            log("Skipping vllm bench (vllm not installed) — optional external comparison")
 
         ok = all(item["ok"] for item in results)
         report_name = args.report_name or f"openai-compat-evals-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.json"

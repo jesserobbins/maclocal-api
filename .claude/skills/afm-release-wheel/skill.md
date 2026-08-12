@@ -19,6 +19,8 @@ Build a PyPI-distributable wheel from an existing compiled `afm` binary and prov
 
 ### Step 1: Ask Target Registry
 
+> **The maintainer has a TestPyPI account set up** (separate login from production PyPI, 2FA + API token). So TestPyPI validation is always available — default to recommending it for any first upload of a new version before production. The token is supplied at publish time (`--token`, `UV_PUBLISH_TOKEN`, or `~/.pypirc`); don't assume it's hardcoded anywhere.
+
 Use AskUserQuestion:
 
 **Question:** "Which PyPI registry should this wheel target?"
@@ -65,7 +67,7 @@ ls -lh "$BIN"
 Also locate required assets:
 ```bash
 # Metallib
-METALLIB="$(dirname "$BIN")/MacLocalAPI_MacLocalAPI.bundle/default.metallib"
+METALLIB="$(dirname "$BIN")/MacLocalAPI_AFMKit.bundle/default.metallib"
 test -f "$METALLIB" && echo "Metallib: OK ($(ls -lh "$METALLIB" | awk '{print $5}'))" || echo "WARNING: No metallib found"
 
 # WebUI (MANDATORY)
@@ -73,7 +75,7 @@ test -f Resources/webui/index.html.gz && echo "WebUI: OK" || echo "FATAL: WebUI 
 
 # Info.plist embedded with NSSpeechRecognitionUsageDescription (MANDATORY for macOS 26)
 # Wheel users get a crash on `afm speech` / POST /v1/audio/transcriptions / chat input_audio
-# if the binary doesn't have this key embedded. See Sources/MacLocalAPI/Info.plist +
+# if the binary doesn't have this key embedded. See Sources/AFMCLI/Info.plist +
 # Package.swift -Xlinker -sectcreate flags.
 if otool -l "$BIN" | grep -q '__info_plist' && strings "$BIN" | grep -q 'NSSpeechRecognitionUsageDescription'; then
   echo "Info.plist: OK (NSSpeechRecognitionUsageDescription embedded)"

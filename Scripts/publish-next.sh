@@ -90,13 +90,13 @@ DATE=$(date -u +%Y%m%d)
 if [ -n "$USER_VERSION" ]; then
   BASE_VERSION="$USER_VERSION"
 else
-  BUILDINFO="$ROOT_DIR/Sources/MacLocalAPI/BuildInfo.swift"
+  BUILDINFO="$ROOT_DIR/Sources/AFMKit/BuildInfo.swift"
   if [ -f "$BUILDINFO" ]; then
     BASE_VERSION=$(grep 'static let version' "$BUILDINFO" | sed 's/.*"\(.*\)".*/\1/' | sed 's/^v//')
   fi
   BASE_VERSION="${BASE_VERSION:-0.0.0}"
 fi
-VERSION="${BASE_VERSION}-next.${SHORT_SHA}.${DATE}"
+VERSION="${BASE_VERSION}-next.${DATE}.${SHORT_SHA}"
 
 log_info "Building afm-next"
 log_info "  Commit: ${SHORT_SHA}"
@@ -121,6 +121,15 @@ if [ ! -x "$BIN" ]; then
   exit 1
 fi
 log_info "Binary: $BIN"
+MLX_METALLIB="$(dirname "$BIN")/MacLocalAPI_AFMKitMLX.bundle/default.metallib"
+if [ ! -f "$MLX_METALLIB" ]; then
+  MLX_METALLIB="$(dirname "$BIN")/MacLocalAPI_AFMKitMLX.bundle/Contents/Resources/default.metallib"
+fi
+if [ ! -f "$MLX_METALLIB" ]; then
+  log_error "Required MLX metallib missing beside release binary"
+  exit 1
+fi
+"$SCRIPT_DIR/check-macos26-compatibility.sh" "$BIN" "$MLX_METALLIB"
 
 # Step 3: Package
 log_info "Creating release package..."
@@ -130,12 +139,17 @@ mkdir -p "$STAGING"
 
 cp "$BIN" "$STAGING/"
 
-# Metallib resource bundle
-BUNDLE_DIR="$(dirname "$BIN")/MacLocalAPI_MacLocalAPI.bundle"
-if [ -d "$BUNDLE_DIR" ]; then
+# Runtime resource bundles. Both must remain beside the relocated executable:
+# MLX supplies its compiled Metal library and DwarfStar supplies Metal sources.
+for BUNDLE_NAME in MacLocalAPI_AFMKitMLX.bundle MacLocalAPI_AFMKitDwarfStar.bundle; do
+  BUNDLE_DIR="$(dirname "$BIN")/$BUNDLE_NAME"
+  if [ ! -d "$BUNDLE_DIR" ]; then
+    log_error "Required runtime bundle missing: $BUNDLE_DIR"
+    exit 1
+  fi
   cp -r "$BUNDLE_DIR" "$STAGING/"
-  log_info "Included metallib bundle"
-fi
+  log_info "Included runtime bundle: $BUNDLE_NAME"
+done
 
 # WebUI
 if [ -f "$ROOT_DIR/Resources/webui/index.html.gz" ]; then
@@ -150,6 +164,12 @@ cp "$ROOT_DIR/LICENSE" "$STAGING/" 2>/dev/null || true
 TARBALL="$ROOT_DIR/afm-next-arm64.tar.gz"
 tar -czf "$TARBALL" -C "$STAGING" .
 log_info "Tarball: $TARBALL ($(du -h "$TARBALL" | cut -f1 | xargs))"
+shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
+
+# Exercise the relocated payload before publishing it. This catches missing
+# SwiftPM resource bundles while the candidate is still local.
+"$STAGING/afm" --version
+"$STAGING/afm" --help | grep -q 'mlx'
 
 # Step 4: Generate changelog
 log_info "Generating changelog..."
@@ -202,7 +222,7 @@ brew reinstall afm-next                  # force reinstall (same version, new bu
 #### pip
 
 \`\`\`bash
-pip install --extra-index-url https://kruks.ai/afm/wheels/simple/ macafm-next
+pip install --extra-index-url https://maclocal-ai.pages.dev/afm/wheels/simple/ macafm-next
 \`\`\`
 
 #### Switching between stable and nightly
@@ -214,13 +234,14 @@ brew unlink afm-next && brew link afm                      # switch back to stab
 
 # pip
 pip install macafm          # stable
-pip install --extra-index-url https://kruks.ai/afm/wheels/simple/ macafm-next   # nightly
+pip install --extra-index-url https://maclocal-ai.pages.dev/afm/wheels/simple/ macafm-next   # nightly
 \`\`\`
 EOF
 )" \
   --target main \
   --repo "$REPO" \
-  "$TARBALL"
+  "$TARBALL" \
+  "$TARBALL.sha256"
 
 log_info "Release uploaded: $RELEASE_TAG"
 
@@ -281,4 +302,4 @@ echo ""
 log_info "Done! afm-next ${VERSION} published."
 echo "  Install (Homebrew): brew install scouzi1966/afm/afm-next"
 echo "  Upgrade (Homebrew): brew upgrade afm-next"
-echo "  Install (pip):      pip install --extra-index-url https://kruks.ai/afm/wheels/simple/ macafm-next"
+echo "  Install (pip):      pip install --extra-index-url https://maclocal-ai.pages.dev/afm/wheels/simple/ macafm-next"

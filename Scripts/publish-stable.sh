@@ -100,7 +100,7 @@ log_info "  Tap: ${TAP_DIR}"
 # Step 1: Build
 if $DO_BUILD; then
   log_info "Running build-from-scratch.sh..."
-  "$SCRIPT_DIR/build-from-scratch.sh"
+  "$SCRIPT_DIR/build-from-scratch.sh" --stable
 else
   log_warn "Skipping build (--skip-build)"
 fi
@@ -115,6 +115,18 @@ if [ ! -x "$BIN" ]; then
   exit 1
 fi
 log_info "Binary: $BIN"
+"$SCRIPT_DIR/check-macos26-compatibility.sh" "$BIN"
+
+# Stable release binaries must expose only the semantic version. Commit
+# suffixes are reserved for development and nightly builds.
+EXPECTED_VERSION="v${VERSION}"
+ACTUAL_VERSION=$("$BIN" --version)
+if [ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]; then
+  log_error "Stable binary version mismatch: expected '$EXPECTED_VERSION', got '$ACTUAL_VERSION'"
+  log_error "Rebuild with: ./Scripts/build-from-scratch.sh --stable"
+  exit 1
+fi
+log_info "Stable version verified: $ACTUAL_VERSION"
 
 # Step 3: Package
 log_info "Creating release package..."
@@ -124,12 +136,16 @@ mkdir -p "$STAGING"
 
 cp "$BIN" "$STAGING/"
 
-# Metallib resource bundle
-BUNDLE_DIR="$(dirname "$BIN")/MacLocalAPI_MacLocalAPI.bundle"
-if [ -d "$BUNDLE_DIR" ]; then
+# Runtime resource bundles. Both must remain beside the relocated executable.
+for BUNDLE_NAME in MacLocalAPI_AFMKitMLX.bundle MacLocalAPI_AFMKitDwarfStar.bundle; do
+  BUNDLE_DIR="$(dirname "$BIN")/$BUNDLE_NAME"
+  if [ ! -d "$BUNDLE_DIR" ]; then
+    log_error "Required runtime bundle missing: $BUNDLE_DIR"
+    exit 1
+  fi
   cp -r "$BUNDLE_DIR" "$STAGING/"
-  log_info "Included metallib bundle"
-fi
+  log_info "Included runtime bundle: $BUNDLE_NAME"
+done
 
 # WebUI
 if [ -f "$ROOT_DIR/Resources/webui/index.html.gz" ]; then
@@ -233,8 +249,18 @@ log_info "Staging assets into macafm/ for Python package..."
 mkdir -p "$ROOT_DIR/macafm/bin"
 cp "$BIN" "$ROOT_DIR/macafm/bin/"
 
+for BUNDLE_NAME in MacLocalAPI_AFMKitMLX.bundle MacLocalAPI_AFMKitDwarfStar.bundle; do
+  BUNDLE_DIR="$(dirname "$BIN")/$BUNDLE_NAME"
+  if [ ! -d "$BUNDLE_DIR" ]; then
+    log_error "Required runtime bundle missing: $BUNDLE_DIR"
+    exit 1
+  fi
+  cp -R "$BUNDLE_DIR" "$ROOT_DIR/macafm/bin/"
+  log_info "  Staged $BUNDLE_NAME"
+done
+
 # Metallib
-METALLIB="$(dirname "$BIN")/MacLocalAPI_MacLocalAPI.bundle/default.metallib"
+METALLIB="$(dirname "$BIN")/MacLocalAPI_AFMKitMLX.bundle/default.metallib"
 if [ -f "$METALLIB" ]; then
   cp "$METALLIB" "$ROOT_DIR/macafm/bin/"
   log_info "  Staged default.metallib"

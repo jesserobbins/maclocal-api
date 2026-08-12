@@ -48,8 +48,8 @@ If the version shows only a base version without a SHA suffix (e.g., `v0.9.8` in
 BIN_DIR="$(dirname "$BIN_ABS")"
 
 # Check for metallib in either location (SPM bundle or loose file)
-if [ -f "$BIN_DIR/MacLocalAPI_MacLocalAPI.bundle/default.metallib" ]; then
-  echo "PASS: Metallib in SPM bundle ($(du -h "$BIN_DIR/MacLocalAPI_MacLocalAPI.bundle/default.metallib" | cut -f1))"
+if [ -f "$BIN_DIR/MacLocalAPI_AFMKit.bundle/default.metallib" ]; then
+  echo "PASS: Metallib in SPM bundle ($(du -h "$BIN_DIR/MacLocalAPI_AFMKit.bundle/default.metallib" | cut -f1))"
 elif [ -f "$BIN_DIR/default.metallib" ]; then
   echo "PASS: Loose metallib ($(du -h "$BIN_DIR/default.metallib" | cut -f1))"
 else
@@ -65,8 +65,8 @@ TMPDIR=$(mktemp -d)
 cp "$BIN_ABS" "$TMPDIR/"
 
 # Copy metallib as loose file (pip wheel layout)
-if [ -f "$BIN_DIR/MacLocalAPI_MacLocalAPI.bundle/default.metallib" ]; then
-  cp "$BIN_DIR/MacLocalAPI_MacLocalAPI.bundle/default.metallib" "$TMPDIR/"
+if [ -f "$BIN_DIR/MacLocalAPI_AFMKit.bundle/default.metallib" ]; then
+  cp "$BIN_DIR/MacLocalAPI_AFMKit.bundle/default.metallib" "$TMPDIR/"
 elif [ -f "$BIN_DIR/default.metallib" ]; then
   cp "$BIN_DIR/default.metallib" "$TMPDIR/"
 fi
@@ -110,7 +110,7 @@ if otool -l "$BIN_ABS" | grep -q '__info_plist'; then
   echo "PASS: __info_plist section present"
 else
   echo "FAIL: Missing __TEXT,__info_plist section"
-  echo "Check Package.swift linker flags and Sources/MacLocalAPI/Info.plist"
+  echo "Check Package.swift linker flags and Sources/AFMCLI/Info.plist"
 fi
 
 # Verify NSSpeechRecognitionUsageDescription key is in the embedded plist
@@ -155,7 +155,7 @@ Use AskUserQuestion with **multiSelect: true**. Present these options:
 | Option | Script | Server? | Port | Runtime | What it tests |
 |--------|--------|---------|------|---------|---------------|
 | **All** | (runs everything below) | — | — | ~3-4 hours | Complete validation |
-| **Unit tests** | `swift test` | No | — | ~5s | 261 Swift unit tests (XML parsing, batch scheduler, KV cache, etc.) |
+| **Unit tests** | `Scripts/swiftpm-reliable.sh test` | No | — | ~5s | Swift unit tests (XML parsing, batch scheduler, KV cache, etc.) |
 | **Assertions (smoke)** | `test-assertions.sh --tier smoke` | Yes | 9998 | ~2 min | Server reachable, basic completion, stop, logprobs, think, tools, errors |
 | **Assertions (standard)** | `test-assertions.sh --tier standard` | Yes | 9998 | ~5 min | + streaming, cache, concurrent, kwargs, XML tools, adaptive XML, grammar, batch |
 | **Assertions (full)** | `test-assertions.sh --tier full` | Yes | 9998 | ~15 min | + performance (TTFT, tok/s, long context 2K/4K tokens) |
@@ -188,7 +188,7 @@ export MACAFM_MLX_MODEL_CACHE=/Volumes/edata/models/vesta-test-cache
 
 | Test | Command |
 |------|---------|
-| Unit tests | `swift test` |
+| Unit tests | `Scripts/swiftpm-reliable.sh test` |
 | Assertions (any tier) | Start server: `MACAFM_MLX_MODEL_CACHE=... $BIN_ABS mlx -m MODEL --port 9998 --tool-call-parser afm_adaptive_xml --enable-prefix-caching --enable-grammar-constraints &` then `./Scripts/test-assertions.sh --tier TIER --model MODEL --port 9998 --bin "$BIN_ABS" --grammar-constraints` |
 | Assertions + grammar + forced | `./Scripts/test-assertions-multi.sh --models "MODEL" --tier full --also-forced-parser qwen3_xml --grammar-constraints` with `AFM_BINARY="$BIN_ABS"` |
 | Smart analysis | `AFM_BIN="$BIN_ABS" ./Scripts/mlx-model-test.sh --model MODEL --prompts Scripts/test-llm-comprehensive.txt --smart 1:claude` |

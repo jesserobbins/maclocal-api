@@ -10,20 +10,37 @@ The server exposes `/v1/chat/completions` and `/v1/models` endpoints compatible 
 
 ## Project Structure
 
+The package vends **two SPM products**: a `.library(AFMKit)` (headless, importable
+`import AFMKit`) and a `.executable(afm)` thin CLI. Library import is proven by
+`Examples/AFMKitConsumer`. (The clean Vapor-free `AFMServer` split is a tracked follow-up —
+today AFMKit also contains the server.)
+
 ```
-Sources/MacLocalAPI/
-├── main.swift                          # CLI entry point (ArgumentParser)
-├── Controllers/
-│   ├── MLXChatCompletionsController.swift  # Streaming/non-streaming SSE handler
-│   └── ...
-├── Models/
-│   ├── MLXModelService.swift           # Model loading, generation, prompt caching
-│   ├── OpenAIRequest.swift             # Request types (ChatCompletionRequest, etc.)
-│   ├── OpenAIResponse.swift            # Response types
-│   └── ...
+Sources/
+├── AFMKit/                             # LIBRARY target (importable via SPM)
+│   ├── AFMEngine.swift                 # Public facade: AFMEngine actor + EngineConfig/GenerationConfig/AFMResponse
+│   ├── AFMLanguageModel.swift          # WWDC26-shaped provider protocol (AFMEngine conforms)
+│   ├── Server.swift                    # Vapor HTTP server (currently in AFMKit)
+│   ├── Controllers/
+│   │   ├── MLXChatCompletionsController.swift  # Streaming/non-streaming SSE handler
+│   │   └── ...
+│   ├── Models/
+│   │   ├── MLXModelService.swift       # Model loading, generation, prompt caching
+│   │   ├── OpenAIRequest.swift         # Request types (ChatCompletionRequest, etc.)
+│   │   ├── OpenAIResponse.swift        # Response types
+│   │   └── ...
+│   ├── BuildInfo.swift                 # version string (SHA injected by build.sh)
+│   └── Resources/default.metallib      # MLX Metal kernels → bundle MacLocalAPI_AFMKitMLX.bundle
+├── AFMCLI/                             # EXECUTABLE target (product name: afm)
+│   ├── main.swift                      # CLI entry point (ArgumentParser)
+│   ├── {Mlx,Serve,Vision,Speech,Embeddings}Command.swift
+│   └── Info.plist                      # embedded into the binary (privacy usage descriptions)
+Examples/AFMKitConsumer/                # standalone SPM package proving `import AFMKit`
+docs/wwdc26-migration.md                # WWDC26 Foundation Models adoption seam map
 vendor/
 ├── mlx-swift-lm/                       # Git submodule — DO NOT modify directly
 ├── llama.cpp/                          # Git submodule
+├── ds4/                                # Canonical antirez/ds4 submodule
 Scripts/
 ├── patches/                            # Our patches to vendor code (copied over originals)
 ├── apply-mlx-patches.sh                # Applies patches from Scripts/patches/ to vendor/
@@ -41,13 +58,32 @@ The patch script (`Scripts/apply-mlx-patches.sh`) copies complete Swift files fr
 
 Commands: `--check` (verify), `--revert` (restore originals), no flag (apply).
 
+### DwarfStar dependency boundary
+
+`vendor/ds4` is pinned directly to canonical `https://github.com/antirez/ds4.git`.
+Do not point the submodule at an AFM fork, patch its loader, sampler, cache, or
+Metal kernels, or require a DS4 pull request for AFM integration. Keep interface
+adaptations in `Sources/CDwarfStar` and `Sources/AFMKitDwarfStar` using the
+public upstream C API. `Scripts/swiftpm-reliable.sh` fingerprints the pinned
+submodule revision to prevent Xcode's native driver from reusing stale C objects.
+
 ### MLX C++ / Metal-kernel patches (separate from the Swift patch set)
 
 The Swift patches above target the `vendor/mlx-swift-lm` submodule. The low-level MLX **C++/Metal**
 code lives in a *different* tree — the `mlx-swift` remote SwiftPM dependency at
-`.build/checkouts/mlx-swift` (ephemeral; wiped by `swift package clean`/re-resolve). Two scripts
+`.build/checkouts/mlx-swift` (ephemeral; wiped by `swift package clean`/re-resolve). Three scripts
 patch it, applied by `build.sh` after `swift package resolve` and before the metallib rebuild:
 
+- `Scripts/apply-mlx-qmv-wide-backport.sh` — backports mlx **PR #3764's `qmv_wide`** small-batch
+  quantized matvec (affine int4/int8 only, GPU gen 15+): each weight group is dequantized once and
+  reused across streamed input vectors. Gated to **M ≥ 3** (not upstream's 2) so the MTP/EAGLE3
+  M=2 verify forwards stay on the same kernel as M=1 decode (M=2 near-tie logit shifts measurably
+  cut MTP acceptance and shifted greedy trajectories). Measured on Qwen3.6-27B-4bit/M4 Pro:
+  **batch B=4 +32%, B=8 +29% aggregate decode; MTP and single-stream bit-identical/unchanged**.
+  Source files in `Scripts/patches/mlx-cpp-qmv-wide/`. Quantized kernels are JIT-compiled from
+  `mlx-generated/quantized.cpp` (the runtime-authoritative copy this script also patches) — no
+  metallib rebuild needed for this one. FULL-FILE replacement: **must run BEFORE
+  apply-mlx-cpp-patches.sh** (build.sh enforces the order; the script refuses to apply out of order).
 - `Scripts/apply-mlx-cpp-patches.sh` — `qmv_fast_wide` quantized matvec kernels.
 - `Scripts/apply-mlx-sdpa-backport.sh` — backports mlx-swift **0.31.3's adaptive-block 2-pass SDPA**
   into the pinned 0.30.3 tree. 0.30.3 hardcodes the split-K count `blocks=32`; 0.31.3 makes it a
@@ -70,12 +106,27 @@ swift build -c release                   # Release build
 ### MLX Metal shader library (`default.metallib`)
 
 `swift build` does **NOT** compile any Metal. The MLX kernels ship as a prebuilt
-`Sources/MacLocalAPI/Resources/default.metallib` (committed to git) that `swift build` only
+`Sources/AFMKitMLX/Resources/default.metallib` (committed to git) that `swift build` only
 copies into the app bundle. The kernel *sources* live in the resolved `mlx-swift` dependency
 (`.build/checkouts/mlx-swift/.../kernels/*.metal`), so editing a kernel (e.g. `sdpa_vector.h`)
 has **zero effect** until the metallib is regenerated. (Editing the dispatch C++ in
 `scaled_dot_product_attention.cpp` *does* recompile — so a kernel/dispatch mismatch silently
 produces garbage at every context length.)
+
+All SwiftPM test invocations must use `Scripts/swiftpm-reliable.sh test`. The
+wrapper stages this canonical committed metallib beside every XCTest executable
+before each build/run attempt, which is where MLX's C++ runtime searches. It
+also exports `MACAFM_MLX_METALLIB` for AFMKit's locator.
+The same wrapper fingerprints `vendor/mlx-swift-lm` and removes stale compiled
+products when those sources change; Xcode 27 Beta 3 can otherwise report a
+successful no-op build after applying a Swift or custom-Metal kernel patch.
+The package manifest compiles that vendor directly whenever its submodule is
+initialized; only submodule-free downstream clones resolve the pinned URL fork.
+Use `Scripts/check-mlx-source-selection.sh` to enforce this invariant after
+dependency or manifest changes.
+Explicit overrides remain supported for metallib qualification.
+The release assertion harness delegates to this wrapper too. Never replace it
+with raw `swift test` or use a one-off metallib override as a workflow fix.
 
 `./build.sh` regenerates the metallib from source as step 4b via `Scripts/rebuild-metallib.sh`
 (compiles the pinned kernel set, links with `metal -o`, verifies kernel-symbol parity, installs).
@@ -233,6 +284,35 @@ When running tests autonomously (Claude Code, Codex, or other AI agents):
 | Promptfoo Agentic | `./Scripts/feature-promptfoo-agentic/run-promptfoo-agentic.sh` | 137 cases across 16 configs |
 | Batch Validation | `./Scripts/feature-mlx-concurrent-batch/validate_responses.py` | Known-answer correctness at B=1,2,4,8 |
 | Smart Analysis | `./Scripts/mlx-model-test.sh` | AI-judge quality scoring |
+
+### Publishing Release Test Artifacts
+
+Keep bulky release-validation reports available without adding them to Git history by publishing one curated archive as an optional GitHub Release asset. Release assets are not included in clones, source archives, Homebrew installs, or pip installs.
+
+1. Select final reports, raw results needed to support the release conclusions, relevant baseline comparisons, and test logs. Exclude caches, generated bytecode, secrets, and redundant intermediate runs.
+2. Stage the selected files under `/tmp/afm-v<VERSION>-test-reports-staging/`. Add a `README.md` that records the test date, summary totals, known failures, baseline identity, and an inventory of the bundle.
+3. Create and verify the archive outside the repository:
+
+   ```bash
+   tar -czf /tmp/afm-v<VERSION>-test-reports.tar.gz \
+     -C /tmp/afm-v<VERSION>-test-reports-staging README.md test-reports
+   shasum -a 256 /tmp/afm-v<VERSION>-test-reports.tar.gz
+   tar -tzf /tmp/afm-v<VERSION>-test-reports.tar.gz
+   ```
+
+4. Confirm that an asset with the same name does not already exist, upload it, and verify the live digest:
+
+   ```bash
+   gh release view v<VERSION> --repo scouzi1966/maclocal-api --json assets
+   gh release upload v<VERSION> /tmp/afm-v<VERSION>-test-reports.tar.gz \
+     --repo scouzi1966/maclocal-api
+   gh release view v<VERSION> --repo scouzi1966/maclocal-api \
+     --json url,assets
+   ```
+
+5. Keep the reports untracked; do not commit the archive or generated report set. Users can find the optional bundle by opening the GitHub release page and expanding **Assets**.
+
+Use GitHub Actions artifacts only for temporary CI output because they expire. If reports must be browsable as permanent HTML, publish them from a separate reports repository with GitHub Pages rather than another branch in this repository.
 
 ## Coding Rules
 

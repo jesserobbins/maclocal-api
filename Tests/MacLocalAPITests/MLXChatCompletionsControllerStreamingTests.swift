@@ -2,7 +2,8 @@ import XCTest
 import Vapor
 import XCTVapor
 
-@testable import MacLocalAPI
+@testable import AFMKit
+@testable import AFMServer
 
 final class MLXChatCompletionsControllerStreamingTests: XCTestCase {
 // dimensions: streaming=true, execution=serial
@@ -47,6 +48,74 @@ final class MLXChatCompletionsControllerStreamingTests: XCTestCase {
         }
     }
 
+    func testStreamingControllerParsesDeepseekDSMLWithoutAdvertisedToolTags() async throws {
+        let service = FakeMLXChatService(
+            streamingResult: makeStreamingResult(
+                chunks: [
+                    StreamChunk(text: "\n\n"),
+                    StreamChunk(text: "<｜DSML｜"),
+                    StreamChunk(text: "tool"),
+                    StreamChunk(text: "_c"),
+                    StreamChunk(text: "alls>\n"),
+                    StreamChunk(text: "<｜DSML｜invoke name=\"get_weather\">\n"),
+                    StreamChunk(text: "<｜DSML｜parameter name=\"location\" string=\"true\">Toronto</｜DSML｜parameter>\n"),
+                    StreamChunk(text: "</｜DSML｜invoke>\n</｜DSML｜tool_calls>"),
+                    StreamChunk(text: "", promptTokens: 415, completionTokens: 44, cachedTokens: 0, promptTime: 1.5, generateTime: 1.8),
+                ],
+                toolCallStartTag: nil,
+                toolCallEndTag: nil
+            )
+        )
+        try MLXChatCompletionsController(
+            modelID: "test-model",
+            service: service,
+            temperature: nil,
+            repetitionPenalty: nil
+        ).boot(routes: app)
+
+        let body = try requestBody(stream: true, toolChoiceJSON: "\"required\"")
+        try await app.testable(method: .running(port: 0)).test(
+            .POST,
+            "/v1/chat/completions",
+            headers: requestHeaders(for: body),
+            body: body
+        ) { res async in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertContains(res.body.string, "\"tool_calls\"")
+            XCTAssertContains(res.body.string, "\"get_weather\"")
+            XCTAssertContains(res.body.string, "\\\"location\\\":\\\"Toronto\\\"")
+            XCTAssertContains(res.body.string, "\"finish_reason\":\"tool_calls\"")
+            XCTAssertFalse(res.body.string.contains("DSML"))
+        }
+    }
+
+    func testRawOutputPreservesStructuralTagsAtGenerationSource() async throws {
+        let service = FakeMLXChatService(
+            streamingResult: makeStreamingResult(chunks: [
+                StreamChunk(text: "<|START_TEXT|>answer<|END_TEXT|>"),
+                StreamChunk(text: "", promptTokens: 4, completionTokens: 3, cachedTokens: 0, promptTime: 0.01, generateTime: 0.01),
+            ])
+        )
+        try MLXChatCompletionsController(
+            modelID: "test-model",
+            service: service,
+            temperature: nil,
+            repetitionPenalty: nil,
+            rawOutput: true
+        ).boot(routes: app)
+
+        let body = try requestBody(stream: true)
+        var headers = HTTPHeaders()
+        headers.contentType = .json
+        headers.replaceOrAdd(name: .contentLength, value: body.readableBytes.description)
+
+        try await app.testable(method: .running(port: 0)).test(.POST, "/v1/chat/completions", headers: headers, body: body) { res async in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertContains(res.body.string, "<|START_TEXT|>answer<|END_TEXT|>")
+        }
+        XCTAssertEqual(service.recordedPreserveStructuralTags, [true])
+    }
+
     func testStreamingControllerSerializesCompletedBatchToolCalls() async throws {
         let toolCall = ResponseToolCall(
             index: 0,
@@ -82,6 +151,51 @@ final class MLXChatCompletionsControllerStreamingTests: XCTestCase {
             XCTAssertContains(res.body.string, "\"read_file\"")
             XCTAssertContains(res.body.string, "\\\"path\\\":\\\"README.md\\\"")
             XCTAssertContains(res.body.string, "\"index\":0")
+            XCTAssertContains(res.body.string, "\"finish_reason\":\"tool_calls\"")
+        }
+    }
+
+    func testStreamingControllerDoesNotDuplicateVendorCallAfterRawXMLStart() async throws {
+        let vendorCall = ResponseToolCall(
+            index: 0,
+            id: "call_vendor",
+            type: "function",
+            function: ResponseToolCallFunction(
+                name: "get_weather",
+                arguments: #"{"location":"Berlin"}"#
+            )
+        )
+        let service = FakeMLXChatService(
+            toolCallParser: "afm_adaptive_xml",
+            streamingResult: makeStreamingResult(chunks: [
+                StreamChunk(text: "<tool_call>"),
+                StreamChunk(text: "<function=get_weather>"),
+                StreamChunk(text: "<parameter=location>Berlin</parameter>"),
+                StreamChunk(text: "", toolCalls: [vendorCall]),
+                StreamChunk(text: "</tool_call>"),
+                StreamChunk(text: "", promptTokens: 20, completionTokens: 5, cachedTokens: 0, promptTime: 0.03, generateTime: 0.02),
+            ])
+        )
+        try MLXChatCompletionsController(
+            modelID: "test-model",
+            service: service,
+            temperature: nil,
+            repetitionPenalty: nil
+        ).boot(routes: app)
+
+        let body = try requestBody(stream: true)
+        try await app.testable(method: .running(port: 0)).test(
+            .POST,
+            "/v1/chat/completions",
+            headers: requestHeaders(for: body),
+            body: body
+        ) { res async in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertEqual(
+                res.body.string.components(separatedBy: #"\"location\":\"Berlin\""#).count - 1,
+                1,
+                "the vendor completion must not repeat arguments already owned by the raw XML runtime"
+            )
             XCTAssertContains(res.body.string, "\"finish_reason\":\"tool_calls\"")
         }
     }
@@ -133,6 +247,11 @@ final class MLXChatCompletionsControllerStreamingTests: XCTestCase {
             XCTAssertContains(res.body.string, "\"id\":\"call_batch\"")
             XCTAssertContains(res.body.string, "\"name\":\"read_file\"")
             XCTAssertContains(res.body.string, "\\\"path\\\":\\\"README.md\\\"")
+            XCTAssertEqual(
+                res.body.string.components(separatedBy: "\\\"path\\\":\\\"README.md\\\"").count - 1,
+                1,
+                "completed batch tool calls must not repeat arguments already emitted as deltas"
+            )
             XCTAssertContains(res.body.string, "\"finish_reason\":\"tool_calls\"")
         }
     }
@@ -264,6 +383,7 @@ final class MLXChatCompletionsControllerStreamingTests: XCTestCase {
         }
 
         XCTAssertEqual(service.recordedStreamingToolNames.first, ["read_file"])
+        XCTAssertEqual(service.recordedStreamingToolChoices.first, "function:read_file")
     }
 
     func testNonStreamingControllerNarrowsToolsToNamedFunctionChoiceBeforeGeneration() async throws {
@@ -302,6 +422,7 @@ final class MLXChatCompletionsControllerStreamingTests: XCTestCase {
         }
 
         XCTAssertEqual(service.recordedGenerateToolNames.first, ["read_file"])
+        XCTAssertEqual(service.recordedGenerateToolChoices.first, "function:read_file")
     }
 
     func testNamedFunctionChoiceMissingFromToolsReturnsBadRequest() async throws {
@@ -577,11 +698,41 @@ final class MLXChatCompletionsControllerStreamingTests: XCTestCase {
         return headers
     }
 
-    private func makeStreamingResult(chunks: [StreamChunk]) -> ChatStreamingResult {
+    private func makeStreamingResult(chunks: [StreamChunk]) -> AFMMLXChatStreamingResult {
         Self.makeDelayedStreamingResult(modelID: "test-model", chunks: chunks, delayNanoseconds: nil)
     }
 
-    private static func makeDelayedStreamingResult(modelID: String, chunks: [StreamChunk], delayNanoseconds: UInt64?) -> ChatStreamingResult {
+    private func makeStreamingResult(
+        chunks: [StreamChunk],
+        toolCallStartTag: String?,
+        toolCallEndTag: String?
+    ) -> AFMMLXChatStreamingResult {
+        Self.makeDelayedStreamingResult(
+            modelID: "test-model",
+            chunks: chunks,
+            delayNanoseconds: nil,
+            toolCallStartTag: toolCallStartTag,
+            toolCallEndTag: toolCallEndTag
+        )
+    }
+
+    private static func makeDelayedStreamingResult(modelID: String, chunks: [StreamChunk], delayNanoseconds: UInt64?) -> AFMMLXChatStreamingResult {
+        Self.makeDelayedStreamingResult(
+            modelID: modelID,
+            chunks: chunks,
+            delayNanoseconds: delayNanoseconds,
+            toolCallStartTag: "<tool_call>",
+            toolCallEndTag: "</tool_call>"
+        )
+    }
+
+    private static func makeDelayedStreamingResult(
+        modelID: String,
+        chunks: [StreamChunk],
+        delayNanoseconds: UInt64?,
+        toolCallStartTag: String?,
+        toolCallEndTag: String?
+    ) -> AFMMLXChatStreamingResult {
         let stream = AsyncThrowingStream<StreamChunk, Error> { continuation in
             Task {
                 for chunk in chunks {
@@ -597,8 +748,8 @@ final class MLXChatCompletionsControllerStreamingTests: XCTestCase {
             modelID: modelID,
             stream: stream,
             promptTokens: 8,
-            toolCallStartTag: "<tool_call>",
-            toolCallEndTag: "</tool_call>",
+            toolCallStartTag: toolCallStartTag,
+            toolCallEndTag: toolCallEndTag,
             thinkStartTag: nil,
             thinkEndTag: nil
         )
@@ -676,7 +827,7 @@ final class MLXChatCompletionsControllerStreamingTests: XCTestCase {
     """
 }
 
-private final class FakeMLXChatService: MLXChatServing, @unchecked Sendable {
+private final class FakeMLXChatService: AFMMLXOpenAIChatServing, @unchecked Sendable {
     let maxConcurrent: Int
     let toolCallParser: String?
     let supportsStrictToolGrammar: Bool
@@ -684,12 +835,25 @@ private final class FakeMLXChatService: MLXChatServing, @unchecked Sendable {
     let thinkEndTag: String?
     let fixToolArgs: Bool
     let enableGrammarConstraints: Bool = false
-    private let generateResult: ChatGenerationResult
-    private let streamingResult: ChatStreamingResult
-    private let streamingHandler: (([Message]) -> ChatStreamingResult)?
+    var servingConfiguration: AFMMLXServingConfiguration {
+        AFMMLXServingConfiguration(
+            toolCallParser: toolCallParser,
+            supportsStrictToolGrammar: supportsStrictToolGrammar,
+            thinkStartTag: thinkStartTag,
+            thinkEndTag: thinkEndTag,
+            fixToolArguments: fixToolArgs,
+            grammarConstraintsEnabled: enableGrammarConstraints
+        )
+    }
+    private let generateResult: AFMMLXChatGenerationResult
+    private let streamingResult: AFMMLXChatStreamingResult
+    private let streamingHandler: (([Message]) -> AFMMLXChatStreamingResult)?
     private let stateLock = NSLock()
     private(set) var recordedGenerateToolNames: [[String]] = []
     private(set) var recordedStreamingToolNames: [[String]] = []
+    private(set) var recordedGenerateToolChoices: [String] = []
+    private(set) var recordedStreamingToolChoices: [String] = []
+    private(set) var recordedPreserveStructuralTags: [Bool] = []
 
     init(
         maxConcurrent: Int = 1,
@@ -698,8 +862,8 @@ private final class FakeMLXChatService: MLXChatServing, @unchecked Sendable {
         thinkStartTag: String? = nil,
         thinkEndTag: String? = nil,
         fixToolArgs: Bool = false,
-        generateResult: ChatGenerationResult? = nil,
-        streamingResult: ChatStreamingResult
+        generateResult: AFMMLXChatGenerationResult? = nil,
+        streamingResult: AFMMLXChatStreamingResult
     ) {
         self.maxConcurrent = maxConcurrent
         self.toolCallParser = toolCallParser
@@ -730,7 +894,7 @@ private final class FakeMLXChatService: MLXChatServing, @unchecked Sendable {
         thinkStartTag: String? = nil,
         thinkEndTag: String? = nil,
         fixToolArgs: Bool = false,
-        streamingHandler: @escaping ([Message]) -> ChatStreamingResult
+        streamingHandler: @escaping ([Message]) -> AFMMLXChatStreamingResult
     ) {
         self.maxConcurrent = maxConcurrent
         self.toolCallParser = toolCallParser
@@ -783,12 +947,55 @@ private final class FakeMLXChatService: MLXChatServing, @unchecked Sendable {
         logprobs: Bool?,
         topLogprobs: Int?,
         tools: [RequestTool]?,
+        parallelToolCalls: Bool?,
         stop: [String]?,
         responseFormat: ResponseFormat?,
         chatTemplateKwargs: [String: AnyCodable]?
-    ) async throws -> ChatGenerationResult {
+    ) async throws -> AFMMLXChatGenerationResult {
         recordGenerateTools(tools)
         return generateResult
+    }
+
+    func generate(
+        model: String,
+        messages: [Message],
+        temperature: Double?,
+        maxTokens: Int?,
+        topP: Double?,
+        repetitionPenalty: Double?,
+        topK: Int?,
+        minP: Double?,
+        presencePenalty: Double?,
+        seed: Int?,
+        logprobs: Bool?,
+        topLogprobs: Int?,
+        tools: [RequestTool]?,
+        toolChoice: ToolChoice?,
+        parallelToolCalls: Bool?,
+        stop: [String]?,
+        responseFormat: ResponseFormat?,
+        chatTemplateKwargs: [String: AnyCodable]?
+    ) async throws -> AFMMLXChatGenerationResult {
+        recordGenerateToolChoice(toolChoice)
+        return try await generate(
+            model: model,
+            messages: messages,
+            temperature: temperature,
+            maxTokens: maxTokens,
+            topP: topP,
+            repetitionPenalty: repetitionPenalty,
+            topK: topK,
+            minP: minP,
+            presencePenalty: presencePenalty,
+            seed: seed,
+            logprobs: logprobs,
+            topLogprobs: topLogprobs,
+            tools: tools,
+            parallelToolCalls: parallelToolCalls,
+            stop: stop,
+            responseFormat: responseFormat,
+            chatTemplateKwargs: chatTemplateKwargs
+        )
     }
 
     func generateStreaming(
@@ -805,10 +1012,11 @@ private final class FakeMLXChatService: MLXChatServing, @unchecked Sendable {
         logprobs: Bool?,
         topLogprobs: Int?,
         tools: [RequestTool]?,
+        parallelToolCalls: Bool?,
         stop: [String]?,
         responseFormat: ResponseFormat?,
         chatTemplateKwargs: [String: AnyCodable]?
-    ) async throws -> ChatStreamingResult {
+    ) async throws -> AFMMLXChatStreamingResult {
         recordStreamingTools(tools)
         return streamingHandler?(messages) ?? streamingResult
     }
@@ -827,12 +1035,17 @@ private final class FakeMLXChatService: MLXChatServing, @unchecked Sendable {
         logprobs: Bool?,
         topLogprobs: Int?,
         tools: [RequestTool]?,
+        toolChoice: ToolChoice?,
+        parallelToolCalls: Bool?,
         stop: [String]?,
         responseFormat: ResponseFormat?,
         chatTemplateKwargs: [String: AnyCodable]?,
+        preserveStructuralTags: Bool,
         requestId: String?
-    ) async throws -> ChatStreamingResult {
-        try await generateStreaming(
+    ) async throws -> AFMMLXChatStreamingResult {
+        recordStreamingToolChoice(toolChoice)
+        recordPreserveStructuralTags(preserveStructuralTags)
+        return try await generateStreaming(
             model: model,
             messages: messages,
             temperature: temperature,
@@ -846,6 +1059,50 @@ private final class FakeMLXChatService: MLXChatServing, @unchecked Sendable {
             logprobs: logprobs,
             topLogprobs: topLogprobs,
             tools: tools,
+            parallelToolCalls: parallelToolCalls,
+            stop: stop,
+            responseFormat: responseFormat,
+            chatTemplateKwargs: chatTemplateKwargs
+        )
+    }
+
+    func generateStreaming(
+        model: String,
+        messages: [Message],
+        temperature: Double?,
+        maxTokens: Int?,
+        topP: Double?,
+        repetitionPenalty: Double?,
+        topK: Int?,
+        minP: Double?,
+        presencePenalty: Double?,
+        seed: Int?,
+        logprobs: Bool?,
+        topLogprobs: Int?,
+        tools: [RequestTool]?,
+        parallelToolCalls: Bool?,
+        stop: [String]?,
+        responseFormat: ResponseFormat?,
+        chatTemplateKwargs: [String: AnyCodable]?,
+        preserveStructuralTags: Bool,
+        requestId: String?
+    ) async throws -> AFMMLXChatStreamingResult {
+        recordPreserveStructuralTags(preserveStructuralTags)
+        return try await generateStreaming(
+            model: model,
+            messages: messages,
+            temperature: temperature,
+            maxTokens: maxTokens,
+            topP: topP,
+            repetitionPenalty: repetitionPenalty,
+            topK: topK,
+            minP: minP,
+            presencePenalty: presencePenalty,
+            seed: seed,
+            logprobs: logprobs,
+            topLogprobs: topLogprobs,
+            tools: tools,
+            parallelToolCalls: parallelToolCalls,
             stop: stop,
             responseFormat: responseFormat,
             chatTemplateKwargs: chatTemplateKwargs
@@ -864,7 +1121,36 @@ private final class FakeMLXChatService: MLXChatServing, @unchecked Sendable {
         stateLock.unlock()
     }
 
-    private static let emptyStreamingResult: ChatStreamingResult = (
+    private func recordPreserveStructuralTags(_ preserve: Bool) {
+        stateLock.lock()
+        recordedPreserveStructuralTags.append(preserve)
+        stateLock.unlock()
+    }
+
+    private func recordGenerateToolChoice(_ toolChoice: ToolChoice?) {
+        stateLock.lock()
+        recordedGenerateToolChoices.append(Self.toolChoiceLabel(toolChoice))
+        stateLock.unlock()
+    }
+
+    private func recordStreamingToolChoice(_ toolChoice: ToolChoice?) {
+        stateLock.lock()
+        recordedStreamingToolChoices.append(Self.toolChoiceLabel(toolChoice))
+        stateLock.unlock()
+    }
+
+    private static func toolChoiceLabel(_ toolChoice: ToolChoice?) -> String {
+        switch toolChoice {
+        case .mode(let mode):
+            return "mode:\(mode)"
+        case .function(let choice):
+            return "function:\(choice.function.name)"
+        case nil:
+            return "none"
+        }
+    }
+
+    private static let emptyStreamingResult: AFMMLXChatStreamingResult = (
         modelID: "test-model",
         stream: AsyncThrowingStream { $0.finish() },
         promptTokens: 0,
